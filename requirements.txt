@@ -1,0 +1,13 @@
+# Core
+arxiv>=2.1.0
+requests>=2.31.0
+
+# Webhook listener
+fastapi>=0.110.0
+uvicorn>=0.27.0
+
+# Optional: experiment tracking
+wandb
+
+# Optional: R2 / S3 sync
+boto3
