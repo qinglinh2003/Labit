@@ -24,6 +24,8 @@ When the user says /search-papers followed by a query (e.g., /search-papers slot
    ---
    ```
    Fill in the "Core idea" section from the S2 TLDR. Populate relevance_to by matching the paper against each project's keywords.
+   Add a `pdf` field pointing to `vault/papers/pdf/{arxiv_id}.pdf`.
+   Download the PDF: `curl -sL https://arxiv.org/pdf/{arxiv_id} -o vault/papers/pdf/{arxiv_id}.pdf`
 
 6. Check vault/papers/ for existing notes — if any of the selected paper's references are already in the vault, add [[wikilinks]] under "References in my vault", and update the referenced paper's "Cited by (in my vault)" section.
 
