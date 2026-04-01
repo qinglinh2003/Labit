@@ -24,7 +24,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent))
 from project_config import (
     list_project_names, ensure_project_dirs, project_dir,
-    find_hypothesis, find_task, PROJECTS_DIR,
+    find_hypothesis, find_task, load_project, PROJECTS_DIR,
 )
 
 HYPOTHESES_DIR = Path(__file__).parent.parent / "experiments" / "hypotheses"
@@ -187,19 +187,71 @@ def update_hypothesis(hid: str, status: str = None, result: str = None, wandb_ru
 
 
 def launch_experiment(hid: str):
+    """Launch experiment via SSH or SkyPilot based on project compute config."""
+    hyp_path = find_hypothesis(hid, HYPOTHESES_DIR)
+    if not hyp_path:
+        print(f"Hypothesis {hid} not found.")
+        return
+
+    hyp_data = yaml.safe_load(hyp_path.read_text())
+    project_name = hyp_data.get("project", "")
+
+    # Load compute config from project
+    compute = {}
+    try:
+        pc = load_project(project_name)
+        compute = pc.get("compute", {})
+    except FileNotFoundError:
+        pass
+
+    # Update status
+    hyp_data["status"] = "in-progress"
+    hyp_path.write_text(yaml.dump(hyp_data, default_flow_style=False, allow_unicode=True))
+
+    backend = compute.get("backend", "skypilot")
+
+    if backend == "ssh":
+        _launch_ssh(hid, hyp_data, compute)
+    else:
+        _launch_skypilot(hid)
+
+
+def _launch_ssh(hid: str, hyp_data: dict, compute: dict):
+    """Launch experiment on a remote machine via SSH."""
+    host = compute.get("host")
+    workdir = compute.get("workdir", "~")
+    conda_init = compute.get("conda_init", "")
+    conda_env = compute.get("conda_env", "")
+    config_file = hyp_data.get("config", "")
+
+    if not host:
+        print("No SSH host configured in project compute config.")
+        return
+
+    # Build remote command
+    parts = []
+    if conda_init:
+        parts.append(f"source {conda_init}")
+    if conda_env:
+        parts.append(f"conda activate {conda_env}")
+    parts.append(f"cd {workdir}")
+    parts.append(f"python train.py --config {config_file} --wandb_tags {hid}")
+
+    remote_cmd = " && ".join(parts)
+    print(f"Launching on {host}: {remote_cmd}")
+
+    try:
+        subprocess.run(["ssh", host, remote_cmd], check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"SSH launch failed: {e}")
+
+
+def _launch_skypilot(hid: str):
     """Launch experiment via SkyPilot."""
     task_path = find_task(hid, TASKS_DIR)
-    hyp_path = find_hypothesis(hid, HYPOTHESES_DIR)
-
     if not task_path:
         print(f"Task file not found for {hid}.")
         return
-
-    # Update status
-    if hyp_path:
-        data = yaml.safe_load(hyp_path.read_text())
-        data["status"] = "in-progress"
-        hyp_path.write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True))
 
     print(f"Launching: sky launch {task_path} --cluster {hid}")
     try:
