@@ -21,10 +21,17 @@ import json
 import os
 import re
 import subprocess
+import sys
 import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
 from time import sleep
+
+sys.path.insert(0, str(Path(__file__).parent))
+from project_config import (
+    load_project, load_all_projects, list_project_names,
+    ensure_project_dirs, project_dir,
+)
 
 # ---------------------------------------------------------------------------
 # Config — edit these to match your research interests
@@ -101,8 +108,9 @@ def s2_search(query: str, limit: int = 20) -> list[dict]:
 # arXiv fetching
 # ---------------------------------------------------------------------------
 
-def fetch_arxiv_papers(days: int = 1, max_results: int = 200) -> list:
+def fetch_arxiv_papers(days: int = 1, max_results: int = 200, keywords: list[str] = None) -> list:
     """Fetch recent arXiv papers matching our categories and keywords."""
+    kw_list = keywords or KEYWORDS
     cat_query = " OR ".join(f"cat:{c}" for c in ARXIV_CATEGORIES)
 
     client = arxiv.Client()
@@ -122,7 +130,7 @@ def fetch_arxiv_papers(days: int = 1, max_results: int = 200) -> list:
 
         # Keyword filtering
         text = f"{result.title} {result.summary}".lower()
-        hits = sum(1 for kw in KEYWORDS if kw.lower() in text)
+        hits = sum(1 for kw in kw_list if kw.lower() in text)
         if hits >= MIN_KEYWORD_HITS:
             papers.append({
                 "arxiv_id": result.entry_id.split("/")[-1],
@@ -137,6 +145,58 @@ def fetch_arxiv_papers(days: int = 1, max_results: int = 200) -> list:
             })
 
     return papers
+
+
+# ---------------------------------------------------------------------------
+# Project relevance
+# ---------------------------------------------------------------------------
+
+def compute_project_relevance(paper: dict, project_configs: list[dict]) -> list[str]:
+    """Return list of project names this paper is relevant to."""
+    text = f"{paper['title']} {paper['abstract']}".lower()
+    relevant = []
+    for pc in project_configs:
+        hits = sum(1 for kw in pc.get("keywords", []) if kw.lower() in text)
+        if hits >= 1:
+            relevant.append(pc["name"])
+    return relevant
+
+
+def backfill_relevance(project_configs: list[dict]):
+    """Re-scan existing paper notes and update their relevance_to field."""
+    updated = 0
+    for f in PAPERS_DIR.glob("*.md"):
+        content = f.read_text()
+        fm_match = re.match(r'^---\n(.+?)\n---', content, re.DOTALL)
+        if not fm_match:
+            continue
+        # Build text from title + tags + body for matching
+        title_match = re.search(r'title:\s*"([^"]*)"', fm_match.group(1))
+        title = title_match.group(1) if title_match else ""
+        tags_match = re.search(r'tags:\s*\[([^\]]*)\]', fm_match.group(1))
+        tags_text = tags_match.group(1).replace(",", " ") if tags_match else ""
+        body = content[fm_match.end():]
+        text = f"{title} {tags_text} {body}".lower()
+
+        relevant = []
+        for pc in project_configs:
+            hits = sum(1 for kw in pc.get("keywords", []) if kw.lower() in text)
+            if hits >= 1:
+                relevant.append(pc["name"])
+
+        relevance_str = ", ".join(relevant)
+        # Update relevance_to in frontmatter
+        new_content = re.sub(
+            r'relevance_to:\s*\[.*?\]',
+            f'relevance_to: [{relevance_str}]',
+            content,
+        )
+        if new_content != content:
+            f.write_text(new_content)
+            updated += 1
+            print(f"  Backfilled: {f.stem} -> [{relevance_str}]")
+
+    print(f"Backfill done: {updated} papers updated.")
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +258,7 @@ def generate_note(paper: dict, s2_data: dict | None, known_ids: dict) -> str:
     if len(paper["authors"]) > 5:
         authors_str += ", ..."
     tags_str = ", ".join(tags)
+    relevance_str = ", ".join(paper.get("relevant_projects", []))
 
     note = f"""---
 paper_id: "{paper['arxiv_id']}"
@@ -207,7 +268,7 @@ venue: ""
 year: {paper['published'][:4]}
 url: "{paper['url']}"
 tags: [{tags_str}]
-relevance_to: []
+relevance_to: [{relevance_str}]
 status: "to-read"
 added: "{datetime.now().strftime('%Y-%m-%d')}"
 ---
@@ -310,12 +371,16 @@ Respond ONLY as JSON array: [{{"index": 0, "score": 3, "reason": "one sentence"}
 # Digest generation
 # ---------------------------------------------------------------------------
 
-def generate_digest(papers: list[dict], date_str: str) -> str:
+def generate_digest(papers: list[dict], date_str: str, project_name: str = None) -> str:
     """Generate a daily digest markdown file."""
     papers_sorted = sorted(papers, key=lambda p: p.get("relevance_score", 0), reverse=True)
 
+    header = f"# Paper digest — {date_str}"
+    if project_name:
+        header += f" [{project_name}]"
+
     lines = [
-        f"# Paper digest — {date_str}",
+        header,
         f"",
         f"Found {len(papers)} papers matching filters.",
         f"",
@@ -353,10 +418,36 @@ def main():
     parser.add_argument("--score", action="store_true", help="Score relevance via claude -p")
     parser.add_argument("--query", type=str, default=None, help="Custom S2 search query instead of arXiv")
     parser.add_argument("--dry-run", action="store_true", help="Print what would be created, don't write")
+    parser.add_argument("--project", type=str, nargs="*", default=None,
+                        help='Project name(s) for filtered digests. Use "all" for all projects.')
+    parser.add_argument("--backfill", action="store_true",
+                        help="Re-scan existing papers and update relevance_to fields")
     args = parser.parse_args()
+
+    # Resolve project configs
+    project_configs = []
+    if args.project:
+        names = list_project_names() if "all" in args.project else args.project
+        project_configs = [load_project(n) for n in names]
+
+    # Handle backfill mode
+    if args.backfill:
+        if not project_configs:
+            print("--backfill requires --project. Use: --backfill --project all")
+            return
+        PAPERS_DIR.mkdir(parents=True, exist_ok=True)
+        backfill_relevance(project_configs)
+        return
 
     PAPERS_DIR.mkdir(parents=True, exist_ok=True)
     DIGEST_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Merge project keywords with global keywords for wider fetch
+    all_keywords = list(KEYWORDS)
+    for pc in project_configs:
+        for kw in pc.get("keywords", []):
+            if kw not in all_keywords:
+                all_keywords.append(kw)
 
     # Fetch papers
     if args.query:
@@ -379,9 +470,14 @@ def main():
             })
     else:
         print(f"Fetching arXiv papers from last {args.days} day(s)...")
-        papers = fetch_arxiv_papers(days=args.days, max_results=args.max_results)
+        papers = fetch_arxiv_papers(days=args.days, max_results=args.max_results, keywords=all_keywords)
 
     print(f"Found {len(papers)} papers matching keywords.")
+
+    # Compute per-paper project relevance
+    if project_configs:
+        for p in papers:
+            p["relevant_projects"] = compute_project_relevance(p, project_configs)
 
     if not papers:
         print("No papers found. Try increasing --days or lowering MIN_KEYWORD_HITS.")
@@ -437,6 +533,23 @@ def main():
         digest_path = DIGEST_DIR / f"{date_str}.md"
         digest_path.write_text(digest)
         print(f"\nDigest written to: {digest_path}")
+
+    # Per-project filtered digests
+    if project_configs:
+        for pc in project_configs:
+            pname = pc["name"]
+            proj_papers = [p for p in papers if pname in p.get("relevant_projects", [])]
+            if not proj_papers:
+                print(f"  {pname}: 0 relevant papers, skipping digest.")
+                continue
+            proj_digest = generate_digest(proj_papers, date_str, project_name=pname)
+            if args.dry_run:
+                print(f"\n  [DRY RUN] {pname}: {len(proj_papers)} relevant papers")
+            else:
+                ensure_project_dirs(pname)
+                proj_digest_path = project_dir(pname) / "digests" / f"{date_str}.md"
+                proj_digest_path.write_text(proj_digest)
+                print(f"  {pname} digest: {len(proj_papers)} papers -> {proj_digest_path}")
 
     print(f"\nDone: {created} created, {skipped} already existed.")
 

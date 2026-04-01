@@ -1,0 +1,21 @@
+name: SemBelief-WM
+description: "Model-based RL using slot-based latent belief states with a VLM backbone"
+keywords:
+  - "world model"
+  - "model-based reinforcement learning"
+  - "slot attention"
+  - "object-centric"
+  - "belief state"
+  - "POMDP"
+  - "partial observability"
+  - "hallucination"
+  - "grounding"
+arxiv_categories:
+  - "cs.AI"
+  - "cs.LG"
+  - "cs.CV"
+relevance_criteria: >
+  Papers relevant to SemBelief-WM involve: world models for RL,
+  slot attention or object-centric representations, belief state estimation
+  under partial observability, VLM grounding/hallucination, or latent state
+  space models. Work on POMDPs and model-based RL is core.

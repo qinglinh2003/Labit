@@ -21,6 +21,12 @@ from pathlib import Path
 
 import yaml
 
+sys.path.insert(0, str(Path(__file__).parent))
+from project_config import (
+    list_project_names, ensure_project_dirs, project_dir,
+    find_hypothesis, PROJECTS_DIR,
+)
+
 HYPOTHESES_DIR = Path(__file__).parent.parent / "experiments" / "hypotheses"
 TASKS_DIR = Path(__file__).parent.parent / "experiments" / "tasks"
 
@@ -53,17 +59,19 @@ autostop:
 
 
 def next_id() -> str:
-    """Generate next hypothesis ID like h001, h002, ..."""
-    existing = list(HYPOTHESES_DIR.glob("h*.yaml"))
-    if not existing:
+    """Generate next hypothesis ID, scanning all locations."""
+    all_files = list(HYPOTHESES_DIR.glob("h*.yaml"))
+    if PROJECTS_DIR.exists():
+        all_files.extend(PROJECTS_DIR.glob("*/hypotheses/h*.yaml"))
+    if not all_files:
         return "h001"
     nums = []
-    for f in existing:
+    for f in all_files:
         try:
             nums.append(int(f.stem[1:]))
         except ValueError:
             pass
-    return f"h{max(nums) + 1:03d}"
+    return f"h{max(nums) + 1:03d}" if nums else "h001"
 
 
 def create_hypothesis():
@@ -98,9 +106,15 @@ def create_hypothesis():
         "notes": "",
     }
 
-    # Write hypothesis YAML
-    HYPOTHESES_DIR.mkdir(parents=True, exist_ok=True)
-    hyp_path = HYPOTHESES_DIR / f"{hid}.yaml"
+    # Write hypothesis YAML — under project overlay if project is recognized
+    known_projects = list_project_names()
+    if project and project in known_projects:
+        ensure_project_dirs(project)
+        hyp_dir = project_dir(project) / "hypotheses"
+    else:
+        hyp_dir = HYPOTHESES_DIR
+    hyp_dir.mkdir(parents=True, exist_ok=True)
+    hyp_path = hyp_dir / f"{hid}.yaml"
     hyp_path.write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True))
     print(f"\nHypothesis saved: {hyp_path}")
 
@@ -125,8 +139,11 @@ def create_hypothesis():
 
 
 def list_hypotheses():
-    """List all hypotheses with status."""
-    files = sorted(HYPOTHESES_DIR.glob("h*.yaml"))
+    """List all hypotheses with status across all locations."""
+    files = list(HYPOTHESES_DIR.glob("h*.yaml"))
+    if PROJECTS_DIR.exists():
+        files.extend(PROJECTS_DIR.glob("*/hypotheses/h*.yaml"))
+    files = sorted(files, key=lambda f: f.stem)
     if not files:
         print("No hypotheses yet. Create one with: python hypothesis_tracker.py new")
         return
@@ -141,8 +158,8 @@ def list_hypotheses():
 
 def show_status(hid: str):
     """Show detailed hypothesis status."""
-    path = HYPOTHESES_DIR / f"{hid}.yaml"
-    if not path.exists():
+    path = find_hypothesis(hid, HYPOTHESES_DIR)
+    if not path:
         print(f"Hypothesis {hid} not found.")
         return
     data = yaml.safe_load(path.read_text())
@@ -151,8 +168,8 @@ def show_status(hid: str):
 
 def update_hypothesis(hid: str, status: str = None, result: str = None, wandb_run: str = None):
     """Update hypothesis fields."""
-    path = HYPOTHESES_DIR / f"{hid}.yaml"
-    if not path.exists():
+    path = find_hypothesis(hid, HYPOTHESES_DIR)
+    if not path:
         print(f"Hypothesis {hid} not found.")
         return
 
@@ -171,14 +188,14 @@ def update_hypothesis(hid: str, status: str = None, result: str = None, wandb_ru
 def launch_experiment(hid: str):
     """Launch experiment via SkyPilot."""
     task_path = TASKS_DIR / f"{hid}.yaml"
-    hyp_path = HYPOTHESES_DIR / f"{hid}.yaml"
+    hyp_path = find_hypothesis(hid, HYPOTHESES_DIR)
 
     if not task_path.exists():
         print(f"Task file not found: {task_path}")
         return
 
     # Update status
-    if hyp_path.exists():
+    if hyp_path:
         data = yaml.safe_load(hyp_path.read_text())
         data["status"] = "in-progress"
         hyp_path.write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True))
