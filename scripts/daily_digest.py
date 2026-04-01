@@ -30,7 +30,7 @@ from time import sleep
 sys.path.insert(0, str(Path(__file__).parent))
 from project_config import (
     load_project, load_all_projects, list_project_names,
-    ensure_project_dirs, project_dir,
+    ensure_project_dirs, project_dir, update_project_papers_index,
 )
 
 # ---------------------------------------------------------------------------
@@ -198,6 +198,35 @@ def backfill_relevance(project_configs: list[dict]):
 
     print(f"Backfill done: {updated} papers updated.")
 
+    # Update per-project papers index
+    for pc in project_configs:
+        count = update_project_papers_index(pc["name"], PAPERS_DIR)
+        print(f"  {pc['name']} papers index: {count} papers")
+
+
+# ---------------------------------------------------------------------------
+# PDF download
+# ---------------------------------------------------------------------------
+
+PDF_DIR = VAULT_DIR / "papers" / "pdf"
+
+
+def download_pdf(arxiv_id: str, pdf_url: str) -> bool:
+    """Download paper PDF to vault/papers/pdf/{arxiv_id}.pdf."""
+    PDF_DIR.mkdir(parents=True, exist_ok=True)
+    pdf_path = PDF_DIR / f"{arxiv_id.replace('/', '_')}.pdf"
+    if pdf_path.exists():
+        return True
+    url = pdf_url or f"https://arxiv.org/pdf/{arxiv_id}"
+    try:
+        r = requests.get(url, timeout=30)
+        if r.status_code == 200 and len(r.content) > 1000:
+            pdf_path.write_bytes(r.content)
+            return True
+    except Exception as e:
+        print(f"  PDF download failed for {arxiv_id}: {e}")
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Note generation
@@ -260,6 +289,8 @@ def generate_note(paper: dict, s2_data: dict | None, known_ids: dict) -> str:
     tags_str = ", ".join(tags)
     relevance_str = ", ".join(paper.get("relevant_projects", []))
 
+    pdf_path = paper.get("pdf_path", "")
+
     note = f"""---
 paper_id: "{paper['arxiv_id']}"
 title: "{paper['title']}"
@@ -267,6 +298,7 @@ authors: [{authors_str}]
 venue: ""
 year: {paper['published'][:4]}
 url: "{paper['url']}"
+pdf: "{pdf_path}"
 tags: [{tags_str}]
 relevance_to: [{relevance_str}]
 status: "to-read"
@@ -512,6 +544,12 @@ def main():
         s2_data = s2_paper_details(p["arxiv_id"])
         sleep(0.5)  # Be nice to S2 API
 
+        # Download PDF
+        if download_pdf(p["arxiv_id"], p.get("pdf_url", "")):
+            p["pdf_path"] = f"vault/papers/pdf/{p['arxiv_id'].replace('/', '_')}.pdf"
+        else:
+            p["pdf_path"] = ""
+
         # Generate and write note
         note_content = generate_note(p, s2_data, known_ids)
         note_path.write_text(note_content)
@@ -550,6 +588,12 @@ def main():
                 proj_digest_path = project_dir(pname) / "digests" / f"{date_str}.md"
                 proj_digest_path.write_text(proj_digest)
                 print(f"  {pname} digest: {len(proj_papers)} papers -> {proj_digest_path}")
+
+    # Update per-project papers index
+    if project_configs and not args.dry_run:
+        for pc in project_configs:
+            count = update_project_papers_index(pc["name"], PAPERS_DIR)
+            print(f"  {pc['name']} papers index: {count} papers")
 
     print(f"\nDone: {created} created, {skipped} already existed.")
 

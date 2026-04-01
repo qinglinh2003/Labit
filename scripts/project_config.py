@@ -50,8 +50,36 @@ def project_dir(name: str) -> Path:
 def ensure_project_dirs(name: str):
     """Create overlay subdirectories for a project."""
     base = project_dir(name)
-    for sub in ["digests", "sparks", "hypotheses", "tasks"]:
+    for sub in ["digests", "sparks", "hypotheses", "tasks", "code", "docs"]:
         (base / sub).mkdir(parents=True, exist_ok=True)
+
+
+def update_project_papers_index(name: str, papers_dir: Path):
+    """Rebuild vault/projects/{name}/papers.yaml from paper notes' relevance_to."""
+    import re
+    name = _resolve_name(name)
+    papers = []
+    for f in sorted(papers_dir.glob("*.md")):
+        content = f.read_text()
+        fm_match = re.match(r'^---\n(.+?)\n---', content, re.DOTALL)
+        if not fm_match:
+            continue
+        rel_match = re.search(r'relevance_to:\s*\[([^\]]*)\]', fm_match.group(1))
+        if not rel_match:
+            continue
+        projects = [p.strip() for p in rel_match.group(1).split(",") if p.strip()]
+        if name in projects:
+            title_match = re.search(r'title:\s*"([^"]*)"', fm_match.group(1))
+            pid_match = re.search(r'paper_id:\s*"([^"]*)"', fm_match.group(1))
+            papers.append({
+                "file": f.stem,
+                "paper_id": pid_match.group(1) if pid_match else "",
+                "title": title_match.group(1) if title_match else f.stem,
+            })
+    index_path = project_dir(name) / "papers.yaml"
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_text(yaml.dump(papers, default_flow_style=False, allow_unicode=True))
+    return len(papers)
 
 
 def find_hypothesis(hid: str, legacy_dir: Path) -> Path | None:
