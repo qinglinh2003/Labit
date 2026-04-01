@@ -24,7 +24,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent))
 from project_config import (
     list_project_names, ensure_project_dirs, project_dir,
-    find_hypothesis, PROJECTS_DIR,
+    find_hypothesis, find_task, PROJECTS_DIR,
 )
 
 HYPOTHESES_DIR = Path(__file__).parent.parent / "experiments" / "hypotheses"
@@ -118,12 +118,13 @@ def create_hypothesis():
     hyp_path.write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True))
     print(f"\nHypothesis saved: {hyp_path}")
 
-    # Generate SkyPilot task YAML
-    TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    # Generate SkyPilot task YAML — same project overlay as hypothesis
+    task_dir = hyp_dir.parent / "tasks"
+    task_dir.mkdir(parents=True, exist_ok=True)
     task_content = SKYPILOT_TEMPLATE.format(
         gpu=gpu, config=config, project=project, id=hid
     )
-    task_path = TASKS_DIR / f"{hid}.yaml"
+    task_path = task_dir / f"{hid}.yaml"
     task_path.write_text(task_content)
     print(f"SkyPilot task:      {task_path}")
 
@@ -187,11 +188,11 @@ def update_hypothesis(hid: str, status: str = None, result: str = None, wandb_ru
 
 def launch_experiment(hid: str):
     """Launch experiment via SkyPilot."""
-    task_path = TASKS_DIR / f"{hid}.yaml"
+    task_path = find_task(hid, TASKS_DIR)
     hyp_path = find_hypothesis(hid, HYPOTHESES_DIR)
 
-    if not task_path.exists():
-        print(f"Task file not found: {task_path}")
+    if not task_path:
+        print(f"Task file not found for {hid}.")
         return
 
     # Update status

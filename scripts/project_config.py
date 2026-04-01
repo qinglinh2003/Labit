@@ -50,7 +50,7 @@ def project_dir(name: str) -> Path:
 def ensure_project_dirs(name: str):
     """Create overlay subdirectories for a project."""
     base = project_dir(name)
-    for sub in ["digests", "sparks", "hypotheses"]:
+    for sub in ["digests", "sparks", "hypotheses", "tasks"]:
         (base / sub).mkdir(parents=True, exist_ok=True)
 
 
@@ -61,6 +61,18 @@ def find_hypothesis(hid: str, legacy_dir: Path) -> Path | None:
         return legacy
     if PROJECTS_DIR.exists():
         matches = list(PROJECTS_DIR.glob(f"*/hypotheses/{hid}.yaml"))
+        if matches:
+            return matches[0]
+    return None
+
+
+def find_task(hid: str, legacy_dir: Path) -> Path | None:
+    """Find a SkyPilot task YAML in legacy dir or any project overlay."""
+    legacy = legacy_dir / f"{hid}.yaml"
+    if legacy.exists():
+        return legacy
+    if PROJECTS_DIR.exists():
+        matches = list(PROJECTS_DIR.glob(f"*/tasks/{hid}.yaml"))
         if matches:
             return matches[0]
     return None
