@@ -17,4 +17,6 @@ When the user says /new-project, help them create a new research project.
 5. Run backfill to tag existing papers:
    python scripts/daily_digest.py --backfill --project {name}
 
-6. Report how many existing papers matched the new project.
+6. Switch active project: write the new project name to configs/active_project.
+
+7. Report how many existing papers matched the new project.
