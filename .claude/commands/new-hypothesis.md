@@ -22,4 +22,4 @@ When the user says /new-hypothesis, help them create a research hypothesis with 
 5. **After approval**, create the hypothesis:
    - Run: python scripts/hypothesis_tracker.py new (fill in all fields)
    - If code changes are needed, implement them
-   - Remind user to /launch-exp when ready, or offer to launch immediately
+   - Remind user: "Use `/launch-exp {id}` to start the experiment, then `/debrief` to check progress and collect results."

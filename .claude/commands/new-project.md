@@ -5,6 +5,7 @@ When the user says /new-project, help them create a new research project.
    - One-line description
    - Research focus / what makes a paper relevant (free-text)
    - GitHub repo URL (optional, e.g., https://github.com/user/repo.git)
+   - Sync directories: which directories on the compute node should be synced to R2? (e.g., "outputs", "checkpoints", "results"). These will be synced between compute node and r2:research-data/{project}/. Default: ["outputs"]
 
 2. From their description, generate:
    - A list of 5-15 keywords for arXiv paper matching
