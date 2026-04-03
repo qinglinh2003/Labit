@@ -7,6 +7,9 @@ venv/
 node_modules/
 .DS_Store
 *.md
+!docs/
+!docs/design/
+!docs/design/*.md
 vault/
 experiments/
 configs/active_project

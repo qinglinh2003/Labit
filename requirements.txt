@@ -1,6 +1,10 @@
 # Core
 arxiv>=2.1.0
+pydantic>=2.12.0
+PyYAML>=6.0.0
 requests>=2.31.0
+rich>=13.0.0
+typer>=0.12.0
 
 # Webhook listener
 fastapi>=0.110.0
