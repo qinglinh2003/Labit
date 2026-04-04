@@ -50,8 +50,14 @@ def discover_repo_root(start: Path | None = None) -> Path:
     candidates = [current, *current.parents]
 
     for candidate in candidates:
-        has_markers = (candidate / ".git").exists() or (candidate / ".claude").exists()
-        if has_markers and (candidate / "scripts").exists():
+        has_markers = (
+            (candidate / ".git").exists()
+            and (candidate / "pyproject.toml").exists()
+            and (candidate / "labit").exists()
+            and (candidate / "configs").exists()
+            and (candidate / "vault").exists()
+        )
+        if has_markers:
             return candidate
 
     raise RuntimeError(
