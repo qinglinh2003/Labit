@@ -45,9 +45,14 @@ class ClaudeAdapter(AgentAdapter):
 
         raw_output = result.stdout.strip()
         structured_output = None
+        parsed = None
         if request.output_schema:
             try:
-                structured_output = json.loads(raw_output)
+                parsed = json.loads(raw_output)
+                if isinstance(parsed, dict) and "structured_output" in parsed:
+                    structured_output = parsed.get("structured_output")
+                else:
+                    structured_output = parsed
             except json.JSONDecodeError:
                 structured_output = raw_output
 
@@ -55,6 +60,6 @@ class ClaudeAdapter(AgentAdapter):
             provider=self.provider,
             raw_output=raw_output,
             structured_output=structured_output,
-            session_id=request.session_id,
+            session_id=parsed.get("session_id") if isinstance(parsed, dict) else request.session_id,
             command=cmd,
         )

@@ -80,6 +80,9 @@ class ChatService:
     def transcript(self, session_id: str) -> list[ChatMessage]:
         return self.store.load_transcript(session_id)
 
+    def context_snapshot(self, session_id: str) -> ContextSnapshot:
+        return self.store.load_context_snapshot(session_id)
+
     def ask(self, *, session_id: str, content: str) -> ChatTurnResult:
         session = self.load_session(session_id)
         if session.status != ChatStatus.ACTIVE:

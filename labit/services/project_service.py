@@ -199,7 +199,17 @@ class ProjectService:
         path = self.paths.vault_projects_dir / name / "hypotheses"
         if not path.exists():
             return 0
-        return len(list(path.glob("h*.yaml")))
+        structured_ids = {
+            item.name
+            for item in path.iterdir()
+            if item.is_dir() and (item / "hypothesis.yaml").exists() and re.fullmatch(r"h\d+", item.name)
+        }
+        legacy_ids = {
+            item.stem
+            for item in path.glob("h*.yaml")
+            if re.fullmatch(r"h\d+", item.stem)
+        }
+        return len(structured_ids | legacy_ids)
 
     def count_project_papers(self, name: str) -> int:
         index_path = self.paths.vault_projects_dir / name / "papers.yaml"

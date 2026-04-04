@@ -4,12 +4,15 @@ import json
 
 import typer
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from labit.chat.models import ChatMode
 from labit.chat.service import ChatService
+from labit.hypotheses.drafter import HypothesisDrafter
+from labit.hypotheses.service import HypothesisService
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
 
@@ -31,6 +34,14 @@ def _chat_service() -> ChatService:
 
 def _project_service() -> ProjectService:
     return ProjectService(RepoPaths.discover())
+
+
+def _hypothesis_service() -> HypothesisService:
+    return HypothesisService(RepoPaths.discover())
+
+
+def _hypothesis_drafter() -> HypothesisDrafter:
+    return HypothesisDrafter(RepoPaths.discover())
 
 
 def _emit(data: object, *, as_json: bool) -> None:
@@ -201,7 +212,7 @@ def _prompt_in_box(session) -> str:
     participants = ", ".join(f"{item.name}:{item.provider.value}" for item in session.participants)
     prompt_prefix = " › "
     meta_line = f"{project} · {mode} · {participants}"
-    command_line = "Commands: /help /list /new /switch /show /mode /exit"
+    command_line = "Commands: /help /list /new /switch /show /mode /hypothesis /exit"
 
     if not console.is_terminal:
         console.print(f"[dim]{meta_line}[/dim]")
@@ -273,8 +284,36 @@ def _shell_help() -> None:
     table.add_row("/switch <session_id>", "Switch to another session.")
     table.add_row("/show", "Show the full transcript for the current session.")
     table.add_row("/mode", "Show current mode, participants, and session info.")
+    table.add_row("/hypothesis [idea]", "Draft and create a structured hypothesis from the current session.")
     table.add_row("/exit", "Leave the chat shell.")
     console.print(Panel(table, title="LABIT Chat Commands", border_style="magenta"))
+
+
+def _confirm_in_shell(prompt: str, *, default: bool = True) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
+    raw = console.input(f"{prompt} {suffix}: ").strip().lower()
+    if not raw:
+        return default
+    return raw in {"y", "yes"}
+
+
+def _render_hypothesis_preview(draft, *, project: str) -> None:
+    body = (
+        f"[bold]Project[/bold]: {project}\n"
+        f"[bold]Claim[/bold]: {draft.claim}\n"
+        f"[bold]Independent variable[/bold]: {draft.independent_variable or '(blank)'}\n"
+        f"[bold]Dependent variable[/bold]: {draft.dependent_variable or '(blank)'}\n"
+        f"[bold]Success criteria[/bold]: {draft.success_criteria or '(blank)'}\n"
+        f"[bold]Failure criteria[/bold]: {draft.failure_criteria or '(blank)'}\n"
+        f"[bold]Source papers[/bold]: {', '.join(draft.source_paper_ids) or '(none)'}"
+    )
+    console.print(Panel(body, title=f"[bold green]Hypothesis Draft · {draft.title}[/bold green]", border_style="green"))
+    if draft.motivation:
+        console.print(Panel(draft.motivation, title="Motivation", border_style="cyan"))
+    if draft.rationale_markdown:
+        console.print(Panel(Markdown(draft.rationale_markdown), title="Rationale", border_style="blue"))
+    if draft.experiment_plan_markdown:
+        console.print(Panel(Markdown(draft.experiment_plan_markdown), title="Experiment Plan", border_style="magenta"))
 
 
 def run_chat_shell(
@@ -314,6 +353,57 @@ def run_chat_shell(
                 continue
             if command == "/mode":
                 _render_session_summary(current_session)
+                continue
+            if command == "/hypothesis":
+                user_intent = argument
+                if user_intent == "new":
+                    user_intent = ""
+                elif user_intent.startswith("new "):
+                    user_intent = user_intent[4:].strip()
+                if not current_session.project:
+                    console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
+                    continue
+                try:
+                    with console.status("[bold blue]Drafting hypothesis from current session...[/bold blue]"):
+                        draft = _hypothesis_drafter().draft_from_session(
+                            session=current_session,
+                            transcript=service.transcript(current_session.session_id),
+                            context_snapshot=service.context_snapshot(current_session.session_id),
+                            user_intent=user_intent,
+                            provider=current_session.participants[0].provider,
+                        )
+                except Exception as exc:
+                    console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                console.print("")
+                _render_hypothesis_preview(draft, project=current_session.project)
+                if not _confirm_in_shell("Create this hypothesis?", default=True):
+                    console.print("[dim]Cancelled hypothesis creation.[/dim]")
+                    continue
+
+                try:
+                    detail = _hypothesis_service().create_hypothesis(
+                        project=current_session.project,
+                        draft=draft,
+                        source_session_id=current_session.session_id,
+                    )
+                except Exception as exc:
+                    console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                console.print("")
+                console.print(
+                    Panel(
+                        (
+                            f"[bold]Created[/bold]: {detail.record.hypothesis_id}\n"
+                            f"[bold]Path[/bold]: {detail.path}\n"
+                            f"[bold]Next[/bold]: labit hypothesis show {detail.record.hypothesis_id}"
+                        ),
+                        title=f"[bold green]{detail.record.title}[/bold green]",
+                        border_style="green",
+                    )
+                )
                 continue
             if command == "/new":
                 title = _prompt_optional("Title", default="Free Conversation")
