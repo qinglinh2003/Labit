@@ -155,3 +155,41 @@ class ChatReply(BaseModel):
     participant: ChatParticipant
     message: ChatMessage
 
+
+class DiscussionSynthesisDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str
+    consensus: list[str] = Field(default_factory=list)
+    disagreements: list[str] = Field(default_factory=list)
+    followups: list[str] = Field(default_factory=list)
+
+    @field_validator("summary", mode="before")
+    @classmethod
+    def strip_summary(cls, value: object) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    @field_validator("summary")
+    @classmethod
+    def validate_summary(cls, value: str) -> str:
+        if not value:
+            raise ValueError("Summary cannot be empty.")
+        return value
+
+    @field_validator("consensus", "disagreements", "followups", mode="before")
+    @classmethod
+    def normalize_lists(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [item.strip() for item in value.split("\n")]
+        if not isinstance(value, list):
+            raise ValueError("This field must be a list of strings.")
+        cleaned: list[str] = []
+        for item in value:
+            text = str(item).strip()
+            if text and text not in cleaned:
+                cleaned.append(text)
+        return cleaned

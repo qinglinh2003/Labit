@@ -13,9 +13,13 @@ from labit.capture.drafter import IdeaDrafter
 from labit.capture.service import CaptureService
 from labit.chat.models import ChatMode
 from labit.chat.service import ChatService
+from labit.chat.synthesizer import DiscussionSynthesizer
+from labit.context.events import SessionEventKind
 from labit.hypotheses.drafter import HypothesisDrafter
 from labit.hypotheses.service import HypothesisService
 from labit.investigations.service import InvestigationService
+from labit.memory.models import MemoryKind
+from labit.memory.store import MemoryStore
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
 
@@ -57,6 +61,14 @@ def _idea_drafter() -> IdeaDrafter:
 
 def _investigation_service() -> InvestigationService:
     return InvestigationService(RepoPaths.discover())
+
+
+def _discussion_synthesizer() -> DiscussionSynthesizer:
+    return DiscussionSynthesizer(RepoPaths.discover())
+
+
+def _memory_store() -> MemoryStore:
+    return MemoryStore(RepoPaths.discover())
 
 
 def _emit(data: object, *, as_json: bool) -> None:
@@ -227,7 +239,7 @@ def _prompt_in_box(session) -> str:
     participants = ", ".join(f"{item.name}:{item.provider.value}" for item in session.participants)
     prompt_prefix = " › "
     meta_line = f"{project} · {mode} · {participants}"
-    command_line = "Commands: /help /list /new /switch /show /mode /idea /note /todo /investigate /hypothesis /exit"
+    command_line = "Commands: /help /list /new /switch /show /mode /memory /idea /note /todo /synthesize /investigate /hypothesis /exit"
 
     if not console.is_terminal:
         console.print(f"[dim]{meta_line}[/dim]")
@@ -299,9 +311,11 @@ def _shell_help() -> None:
     table.add_row("/switch <session_id>", "Switch to another session.")
     table.add_row("/show", "Show the full transcript for the current session.")
     table.add_row("/mode", "Show current mode, participants, and session info.")
+    table.add_row("/memory [id|kind]", "Show recent project memory, one memory by id, or filter by memory kind.")
     table.add_row("/idea [text]", "Save a lightweight project idea. With no text, show saved ideas.")
     table.add_row("/note [text]", "Save a lightweight project note. With no text, show saved notes.")
     table.add_row("/todo [text]", "Save an actionable project todo. With no text, show saved todos.")
+    table.add_row("/synthesize [hint]", "Distill the current discussion into consensus, disagreements, and follow-ups.")
     table.add_row("/investigate <topic>", "Investigate a topic from the current session and write a report.")
     table.add_row("/hypothesis [idea]", "Draft and create a structured hypothesis from the current session.")
     table.add_row("/exit", "Leave the chat shell.")
@@ -348,6 +362,23 @@ def _render_idea_preview(draft) -> None:
     )
 
 
+def _render_synthesis_preview(draft) -> None:
+    parts = [f"[bold]Summary[/bold]:\n{draft.summary}"]
+    if draft.consensus:
+        parts.append("[bold]Consensus[/bold]:\n" + "\n".join(f"- {item}" for item in draft.consensus))
+    if draft.disagreements:
+        parts.append("[bold]Disagreements[/bold]:\n" + "\n".join(f"- {item}" for item in draft.disagreements))
+    if draft.followups:
+        parts.append("[bold]Follow-ups[/bold]:\n" + "\n".join(f"- {item}" for item in draft.followups))
+    console.print(
+        Panel(
+            "\n\n".join(parts),
+            title="[bold green]Discussion Synthesis[/bold green]",
+            border_style="green",
+        )
+    )
+
+
 def _render_capture_records(kind: str, records) -> None:
     label_map = {
         "idea": "Ideas",
@@ -370,6 +401,42 @@ def _render_related_reports(reports) -> None:
         summary = item.summary or "(no summary)"
         console.print(f"- [bold]{item.title}[/bold] [dim]({item.path})[/dim]")
         console.print(f"  {summary}")
+
+
+def _render_memory_records(records) -> None:
+    console.print("[bold]Project Memory[/bold]")
+    if not records:
+        console.print("[dim]No memory records yet.[/dim]")
+        return
+    for record in records:
+        refs = f" · refs: {', '.join(record.evidence_refs[:2])}" if record.evidence_refs else ""
+        console.print(
+            f"- [bold]{record.memory_id}[/bold] [{record.kind.value}/{record.memory_type.value}] "
+            f"{record.title} · {record.namespace.render()} · score:{record.promotion_score}{refs}"
+        )
+
+
+def _render_memory_detail(record) -> None:
+    body = (
+        f"[bold]Kind[/bold]: {record.kind.value}\n"
+        f"[bold]Type[/bold]: {record.memory_type.value}\n"
+        f"[bold]Status[/bold]: {record.status.value}\n"
+        f"[bold]Namespace[/bold]: {record.namespace.render()}\n"
+        f"[bold]Confidence[/bold]: {record.confidence}\n"
+        f"[bold]Promotion score[/bold]: {record.promotion_score}\n"
+        f"[bold]Promotion reasons[/bold]: {', '.join(record.promotion_reasons) or '(none)'}\n"
+        f"[bold]Updated[/bold]: {record.updated_at}\n"
+        f"[bold]Evidence refs[/bold]: {', '.join(record.evidence_refs) or '(none)'}\n"
+        f"[bold]Source artifacts[/bold]: {', '.join(record.source_artifact_refs) or '(none)'}\n\n"
+        f"{record.summary}"
+    )
+    console.print(
+        Panel(
+            body,
+            title=f"[bold green]{record.memory_id} · {record.title}[/bold green]",
+            border_style="green",
+        )
+    )
 
 
 def _render_investigation_result(result) -> None:
@@ -410,6 +477,19 @@ def _context_snapshot_excerpt(snapshot, *, max_blocks: int = 6, max_chars: int =
     return text[:max_chars].strip()
 
 
+def _session_evidence_refs(session) -> list[str]:
+    refs: list[str] = []
+    if session.project:
+        refs.append(f"project:{session.project}")
+    for binding in session.context_bindings:
+        if binding.provider != "paper_focus":
+            continue
+        paper_id = str(binding.config.get("paper_id", "")).strip()
+        if paper_id:
+            refs.append(f"paper:{paper_id}")
+    return refs
+
+
 def run_chat_shell(
     *,
     session,
@@ -447,6 +527,66 @@ def run_chat_shell(
                 continue
             if command == "/mode":
                 _render_session_summary(current_session)
+                continue
+            if command == "/memory":
+                if not current_session.project:
+                    console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
+                    continue
+                store = _memory_store()
+                try:
+                    if not argument:
+                        records = store.list_records(current_session.project)[:10]
+                        _render_memory_records(records)
+                        continue
+                    token = argument.strip()
+                    try:
+                        kind = MemoryKind(token)
+                    except ValueError:
+                        kind = None
+                    if kind is not None:
+                        records = [record for record in store.list_records(current_session.project) if record.kind == kind][:10]
+                        _render_memory_records(records)
+                        continue
+                    record = store.load_record(current_session.project, token)
+                except Exception as exc:
+                    console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+                _render_memory_detail(record)
+                continue
+            if command == "/synthesize":
+                try:
+                    with console.status("[bold blue]Synthesizing current discussion...[/bold blue]"):
+                        draft = _discussion_synthesizer().synthesize_from_session(
+                            session=current_session,
+                            transcript=service.transcript(current_session.session_id),
+                            context_snapshot=service.context_snapshot(current_session.session_id),
+                            user_intent=argument,
+                            provider=current_session.participants[0].provider,
+                        )
+                except Exception as exc:
+                    console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                console.print("")
+                _render_synthesis_preview(draft)
+                if not _confirm_in_shell("Save this synthesis to working memory?", default=True):
+                    console.print("[dim]Cancelled synthesis.[/dim]")
+                    continue
+
+                try:
+                    service.record_discussion_synthesis(
+                        session_id=current_session.session_id,
+                        summary=draft.summary,
+                        consensus=draft.consensus,
+                        disagreements=draft.disagreements,
+                        followups=draft.followups,
+                        evidence_refs=_session_evidence_refs(current_session),
+                    )
+                except Exception as exc:
+                    console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                console.print("[green]Discussion synthesis saved.[/green]")
                 continue
             if command == "/investigate":
                 topic = argument.strip()
@@ -499,6 +639,55 @@ def run_chat_shell(
 
                 console.print("")
                 _render_investigation_result(result)
+                try:
+                    service.record_session_event(
+                        session_id=current_session.session_id,
+                        kind=SessionEventKind.ARTIFACT_REPORT_CREATED,
+                        actor="labit",
+                        summary=f"Investigation report created: {result.title}",
+                        payload={
+                            "title": result.title,
+                            "topic": result.topic,
+                            "mode": result.mode.value,
+                            "run_id": result.run_id,
+                            "report_path": result.report_path,
+                            "summary": result.summary,
+                        },
+                        evidence_refs=_session_evidence_refs(current_session) + [f"report:{result.report_path}"],
+                    )
+                except Exception:
+                    pass
+                try:
+                    consensus = [result.summary] if result.summary else [f"Investigation completed on topic: {result.topic}"]
+                    followups = ["Review the report and decide whether follow-up experiments are needed."]
+                    disagreements: list[str] = []
+                    if result.mode == ChatMode.ROUND_ROBIN:
+                        disagreements.append("Round-robin investigation revised an earlier draft; inspect the run artifacts for any unresolved differences.")
+                    elif result.mode == ChatMode.PARALLEL:
+                        disagreements.append("Parallel investigation merged two independent drafts; inspect the run artifacts for competing framings.")
+                    service.record_discussion_synthesis(
+                        session_id=current_session.session_id,
+                        summary=f"Investigation discussion synthesized around topic: {result.topic}",
+                        consensus=consensus,
+                        disagreements=disagreements,
+                        followups=followups,
+                        evidence_refs=_session_evidence_refs(current_session) + [f"report:{result.report_path}"],
+                    )
+                except Exception:
+                    pass
+                try:
+                    service.record_discussion_synthesis(
+                        session_id=current_session.session_id,
+                        summary=f"Hypothesis discussion crystallized into {detail.record.hypothesis_id}: {detail.record.title}",
+                        consensus=[detail.record.claim],
+                        disagreements=[],
+                        followups=[f"Design or launch an experiment for {detail.record.hypothesis_id}."],
+                        evidence_refs=_session_evidence_refs(current_session)
+                        + [f"hypothesis:{detail.record.hypothesis_id}"]
+                        + [f"paper:{paper_id}" for paper_id in detail.record.source_paper_ids],
+                    )
+                except Exception:
+                    pass
                 continue
             if command in {"/idea", "/note", "/todo"}:
                 kind_map = {
@@ -584,6 +773,28 @@ def run_chat_shell(
                         border_style="green",
                     )
                 )
+                event_kind_map = {
+                    "idea": SessionEventKind.ARTIFACT_IDEA_CREATED,
+                    "note": SessionEventKind.ARTIFACT_NOTE_CREATED,
+                    "todo": SessionEventKind.ARTIFACT_TODO_CREATED,
+                }
+                try:
+                    service.record_session_event(
+                        session_id=current_session.session_id,
+                        kind=event_kind_map[kind],
+                        actor="labit",
+                        summary=f"{kind.title()} captured: {record.title}",
+                        payload={
+                            "kind": kind,
+                            "title": record.title,
+                            "path": record.path,
+                            "source": record.source,
+                            "created_at": record.created_at,
+                        },
+                        evidence_refs=_session_evidence_refs(current_session) + [f"{kind}:{record.path}"],
+                    )
+                except Exception:
+                    pass
                 continue
             if command == "/hypothesis":
                 user_intent = argument
@@ -635,6 +846,25 @@ def run_chat_shell(
                         border_style="green",
                     )
                 )
+                try:
+                    service.record_session_event(
+                        session_id=current_session.session_id,
+                        kind=SessionEventKind.ARTIFACT_HYPOTHESIS_CREATED,
+                        actor="labit",
+                        summary=f"Hypothesis created: {detail.record.hypothesis_id} · {detail.record.title}",
+                        payload={
+                            "hypothesis_id": detail.record.hypothesis_id,
+                            "title": detail.record.title,
+                            "path": detail.path,
+                            "claim": detail.record.claim,
+                            "source_paper_ids": detail.record.source_paper_ids,
+                        },
+                        evidence_refs=_session_evidence_refs(current_session)
+                        + [f"hypothesis:{detail.record.hypothesis_id}"]
+                        + [f"paper:{paper_id}" for paper_id in detail.record.source_paper_ids],
+                    )
+                except Exception:
+                    pass
                 continue
             if command == "/new":
                 title = _prompt_optional("Title", default="Free Conversation")

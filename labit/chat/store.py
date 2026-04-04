@@ -22,6 +22,8 @@ class ChatStore:
         self.write_context_snapshot(session.session_id, snapshot)
         transcript_path = session_dir / "transcript.jsonl"
         transcript_path.touch(exist_ok=True)
+        events_path = session_dir / "events.jsonl"
+        events_path.touch(exist_ok=True)
         return session_dir
 
     def write_session(self, session: ChatSession) -> Path:
@@ -83,4 +85,3 @@ class ChatStore:
             handle.write(text)
             temp_path = Path(handle.name)
         temp_path.replace(path)
-

@@ -11,6 +11,7 @@ class RepoPaths:
     labit_dir: Path
     runs_dir: Path
     conversations_dir: Path
+    context_dir: Path
     configs_dir: Path
     project_configs_dir: Path
     active_project_path: Path
@@ -28,6 +29,7 @@ class RepoPaths:
             labit_dir=root / ".labit",
             runs_dir=root / ".labit" / "runs",
             conversations_dir=root / ".labit" / "conversations",
+            context_dir=root / ".labit" / "context",
             configs_dir=root / "configs",
             project_configs_dir=root / "configs" / "projects",
             active_project_path=root / "configs" / "active_project",

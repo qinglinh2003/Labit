@@ -13,6 +13,7 @@ from labit.chat.models import (
     MemoryBinding,
     MemoryBlock,
 )
+from labit.context.store import SessionContextStore
 from labit.paths import RepoPaths
 from labit.papers.service import PaperService
 from labit.papers.text import html_to_text
@@ -74,6 +75,57 @@ class EmptyMemoryProvider(ConversationMemoryProvider):
         paths: RepoPaths,
     ) -> list[MemoryBlock]:
         return []
+
+
+class SessionWorkingMemoryProvider(ConversationMemoryProvider):
+    name = "session_working_memory"
+
+    def build(
+        self,
+        *,
+        session: ChatSession,
+        transcript: list[ChatMessage],
+        binding: MemoryBinding,
+        paths: RepoPaths,
+    ) -> list[MemoryBlock]:
+        store = SessionContextStore(paths)
+        snapshot = store.load_working_memory(session.session_id)
+        if snapshot is None:
+            return []
+
+        lines: list[str] = []
+        if snapshot.current_goal:
+            lines.append(f"Current goal: {snapshot.current_goal}")
+        if snapshot.active_artifacts:
+            lines.append(f"Active artifacts: {', '.join(snapshot.active_artifacts)}")
+        if snapshot.decisions_made:
+            lines.append("Decisions:")
+            lines.extend(f"- {item}" for item in snapshot.decisions_made)
+        if snapshot.open_questions:
+            lines.append("Open questions:")
+            lines.extend(f"- {item}" for item in snapshot.open_questions)
+        if snapshot.discussion_state.consensus:
+            lines.append("Consensus:")
+            lines.extend(f"- {item}" for item in snapshot.discussion_state.consensus)
+        if snapshot.discussion_state.disagreements:
+            lines.append("Disagreements:")
+            lines.extend(f"- {item}" for item in snapshot.discussion_state.disagreements)
+        if snapshot.followups:
+            lines.append("Follow-ups:")
+            lines.extend(f"- {item}" for item in snapshot.followups)
+        if snapshot.evidence_refs:
+            lines.append("Evidence refs:")
+            lines.extend(f"- {item}" for item in snapshot.evidence_refs)
+        if not lines:
+            return []
+
+        return [
+            MemoryBlock(
+                source=self.name,
+                title="Session Working Memory",
+                content="\n".join(lines),
+            )
+        ]
 
 
 class PaperFocusContextProvider(ConversationContextProvider):
@@ -236,7 +288,10 @@ class ConversationContextRegistry:
                 EmptyContextProvider.name: EmptyContextProvider(),
                 PaperFocusContextProvider.name: PaperFocusContextProvider(),
             },
-            memory_providers={EmptyMemoryProvider.name: EmptyMemoryProvider()},
+            memory_providers={
+                EmptyMemoryProvider.name: EmptyMemoryProvider(),
+                SessionWorkingMemoryProvider.name: SessionWorkingMemoryProvider(),
+            },
         )
 
     def build_snapshot(
