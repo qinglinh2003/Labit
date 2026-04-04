@@ -16,6 +16,9 @@ class SessionEventKind(str, Enum):
     ARTIFACT_NOTE_CREATED = "artifact.note_created"
     ARTIFACT_TODO_CREATED = "artifact.todo_created"
     ARTIFACT_HYPOTHESIS_CREATED = "artifact.hypothesis_created"
+    ARTIFACT_EXPERIMENT_CREATED = "artifact.experiment_created"
+    ARTIFACT_TASK_LAUNCHED = "artifact.task_launched"
+    ARTIFACT_HYPOTHESIS_REVIEWED = "artifact.hypothesis_reviewed"
     ARTIFACT_REPORT_CREATED = "artifact.report_created"
     DISCUSSION_SYNTHESIS = "discussion.synthesis"
 
@@ -65,4 +68,3 @@ class WorkingMemorySnapshot(BaseModel):
     discussion_state: DiscussionState = Field(default_factory=DiscussionState)
     built_from_event_ids: list[str] = Field(default_factory=list)
     updated_at: str = Field(default_factory=utc_now_iso)
-

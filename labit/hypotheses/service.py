@@ -125,6 +125,39 @@ class HypothesisService:
 
         return self.load_hypothesis(resolved, hypothesis_id)
 
+    def update_hypothesis_record(
+        self,
+        *,
+        project: str,
+        hypothesis_id: str,
+        record: HypothesisRecord,
+        rationale_markdown: str | None = None,
+        experiment_plan_markdown: str | None = None,
+    ) -> HypothesisDetail:
+        resolved = self._require_project(project)
+        detail = self.load_hypothesis(resolved, hypothesis_id)
+        hypothesis_dir = self.hypothesis_dir(resolved, hypothesis_id)
+        hypothesis_dir.mkdir(parents=True, exist_ok=True)
+
+        self._atomic_write_yaml(hypothesis_dir / "hypothesis.yaml", record.model_dump(mode="json"))
+        if rationale_markdown is not None:
+            self._atomic_write_text(hypothesis_dir / "rationale.md", self._normalize_markdown(rationale_markdown))
+        elif detail.legacy:
+            self._atomic_write_text(hypothesis_dir / "rationale.md", self._normalize_markdown(detail.rationale_markdown))
+
+        if experiment_plan_markdown is not None:
+            self._atomic_write_text(
+                hypothesis_dir / "experiment_plan.md",
+                self._normalize_markdown(experiment_plan_markdown),
+            )
+        elif detail.legacy:
+            self._atomic_write_text(
+                hypothesis_dir / "experiment_plan.md",
+                self._normalize_markdown(detail.experiment_plan_markdown),
+            )
+
+        return self.load_hypothesis(resolved, hypothesis_id)
+
     def hypotheses_dir(self, project: str) -> Path:
         return self.paths.vault_projects_dir / project / "hypotheses"
 

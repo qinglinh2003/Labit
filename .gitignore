@@ -12,6 +12,8 @@ node_modules/
 !docs/design/*.md
 vault/
 experiments/
+!labit/experiments/
+!labit/experiments/**/*.py
 configs/active_project
 configs/projects/
 scratch/

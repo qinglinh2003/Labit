@@ -16,7 +16,19 @@ from labit.chat.models import ChatMode
 from labit.chat.service import ChatService
 from labit.chat.synthesizer import DiscussionSynthesizer
 from labit.context.events import SessionEventKind
+from labit.experiments.executors.ssh import SSHExecutor
+from labit.experiments.models import (
+    ExperimentDraft,
+    ResearchRole,
+    TaskDraft,
+    TaskKind,
+    TaskResources,
+    TaskSpec,
+    TaskStatus,
+)
+from labit.experiments.service import ExperimentService
 from labit.hypotheses.drafter import HypothesisDrafter
+from labit.hypotheses.models import HypothesisResolution, HypothesisState, utc_now_iso
 from labit.hypotheses.service import HypothesisService
 from labit.investigations.service import InvestigationService
 from labit.memory.models import MemoryKind
@@ -54,6 +66,10 @@ def _hypothesis_drafter() -> HypothesisDrafter:
 
 def _capture_service() -> CaptureService:
     return CaptureService(RepoPaths.discover())
+
+
+def _experiment_service() -> ExperimentService:
+    return ExperimentService(RepoPaths.discover())
 
 
 def _idea_drafter() -> IdeaDrafter:
@@ -258,7 +274,7 @@ def _prompt_in_box(session) -> str:
     participants = ", ".join(f"{item.name}:{item.provider.value}" for item in session.participants)
     prompt_prefix = " › "
     meta_line = f"{project} · {mode} · {participants}"
-    command_line = "Commands: /help /list /new /switch /show /mode /memory /think /long-term-memory /think-long-term /idea /note /todo /synthesize /investigate /hypothesis /exit"
+    command_line = "Commands: /help /list /new /switch /show /mode /memory /think /long-term-memory /think-long-term /idea /note /todo /synthesize /investigate /hypothesis /launch-exp /debrief /review-results /exit"
 
     if not console.is_terminal:
         console.print(f"[dim]{meta_line}[/dim]")
@@ -340,6 +356,9 @@ def _shell_help() -> None:
     table.add_row("/synthesize [hint]", "Distill the current discussion into consensus, disagreements, and follow-ups.")
     table.add_row("/investigate <topic>", "Investigate a topic from the current session and write a report.")
     table.add_row("/hypothesis [idea]", "Draft and create a structured hypothesis from the current session.")
+    table.add_row("/launch-exp <hypothesis_id>", "Draft a simple experiment from a hypothesis, freeze a launch artifact, and submit it over SSH.")
+    table.add_row("/debrief", "Inspect active experiment launches and show their latest runtime state.")
+    table.add_row("/review-results <hypothesis_id>", "Summarize experiments linked to a hypothesis, suggest a resolution, and optionally write the decision back.")
     table.add_row("/exit", "Leave the chat shell.")
     console.print(Panel(table, title="LABIT Chat Commands", border_style="magenta"))
 
@@ -474,6 +493,199 @@ def _render_investigation_result(result) -> None:
             border_style="green",
         )
     )
+
+
+def _render_experiment_launch_preview(
+    *,
+    hypothesis_id: str,
+    defaults: dict[str, str],
+    execution,
+) -> None:
+    body = (
+        f"[bold]Hypothesis[/bold]: {hypothesis_id}\n"
+        f"[bold]Title[/bold]: {defaults.get('title') or '(blank)'}\n"
+        f"[bold]Objective[/bold]: {defaults.get('objective') or '(blank)'}\n"
+        f"[bold]Task kind[/bold]: {defaults.get('task_kind') or '(blank)'}\n"
+        f"[bold]Research role[/bold]: {defaults.get('research_role') or '(blank)'}\n"
+        f"[bold]Branch[/bold]: {defaults.get('branch') or '(blank)'}\n"
+        f"[bold]Config[/bold]: {defaults.get('config_ref') or '(blank)'}\n"
+        f"[bold]GPU[/bold]: {defaults.get('gpu') or '(blank)'}\n"
+        f"[bold]Output dir[/bold]: {defaults.get('output_dir') or '(blank)'}\n"
+        f"[bold]Command[/bold]: {defaults.get('command') or '(blank)'}\n\n"
+        f"[bold]Backend[/bold]: {execution.backend.value}\n"
+        f"[bold]Host[/bold]: {execution.host or '(blank)'}\n"
+        f"[bold]Workdir[/bold]: {execution.workdir or '(blank)'}\n"
+        f"[bold]Runtime[/bold]: {execution.runtime.value}"
+    )
+    console.print(Panel(body, title="[bold green]Launch Experiment Preview[/bold green]", border_style="green"))
+
+
+def _render_review_suggestion(suggestion) -> None:
+    body = (
+        f"[bold]Hypothesis[/bold]: {suggestion.hypothesis_id}\n"
+        f"[bold]Current[/bold]: {suggestion.current_state}/{suggestion.current_resolution}\n"
+        f"[bold]Suggested[/bold]: {suggestion.suggested_state}/{suggestion.suggested_resolution}\n"
+        f"[bold]Supporting[/bold]: {', '.join(suggestion.supporting_experiment_ids) or '(none)'}\n"
+        f"[bold]Contradicting[/bold]: {', '.join(suggestion.contradicting_experiment_ids) or '(none)'}\n"
+        f"[bold]Pending[/bold]: {', '.join(suggestion.pending_experiment_ids) or '(none)'}\n"
+        f"[bold]Reviewed[/bold]: {', '.join(suggestion.reviewed_experiment_ids) or '(none)'}\n\n"
+        f"[bold]Result summary[/bold]: {suggestion.result_summary or '(blank)'}\n\n"
+        f"[bold]Decision rationale[/bold]: {suggestion.decision_rationale or '(blank)'}"
+    )
+    console.print(
+        Panel(
+            body,
+            title=f"[bold green]Review Results · {suggestion.title}[/bold green]",
+            border_style="green",
+        )
+    )
+    if suggestion.next_steps:
+        console.print("[bold]Next steps[/bold]")
+        for item in suggestion.next_steps:
+            console.print(f"- {item}")
+
+
+def _launch_markdown(
+    *,
+    hypothesis_id: str,
+    experiment_id: str,
+    task_id: str,
+    launch_id: str,
+    defaults: dict[str, str],
+    execution,
+    receipt,
+) -> str:
+    lines = [
+        f"# Launch {experiment_id}",
+        "",
+        f"- Hypothesis: {hypothesis_id}",
+        f"- Task: {task_id}",
+        f"- Launch: {launch_id}",
+        f"- Accepted: {'yes' if receipt.accepted else 'no'}",
+        f"- Backend: {execution.backend.value}",
+        f"- Host: {receipt.remote_host or execution.host or '(blank)'}",
+        f"- Runtime: {execution.runtime.value}",
+        f"- Branch: {defaults.get('branch') or '(blank)'}",
+        f"- Config: {defaults.get('config_ref') or '(blank)'}",
+        f"- GPU: {defaults.get('gpu') or '(blank)'}",
+        f"- Output dir: {defaults.get('output_dir') or '(blank)'}",
+        f"- PID: {receipt.pid or '(none)'}",
+        f"- Log: {receipt.log_path or '(none)'}",
+        "",
+        "## Command",
+        "",
+        "```bash",
+        defaults.get("command", "").strip(),
+        "```",
+    ]
+    if receipt.stderr_tail:
+        lines.extend(["", "## Submission stderr", "", "```text", receipt.stderr_tail.strip(), "```"])
+    return "\n".join(lines).rstrip()
+
+
+def _debrief_markdown(*, experiment_id: str, rows: list[str]) -> str:
+    lines = [f"# Debrief {experiment_id}", ""]
+    if not rows:
+        lines.append("No active launches found.")
+        return "\n".join(lines)
+    lines.extend(rows)
+    return "\n".join(lines)
+
+
+def _review_markdown(*, hypothesis_id: str, suggestion, saved) -> str:
+    lines = [
+        f"# Review {hypothesis_id}",
+        "",
+        f"- Current -> Suggested: {suggestion.current_state}/{suggestion.current_resolution} -> {suggestion.suggested_state}/{suggestion.suggested_resolution}",
+        f"- Final state: {saved.record.state.value}",
+        f"- Final resolution: {saved.record.resolution.value}",
+        f"- Supporting experiments: {', '.join(saved.record.supporting_experiment_ids) or '(none)'}",
+        f"- Contradicting experiments: {', '.join(saved.record.contradicting_experiment_ids) or '(none)'}",
+        f"- Reviewed experiments: {', '.join(suggestion.reviewed_experiment_ids) or '(none)'}",
+        "",
+        "## Result Summary",
+        "",
+        saved.record.result_summary or "(blank)",
+        "",
+        "## Decision Rationale",
+        "",
+        saved.record.decision_rationale or "(blank)",
+    ]
+    return "\n".join(lines)
+
+
+def _flatten_numeric_metrics(value, *, prefix: str = "", depth: int = 0, max_depth: int = 2) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    if depth > max_depth:
+        return metrics
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_text = str(key).strip()
+            if not key_text:
+                continue
+            nested_prefix = f"{prefix}.{key_text}" if prefix else key_text
+            metrics.update(_flatten_numeric_metrics(item, prefix=nested_prefix, depth=depth + 1, max_depth=max_depth))
+    elif isinstance(value, list):
+        return metrics
+    elif isinstance(value, bool):
+        return metrics
+    elif isinstance(value, (int, float)):
+        metrics[prefix or "value"] = float(value)
+    return metrics
+
+
+def _collect_task_metrics(collected: dict) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    files = collected.get("files", {}) or {}
+    for path, content in files.items():
+        try:
+            parsed = json.loads(content)
+        except Exception:
+            continue
+        base = str(path).rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        for key, value in _flatten_numeric_metrics(parsed).items():
+            metric_key = f"{base}.{key}" if key and key != "value" else base
+            metrics[metric_key] = value
+    manifest_count = collected.get("manifest_line_count")
+    if isinstance(manifest_count, int):
+        metrics["manifest.line_count"] = float(manifest_count)
+    return metrics
+
+
+def _task_summary_from_collect(task, collected: dict, metrics: dict[str, float]) -> str:
+    status = str(collected.get("status", "unknown")).strip() or "unknown"
+    if status == "running":
+        log_tail = str(collected.get("log_tail", "") or "").strip()
+        if log_tail:
+            last_line = log_tail.splitlines()[-1].strip()
+            return f"Task is still running. Latest log line: {last_line}"
+        return "Task is still running."
+    if metrics:
+        preview = ", ".join(f"{key}={value:.4g}" for key, value in list(metrics.items())[:4])
+        return f"Collected result metrics: {preview}"
+    if collected.get("output_dir_exists"):
+        refs = collected.get("artifact_refs", []) or []
+        return f"Task stopped and produced artifacts ({len(refs)} files discovered)."
+    log_tail = str(collected.get("log_tail", "") or "").strip()
+    if log_tail:
+        last_line = log_tail.splitlines()[-1].strip()
+        return f"Task stopped without recognized result files. Latest log line: {last_line}"
+    return f"Task stopped without recognized result files for {task.task_kind.value}."
+
+
+def _task_error_from_collect(collected: dict) -> str:
+    if str(collected.get("status", "")).strip() == "running":
+        return ""
+    stderr = str(collected.get("stderr", "") or "").strip()
+    if stderr:
+        return stderr
+    log_tail = str(collected.get("log_tail", "") or "").strip()
+    if not log_tail:
+        return ""
+    error_markers = ("traceback", "error", "exception", "failed", "fatal")
+    if any(marker in log_tail.lower() for marker in error_markers):
+        return log_tail
+    return ""
 
 
 def _transcript_excerpt(messages, *, limit: int = 16, max_chars: int = 6000) -> str:
@@ -786,19 +998,6 @@ def run_chat_shell(
                     )
                 except Exception:
                     pass
-                try:
-                    service.record_discussion_synthesis(
-                        session_id=current_session.session_id,
-                        summary=f"Hypothesis discussion crystallized into {detail.record.hypothesis_id}: {detail.record.title}",
-                        consensus=[detail.record.claim],
-                        disagreements=[],
-                        followups=[f"Design or launch an experiment for {detail.record.hypothesis_id}."],
-                        evidence_refs=_session_evidence_refs(current_session)
-                        + [f"hypothesis:{detail.record.hypothesis_id}"]
-                        + [f"paper:{paper_id}" for paper_id in detail.record.source_paper_ids],
-                    )
-                except Exception:
-                    pass
                 continue
             if command in {"/idea", "/note", "/todo"}:
                 kind_map = {
@@ -973,6 +1172,406 @@ def run_chat_shell(
                         evidence_refs=_session_evidence_refs(current_session)
                         + [f"hypothesis:{detail.record.hypothesis_id}"]
                         + [f"paper:{paper_id}" for paper_id in detail.record.source_paper_ids],
+                    )
+                except Exception:
+                    pass
+                try:
+                    service.record_discussion_synthesis(
+                        session_id=current_session.session_id,
+                        summary=f"Hypothesis discussion crystallized into {detail.record.hypothesis_id}: {detail.record.title}",
+                        consensus=[detail.record.claim],
+                        disagreements=[],
+                        followups=[f"Design or launch an experiment for {detail.record.hypothesis_id}."],
+                        evidence_refs=_session_evidence_refs(current_session)
+                        + [f"hypothesis:{detail.record.hypothesis_id}"]
+                        + [f"paper:{paper_id}" for paper_id in detail.record.source_paper_ids],
+                    )
+                except Exception:
+                    pass
+                continue
+            if command == "/launch-exp":
+                hypothesis_id = argument.strip()
+                if not hypothesis_id:
+                    console.print("[bold red]Usage:[/bold red] /launch-exp <hypothesis_id>")
+                    continue
+                if not current_session.project:
+                    console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
+                    continue
+
+                experiment_service = _experiment_service()
+                try:
+                    execution = experiment_service.build_default_execution_profile(current_session.project)
+                    defaults = experiment_service.suggest_task_defaults(
+                        project=current_session.project,
+                        hypothesis_id=hypothesis_id,
+                    )
+                except Exception as exc:
+                    console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                console.print("")
+                _render_experiment_launch_preview(
+                    hypothesis_id=hypothesis_id,
+                    defaults=defaults,
+                    execution=execution,
+                )
+
+                if not defaults.get("command"):
+                    console.print("[yellow]No runnable command was inferred from the hypothesis. Fill it in before launch.[/yellow]")
+                    defaults["command"] = _prompt_text("Command")
+                elif _confirm_in_shell("Edit launch fields before submitting?", default=False):
+                    defaults["command"] = _prompt_optional("Command", default=defaults.get("command", ""))
+                    defaults["branch"] = _prompt_optional("Branch", default=defaults.get("branch", ""))
+                    defaults["config_ref"] = _prompt_optional("Config", default=defaults.get("config_ref", ""))
+                    defaults["gpu"] = _prompt_optional("GPU", default=defaults.get("gpu", ""))
+                    defaults["output_dir"] = _prompt_optional("Output dir", default=defaults.get("output_dir", ""))
+
+                if not defaults.get("command", "").strip():
+                    console.print("[bold red]Error:[/bold red] Launch command cannot be empty.")
+                    continue
+
+                try:
+                    draft = ExperimentDraft(
+                        title=defaults["title"],
+                        objective=defaults["objective"],
+                        execution=execution,
+                        source_session_id=current_session.session_id,
+                        source_paper_ids=[item for item in defaults.get("source_paper_ids", "").split(",") if item],
+                        tasks=[
+                            TaskDraft(
+                                title=defaults["title"],
+                                task_kind=TaskKind(defaults.get("task_kind", TaskKind.CUSTOM.value)),
+                                research_role=ResearchRole.EVIDENCE,
+                                spec=TaskSpec(
+                                    branch=defaults.get("branch", ""),
+                                    config_ref=defaults.get("config_ref", ""),
+                                    command=defaults.get("command", ""),
+                                    output_dir=defaults.get("output_dir", ""),
+                                ),
+                                resources=TaskResources(profile="default", gpu=defaults.get("gpu", "")),
+                            )
+                        ],
+                    )
+                except Exception as exc:
+                    console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                if not _confirm_in_shell("Create experiment and submit the first task?", default=True):
+                    console.print("[dim]Cancelled launch.[/dim]")
+                    continue
+
+                try:
+                    detail = experiment_service.create_experiment(
+                        project=current_session.project,
+                        hypothesis_id=hypothesis_id,
+                        draft=draft,
+                    )
+                    first_task_id = detail.tasks[0].task_id
+                    artifact = experiment_service.materialize_launch_artifact(
+                        project=current_session.project,
+                        experiment_id=detail.record.experiment_id,
+                        task_id=first_task_id,
+                    )
+                    receipt = SSHExecutor(RepoPaths.discover()).submit(artifact)
+                    artifact = experiment_service.record_submission_receipt(
+                        project=current_session.project,
+                        experiment_id=detail.record.experiment_id,
+                        launch_id=artifact.launch_id,
+                        receipt=receipt,
+                    )
+                    experiment_service.write_launch_markdown(
+                        project=current_session.project,
+                        experiment_id=detail.record.experiment_id,
+                        content=_launch_markdown(
+                            hypothesis_id=hypothesis_id,
+                            experiment_id=detail.record.experiment_id,
+                            task_id=first_task_id,
+                            launch_id=artifact.launch_id,
+                            defaults=defaults,
+                            execution=execution,
+                            receipt=receipt,
+                        ),
+                    )
+                except Exception as exc:
+                    console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                console.print(
+                    Panel(
+                        (
+                            f"[bold]Experiment[/bold]: {detail.record.experiment_id}\n"
+                            f"[bold]Task[/bold]: {first_task_id}\n"
+                            f"[bold]Launch[/bold]: {artifact.launch_id}\n"
+                            f"[bold]Accepted[/bold]: {receipt.accepted}\n"
+                            f"[bold]Host[/bold]: {receipt.remote_host or '(blank)'}\n"
+                            f"[bold]PID[/bold]: {receipt.pid or '(none)'}\n"
+                            f"[bold]Log[/bold]: {receipt.log_path or '(none)'}\n"
+                            f"[bold]stderr[/bold]: {receipt.stderr_tail or '(blank)'}\n"
+                            f"[bold]Path[/bold]: vault/projects/{current_session.project}/experiments/{detail.record.experiment_id}"
+                        ),
+                        title="[bold green]Experiment launch[/bold green]" if receipt.accepted else "[bold red]Experiment launch failed[/bold red]",
+                        border_style="green" if receipt.accepted else "red",
+                    )
+                )
+                try:
+                    service.record_session_event(
+                        session_id=current_session.session_id,
+                        kind=SessionEventKind.ARTIFACT_EXPERIMENT_CREATED,
+                        actor="labit",
+                        summary=f"Experiment created: {detail.record.experiment_id} for {hypothesis_id}",
+                        payload={
+                            "experiment_id": detail.record.experiment_id,
+                            "hypothesis_id": hypothesis_id,
+                            "task_id": first_task_id,
+                            "launch_id": artifact.launch_id,
+                            "accepted": receipt.accepted,
+                            "remote_host": receipt.remote_host,
+                            "pid": receipt.pid,
+                            "log_path": receipt.log_path,
+                        },
+                        evidence_refs=_session_evidence_refs(current_session)
+                        + [f"hypothesis:{hypothesis_id}", f"experiment:{detail.record.experiment_id}"],
+                    )
+                except Exception:
+                    pass
+                if receipt.accepted:
+                    try:
+                        service.record_session_event(
+                            session_id=current_session.session_id,
+                            kind=SessionEventKind.ARTIFACT_TASK_LAUNCHED,
+                            actor="labit",
+                            summary=f"Task launched: {detail.record.experiment_id}/{first_task_id}/{artifact.launch_id}",
+                            payload={
+                                "experiment_id": detail.record.experiment_id,
+                                "task_id": first_task_id,
+                                "launch_id": artifact.launch_id,
+                                "remote_host": receipt.remote_host,
+                                "pid": receipt.pid,
+                                "log_path": receipt.log_path,
+                            },
+                            evidence_refs=_session_evidence_refs(current_session)
+                            + [f"experiment:{detail.record.experiment_id}", f"launch:{artifact.launch_id}"],
+                        )
+                    except Exception:
+                        pass
+                continue
+            if command == "/debrief":
+                if not current_session.project:
+                    console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
+                    continue
+                experiment_service = _experiment_service()
+                try:
+                    experiments = experiment_service.list_experiments(current_session.project)
+                except Exception as exc:
+                    console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                rows: list[str] = []
+                rows_by_experiment: dict[str, list[str]] = {}
+                executor = SSHExecutor(RepoPaths.discover())
+                for summary in experiments:
+                    detail = experiment_service.load_experiment(current_session.project, summary.experiment_id)
+                    for task in detail.tasks:
+                        if not task.latest_launch_id:
+                            continue
+                        task_record = experiment_service.load_task(
+                            current_session.project,
+                            detail.record.experiment_id,
+                            task.task_id,
+                        )
+                        artifact = experiment_service.load_launch_artifact(
+                            current_session.project,
+                            detail.record.experiment_id,
+                            task.latest_launch_id,
+                        )
+                        if not artifact.submission or not artifact.submission.accepted:
+                            continue
+                        collected = executor.collect(artifact)
+                        collected_status = str(collected.get("status", "unknown")).strip() or "unknown"
+                        metrics = _collect_task_metrics(collected)
+                        summary_text = _task_summary_from_collect(task_record, collected, metrics)
+                        error_text = _task_error_from_collect(collected)
+
+                        next_status = task_record.status
+                        runtime_updates = {
+                            "started_at": task_record.runtime.started_at or (
+                                utc_now_iso() if collected_status == "running" else task_record.runtime.started_at
+                            ),
+                        }
+                        if collected_status == "running":
+                            next_status = TaskStatus.RUNNING
+                        elif collected_status == "stopped":
+                            next_status = (
+                                TaskStatus.COMPLETED
+                                if metrics or collected.get("output_dir_exists") or collected.get("artifact_refs")
+                                else TaskStatus.FAILED
+                            )
+                            runtime_updates["finished_at"] = task_record.runtime.finished_at or utc_now_iso()
+                        updated_task = task_record.model_copy(
+                            update={
+                                "status": next_status,
+                                "runtime": task_record.runtime.model_copy(update=runtime_updates),
+                                "results": task_record.results.model_copy(
+                                    update={
+                                        "metrics": metrics or task_record.results.metrics,
+                                        "artifact_refs": list(dict.fromkeys(
+                                            [*task_record.results.artifact_refs, *(collected.get("artifact_refs", []) or [])]
+                                        )),
+                                        "summary": summary_text,
+                                        "error": error_text,
+                                    }
+                                ),
+                            }
+                        )
+                        try:
+                            experiment_service.save_task_record(
+                                project=current_session.project,
+                                task=updated_task,
+                            )
+                        except Exception:
+                            pass
+
+                        row = (
+                            f"- {detail.record.experiment_id}/{task.task_id}/{artifact.launch_id} · "
+                            f"{next_status.value} · {summary_text}"
+                        )
+                        rows.append(f"[bold]{row.split(' · ', 1)[0]}[/bold] · {row.split(' · ', 1)[1]}")
+                        rows_by_experiment.setdefault(detail.record.experiment_id, []).append(row)
+
+                console.print("[bold]Debrief[/bold]")
+                if not rows:
+                    console.print("[dim]No active launches found.[/dim]")
+                else:
+                    for row in rows:
+                        console.print(row)
+                    for experiment_id, experiment_rows in rows_by_experiment.items():
+                        try:
+                            experiment_service.write_debrief_markdown(
+                                project=current_session.project,
+                                experiment_id=experiment_id,
+                                content=_debrief_markdown(
+                                    experiment_id=experiment_id,
+                                    rows=experiment_rows,
+                                ),
+                            )
+                        except Exception:
+                            pass
+                continue
+            if command == "/review-results":
+                hypothesis_id = argument.strip()
+                if not hypothesis_id:
+                    console.print("[bold red]Usage:[/bold red] /review-results <hypothesis_id>")
+                    continue
+                if not current_session.project:
+                    console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
+                    continue
+
+                experiment_service = _experiment_service()
+                hypothesis_service = _hypothesis_service()
+                try:
+                    suggestion = experiment_service.suggest_hypothesis_review(
+                        project=current_session.project,
+                        hypothesis_id=hypothesis_id,
+                    )
+                    hypothesis_detail = hypothesis_service.load_hypothesis(current_session.project, hypothesis_id)
+                except Exception as exc:
+                    console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                console.print("")
+                _render_review_suggestion(suggestion)
+                if not _confirm_in_shell("Write this review decision back to the hypothesis?", default=False):
+                    console.print("[dim]Kept as suggestion only.[/dim]")
+                    continue
+
+                try:
+                    now = utc_now_iso()
+                    next_state = HypothesisState(suggestion.suggested_state)
+                    next_resolution = HypothesisResolution(suggestion.suggested_resolution)
+                    updated_record = hypothesis_detail.record.model_copy(
+                        update={
+                            "state": next_state,
+                            "resolution": next_resolution,
+                            "result_summary": suggestion.result_summary,
+                            "decision_rationale": suggestion.decision_rationale,
+                            "supporting_experiment_ids": suggestion.supporting_experiment_ids,
+                            "contradicting_experiment_ids": suggestion.contradicting_experiment_ids,
+                            "closed_at": (
+                                (hypothesis_detail.record.closed_at or now)
+                                if next_state == HypothesisState.CLOSED
+                                else None
+                            ),
+                            "updated_at": now,
+                        }
+                    )
+                    saved = hypothesis_service.update_hypothesis_record(
+                        project=current_session.project,
+                        hypothesis_id=hypothesis_id,
+                        record=updated_record,
+                    )
+                except Exception as exc:
+                    console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                review_markdown = _review_markdown(
+                    hypothesis_id=hypothesis_id,
+                    suggestion=suggestion,
+                    saved=saved,
+                )
+                for experiment_id in suggestion.reviewed_experiment_ids:
+                    try:
+                        experiment_service.write_review_markdown(
+                            project=current_session.project,
+                            experiment_id=experiment_id,
+                            content=review_markdown,
+                        )
+                    except Exception:
+                        pass
+
+                console.print(
+                    Panel(
+                        (
+                            f"[bold]Hypothesis[/bold]: {saved.record.hypothesis_id}\n"
+                            f"[bold]State[/bold]: {saved.record.state.value}\n"
+                            f"[bold]Resolution[/bold]: {saved.record.resolution.value}\n"
+                            f"[bold]Result[/bold]: {saved.record.result_summary or '(blank)'}"
+                        ),
+                        title="[bold green]Review saved[/bold green]",
+                        border_style="green",
+                    )
+                )
+                try:
+                    service.record_session_event(
+                        session_id=current_session.session_id,
+                        kind=SessionEventKind.ARTIFACT_HYPOTHESIS_REVIEWED,
+                        actor="labit",
+                        summary=f"Hypothesis reviewed: {saved.record.hypothesis_id} -> {saved.record.state.value}/{saved.record.resolution.value}",
+                        payload={
+                            "hypothesis_id": saved.record.hypothesis_id,
+                            "state": saved.record.state.value,
+                            "resolution": saved.record.resolution.value,
+                            "supporting_experiment_ids": saved.record.supporting_experiment_ids,
+                            "contradicting_experiment_ids": saved.record.contradicting_experiment_ids,
+                        },
+                        evidence_refs=_session_evidence_refs(current_session)
+                        + [f"hypothesis:{saved.record.hypothesis_id}"]
+                        + [f"experiment:{item}" for item in suggestion.reviewed_experiment_ids],
+                    )
+                except Exception:
+                    pass
+                try:
+                    service.record_discussion_synthesis(
+                        session_id=current_session.session_id,
+                        summary=(
+                            f"Hypothesis {saved.record.hypothesis_id} reviewed as "
+                            f"{saved.record.state.value}/{saved.record.resolution.value}."
+                        ),
+                        consensus=[saved.record.result_summary] if saved.record.result_summary else [],
+                        disagreements=[],
+                        followups=suggestion.next_steps,
+                        evidence_refs=_session_evidence_refs(current_session)
+                        + [f"hypothesis:{saved.record.hypothesis_id}"]
+                        + [f"experiment:{item}" for item in suggestion.reviewed_experiment_ids],
                     )
                 except Exception:
                     pass
