@@ -15,6 +15,7 @@ from labit.chat.models import ChatMode
 from labit.chat.service import ChatService
 from labit.hypotheses.drafter import HypothesisDrafter
 from labit.hypotheses.service import HypothesisService
+from labit.investigations.service import InvestigationService
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
 
@@ -52,6 +53,10 @@ def _capture_service() -> CaptureService:
 
 def _idea_drafter() -> IdeaDrafter:
     return IdeaDrafter(RepoPaths.discover())
+
+
+def _investigation_service() -> InvestigationService:
+    return InvestigationService(RepoPaths.discover())
 
 
 def _emit(data: object, *, as_json: bool) -> None:
@@ -222,7 +227,7 @@ def _prompt_in_box(session) -> str:
     participants = ", ".join(f"{item.name}:{item.provider.value}" for item in session.participants)
     prompt_prefix = " › "
     meta_line = f"{project} · {mode} · {participants}"
-    command_line = "Commands: /help /list /new /switch /show /mode /idea /note /todo /hypothesis /exit"
+    command_line = "Commands: /help /list /new /switch /show /mode /idea /note /todo /investigate /hypothesis /exit"
 
     if not console.is_terminal:
         console.print(f"[dim]{meta_line}[/dim]")
@@ -297,6 +302,7 @@ def _shell_help() -> None:
     table.add_row("/idea [text]", "Save a lightweight project idea. With no text, show saved ideas.")
     table.add_row("/note [text]", "Save a lightweight project note. With no text, show saved notes.")
     table.add_row("/todo [text]", "Save an actionable project todo. With no text, show saved todos.")
+    table.add_row("/investigate <topic>", "Investigate a topic from the current session and write a report.")
     table.add_row("/hypothesis [idea]", "Draft and create a structured hypothesis from the current session.")
     table.add_row("/exit", "Leave the chat shell.")
     console.print(Panel(table, title="LABIT Chat Commands", border_style="magenta"))
@@ -358,6 +364,52 @@ def _render_capture_records(kind: str, records) -> None:
         console.print(f"  [dim]{item.path}[/dim]")
 
 
+def _render_related_reports(reports) -> None:
+    console.print("[bold]Related reports[/bold]")
+    for item in reports:
+        summary = item.summary or "(no summary)"
+        console.print(f"- [bold]{item.title}[/bold] [dim]({item.path})[/dim]")
+        console.print(f"  {summary}")
+
+
+def _render_investigation_result(result) -> None:
+    console.print(
+        Panel(
+            (
+                f"[bold]Title[/bold]: {result.title}\n"
+                f"[bold]Path[/bold]: {result.report_path}\n"
+                f"[bold]Run[/bold]: {result.run_id}\n"
+                f"[bold]Summary[/bold]: {result.summary or '(blank)'}"
+            ),
+            title="[bold green]Investigation complete[/bold green]",
+            border_style="green",
+        )
+    )
+
+
+def _transcript_excerpt(messages, *, limit: int = 16, max_chars: int = 6000) -> str:
+    if not messages:
+        return ""
+    lines: list[str] = []
+    for message in messages[-limit:]:
+        speaker = message.speaker
+        if message.provider:
+            speaker = f"{speaker} ({message.provider.value})"
+        lines.append(f"{speaker}: {message.content.strip()}")
+    text = "\n".join(lines).strip()
+    return text[:max_chars].strip()
+
+
+def _context_snapshot_excerpt(snapshot, *, max_blocks: int = 6, max_chars: int = 5000) -> str:
+    pieces: list[str] = []
+    for block in snapshot.blocks[:max_blocks]:
+        pieces.append(f"[{block.title}]\n{block.content.strip()}")
+    for memory in snapshot.memory[:max_blocks]:
+        pieces.append(f"[{memory.title}]\n{memory.content.strip()}")
+    text = "\n\n".join(piece for piece in pieces if piece).strip()
+    return text[:max_chars].strip()
+
+
 def run_chat_shell(
     *,
     session,
@@ -395,6 +447,58 @@ def run_chat_shell(
                 continue
             if command == "/mode":
                 _render_session_summary(current_session)
+                continue
+            if command == "/investigate":
+                topic = argument.strip()
+                if not topic:
+                    console.print("[bold red]Usage:[/bold red] /investigate <topic>")
+                    continue
+                if not current_session.project:
+                    console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
+                    continue
+
+                transcript = service.transcript(current_session.session_id)
+                snapshot = service.context_snapshot(current_session.session_id)
+                investigation_service = _investigation_service()
+                try:
+                    related = investigation_service.find_related_reports(current_session.project, topic)
+                except Exception as exc:
+                    console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                if related:
+                    console.print("")
+                    _render_related_reports(related)
+                    if not _confirm_in_shell("Investigate further?", default=True):
+                        console.print("[dim]Cancelled investigation.[/dim]")
+                        continue
+
+                primary_provider = current_session.participants[0].provider.value
+                second_provider = (
+                    current_session.participants[1].provider.value
+                    if len(current_session.participants) > 1
+                    else primary_provider
+                )
+
+                try:
+                    with console.status("[bold blue]Investigating current topic...[/bold blue]"):
+                        result = investigation_service.investigate(
+                            project=current_session.project,
+                            topic=topic,
+                            mode=current_session.mode,
+                            provider=primary_provider,
+                            second_provider=second_provider,
+                            source_session_id=current_session.session_id,
+                            session_title=current_session.title,
+                            transcript_excerpt=_transcript_excerpt(transcript),
+                            session_context=_context_snapshot_excerpt(snapshot),
+                        )
+                except Exception as exc:
+                    console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                console.print("")
+                _render_investigation_result(result)
                 continue
             if command in {"/idea", "/note", "/todo"}:
                 kind_map = {
