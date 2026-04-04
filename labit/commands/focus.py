@@ -113,7 +113,7 @@ def _open_focus_session(
     return session, True, global_record.meta.title
 
 
-@focus_app.command("open")
+@focus_app.command("open", help="Open or resume a paper-focused conversation session for one canonical paper.")
 def open_focus_session(
     paper_id: str = typer.Argument(..., help="Canonical paper id to focus on."),
     mode: ChatMode = typer.Option(ChatMode.SINGLE, "--mode", help="single, round_robin, or parallel."),
@@ -151,7 +151,7 @@ def open_focus_session(
     run_chat_shell(session=session, service=_chat_service())
 
 
-@focus_app.command("list")
+@focus_app.command("list", help="List existing paper-focused conversation sessions.")
 def list_focus_sessions(
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:

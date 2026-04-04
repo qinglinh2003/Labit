@@ -207,7 +207,7 @@ def _render_search_results(project: str, results: list[dict]) -> None:
         console.print("")
 
 
-@paper_app.command("search")
+@paper_app.command("search", help="Search for project-relevant papers, review results, and optionally pull or ingest them.")
 def search_papers(
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
@@ -298,7 +298,7 @@ def search_papers(
     _print_result("Search action complete", rows)
 
 
-@paper_app.command("pull")
+@paper_app.command("pull", help="Resolve a paper by arXiv id or URL, download canonical assets, and link it into the active project.")
 def pull_paper(
     reference: str | None = typer.Argument(None, help="Optional arXiv id or arXiv URL."),
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
@@ -355,7 +355,7 @@ def pull_paper(
     )
 
 
-@paper_app.command("ingest")
+@paper_app.command("ingest", help="Pull a paper into the active project and generate a project-specific summary.")
 def ingest_paper(
     reference: str | None = typer.Argument(None, help="Optional arXiv id or arXiv URL."),
     provider: str = typer.Option("auto", "--provider", help="Summary provider: auto, claude, or codex."),
@@ -426,7 +426,7 @@ def ingest_paper(
     )
 
 
-@paper_app.command("show")
+@paper_app.command("show", help="Show the global paper library overview or inspect one canonical paper in the active project.")
 def show_paper(
     paper_id: str | None = typer.Argument(None, help="Optional canonical paper id."),
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
