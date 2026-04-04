@@ -274,7 +274,6 @@ External tools you will realistically want:
 Install locally:
 
 ```bash
-cd dev
 pip install -e .
 ```
 
