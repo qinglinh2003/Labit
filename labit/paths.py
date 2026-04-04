@@ -8,24 +8,34 @@ from pathlib import Path
 @dataclass(frozen=True)
 class RepoPaths:
     root: Path
+    labit_dir: Path
+    runs_dir: Path
+    conversations_dir: Path
     configs_dir: Path
     project_configs_dir: Path
     active_project_path: Path
     vault_dir: Path
     vault_projects_dir: Path
     papers_dir: Path
+    papers_by_id_dir: Path
+    papers_index_path: Path
 
     @classmethod
     def discover(cls, start: Path | None = None) -> "RepoPaths":
         root = discover_repo_root(start=start)
         return cls(
             root=root,
+            labit_dir=root / ".labit",
+            runs_dir=root / ".labit" / "runs",
+            conversations_dir=root / ".labit" / "conversations",
             configs_dir=root / "configs",
             project_configs_dir=root / "configs" / "projects",
             active_project_path=root / "configs" / "active_project",
             vault_dir=root / "vault",
             vault_projects_dir=root / "vault" / "projects",
             papers_dir=root / "vault" / "papers",
+            papers_by_id_dir=root / "vault" / "papers" / "by_id",
+            papers_index_path=root / "vault" / "papers" / "index.yaml",
         )
 
 

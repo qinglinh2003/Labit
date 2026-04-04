@@ -1,0 +1,572 @@
+from __future__ import annotations
+
+import json
+
+import typer
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+from labit.chat.models import ChatMode
+from labit.chat.service import ChatService
+from labit.paths import RepoPaths
+from labit.services.project_service import ProjectService
+
+chat_app = typer.Typer(
+    help="Shared free conversation sessions with one or more agent backends.",
+    invoke_without_command=True,
+)
+console = Console()
+
+_PROVIDER_STYLES = {
+    "claude": ("blue", "CLAUDE"),
+    "codex": ("green", "CODEX"),
+}
+
+
+def _chat_service() -> ChatService:
+    return ChatService(RepoPaths.discover())
+
+
+def _project_service() -> ProjectService:
+    return ProjectService(RepoPaths.discover())
+
+
+def _emit(data: object, *, as_json: bool) -> None:
+    if as_json:
+        typer.echo(json.dumps(data, indent=2, sort_keys=True))
+        return
+    console.print(data)
+
+
+def _fail(message: str, *, as_json: bool) -> int:
+    if as_json:
+        _emit({"ok": False, "error": message}, as_json=True)
+    else:
+        console.print(f"[bold red]Error:[/bold red] {message}")
+    return 1
+
+
+def _prompt_text(label: str) -> str:
+    while True:
+        value = typer.prompt(label).strip()
+        if value:
+            return value
+        console.print("[bold red]This field is required.[/bold red]")
+
+
+def _prompt_optional(label: str, default: str = "") -> str:
+    return typer.prompt(label, default=default, show_default=bool(default)).strip()
+
+
+def _prompt_mode() -> ChatMode:
+    choices = [mode.value for mode in ChatMode]
+    normalized = {choice.lower(): choice for choice in choices}
+    while True:
+        value = typer.prompt(
+            f"Mode [{' / '.join(choices)}]",
+            default=ChatMode.SINGLE.value,
+            show_default=True,
+        ).strip().lower()
+        if value in normalized:
+            return ChatMode(normalized[value])
+        console.print(f"[bold red]Choose one of:[/bold red] {', '.join(choices)}")
+
+
+def _render_session_summary(session) -> None:
+    participants = "\n".join(f"- {item.name} ({item.provider.value})" for item in session.participants)
+    body = (
+        f"[bold]Session ID[/bold]: {session.session_id}\n"
+        f"[bold]Mode[/bold]: {session.mode.value}\n"
+        f"[bold]Project[/bold]: {session.project or '(none)'}\n"
+        f"[bold]Status[/bold]: {session.status.value}\n"
+        f"[bold]Participants[/bold]:\n{participants}"
+    )
+    console.print(Panel(body, title=f"[bold green]{session.title}[/bold green]", border_style="green"))
+
+
+def _render_transcript(messages) -> None:
+    if not messages:
+        console.print("[dim]No messages yet.[/dim]")
+        return
+    for message in messages:
+        _render_message_block(message)
+
+
+def _render_compact_transcript(messages) -> None:
+    if not messages:
+        console.print("[dim]No messages yet.[/dim]")
+        return
+    for message in messages:
+        if message.message_type.value == "user":
+            console.print(Panel.fit(message.content, title=f"user · turn {message.turn_index}", border_style="white"))
+            continue
+        provider_name = message.provider.value if message.provider else "agent"
+        color, label = _PROVIDER_STYLES.get(provider_name, ("cyan", provider_name.upper()))
+        title = f"{label} · {message.speaker} · turn {message.turn_index}"
+        console.print(Panel.fit(message.content, title=title, border_style=color))
+
+
+def _render_message_block(message) -> None:
+    if message.message_type.value == "user":
+        console.print(Panel(message.content, title=f"user · turn {message.turn_index}", border_style="white"))
+        console.print("")
+        return
+
+    provider_name = message.provider.value if message.provider else "agent"
+    color, label = _PROVIDER_STYLES.get(provider_name, ("cyan", provider_name.upper()))
+    title = f"{label} · {message.speaker} · turn {message.turn_index}"
+    console.print(Panel(message.content, title=title, border_style=color))
+    console.print("")
+
+
+def _render_recent_messages(messages, *, count: int = 8) -> None:
+    console.print(Panel.fit(_transcript_preview_text(messages[-count:]), title="Recent Messages", border_style="blue"))
+
+
+def _transcript_preview_text(messages) -> Text:
+    if not messages:
+        return Text("No messages yet.", style="dim")
+    text = Text()
+    for idx, message in enumerate(messages):
+        if idx:
+            text.append("\n")
+        if message.message_type.value == "user":
+            text.append("user", style="bold white on blue")
+        else:
+            text.append(message.speaker, style="bold cyan")
+            if message.provider:
+                text.append(f" ({message.provider.value})", style="dim")
+        text.append(": ")
+        text.append(message.content)
+    return text
+
+
+def _render_shell_header(session) -> None:
+    mode_label = {
+        ChatMode.SINGLE: "Single agent",
+        ChatMode.ROUND_ROBIN: "Round robin",
+        ChatMode.PARALLEL: "Parallel replies",
+    }[session.mode]
+    participants = ", ".join(f"{item.name}:{item.provider.value}" for item in session.participants)
+    body = (
+        f"[bold]Project[/bold]: {session.project or '(none)'}\n"
+        f"[bold]Mode[/bold]: {mode_label}\n"
+        f"[bold]Participants[/bold]: {participants}\n"
+        f"[bold]Session ID[/bold]: {session.session_id}\n"
+        "[dim]Type a message to continue. Use /help to see shell commands.[/dim]"
+    )
+    console.print(Panel(body, title=f"[bold green]LABIT Chat · {session.title}[/bold green]", border_style="green"))
+
+
+def _box_width() -> int:
+    width = console.size.width if console.size.width else 80
+    return max(60, width - 4)
+
+
+def _clip_box_text(text: str, width: int) -> str:
+    text = text.strip()
+    if len(text) <= width:
+        return text
+    if width <= 1:
+        return text[:width]
+    return f"{text[: width - 1]}…"
+
+
+def _box_top(title: str, width: int) -> str:
+    inner_width = width - 2
+    title_text = f" {title} "
+    if len(title_text) >= inner_width:
+        return f"╭{title_text[:inner_width]}╮"
+    filler = "─" * (inner_width - len(title_text))
+    return f"╭{title_text}{filler}╮"
+
+
+def _box_line(text: str, width: int) -> str:
+    inner_width = width - 2
+    content = _clip_box_text(text, inner_width)
+    return f"│{content.ljust(inner_width)}│"
+
+
+def _box_bottom(width: int) -> str:
+    return f"╰{'─' * (width - 2)}╯"
+
+
+def _prompt_in_box(session) -> str:
+    width = _box_width()
+    inner_width = width - 2
+    project = session.project or "no-project"
+    mode = session.mode.value
+    participants = ", ".join(f"{item.name}:{item.provider.value}" for item in session.participants)
+    prompt_prefix = " › "
+    meta_line = f"{project} · {mode} · {participants}"
+    command_line = "Commands: /help /list /new /switch /show /mode /exit"
+
+    if not console.is_terminal:
+        console.print(f"[dim]{meta_line}[/dim]")
+        console.print(f"[dim]{command_line}[/dim]")
+        console.print(f"[yellow]{_box_top('Input', width)}[/yellow]")
+        console.print(f"[yellow]{_box_line('', width)}[/yellow]")
+        console.print(f"[yellow]│[/yellow]{prompt_prefix}", end="")
+        raw = console.input("")
+        console.print(f"[yellow]{_box_line('', width)}[/yellow]")
+        console.print(f"[yellow]{_box_bottom(width)}[/yellow]")
+        return raw
+
+    top = _box_top("Input", width)
+    empty = _box_line("", width)
+    prompt_fill = " " * max(0, inner_width - len(prompt_prefix))
+    prompt_line = f"│{prompt_prefix}{prompt_fill}│"
+    bottom = _box_bottom(width)
+
+    stream = console.file
+    yellow = "\x1b[33m"
+    reset = "\x1b[0m"
+
+    console.print(f"[dim]{meta_line}[/dim]")
+    console.print(f"[dim]{command_line}[/dim]")
+    stream.write(f"{yellow}{top}{reset}\n")
+    stream.write(f"{yellow}{empty}{reset}\n")
+    stream.write(f"{yellow}{prompt_line}{reset}\n")
+    stream.write(f"{yellow}{empty}{reset}\n")
+    stream.write(f"{yellow}{bottom}{reset}\n")
+    stream.write("\n")
+    stream.write(f"\x1b[4A\r\x1b[{len(prompt_prefix) + 1}C")
+    stream.flush()
+
+    raw = input()
+
+    stream.write("\x1b[2B\r")
+    stream.flush()
+    return raw
+
+
+def _open_default_session(
+    *,
+    service: ChatService,
+    title: str | None,
+    mode: ChatMode | None,
+    provider: str,
+    second_provider: str,
+):
+    sessions = service.list_sessions()
+    if sessions:
+        return sessions[0], False
+    session = service.open_session(
+        title=title or "Free Conversation",
+        mode=mode or ChatMode.SINGLE,
+        provider=provider,
+        second_provider=second_provider,
+        project=_project_service().active_project_name(),
+    )
+    return session, True
+
+
+def _shell_help() -> None:
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Command", style="bold")
+    table.add_column("What It Does")
+    table.add_row("/help", "Show shell commands.")
+    table.add_row("/list", "List existing chat sessions.")
+    table.add_row("/new", "Create a new session and switch into it.")
+    table.add_row("/switch <session_id>", "Switch to another session.")
+    table.add_row("/show", "Show the full transcript for the current session.")
+    table.add_row("/mode", "Show current mode, participants, and session info.")
+    table.add_row("/exit", "Leave the chat shell.")
+    console.print(Panel(table, title="LABIT Chat Commands", border_style="magenta"))
+
+
+def run_chat_shell(
+    *,
+    session,
+    service: ChatService,
+) -> None:
+    _render_shell_header(session)
+    transcript = service.transcript(session.session_id)
+    console.print("")
+    _render_recent_messages(transcript, count=8)
+    console.print("")
+
+    current_session = session
+    while True:
+        raw = _prompt_in_box(current_session).strip()
+        if not raw:
+            continue
+        if raw.startswith("/"):
+            parts = raw.split(maxsplit=1)
+            command = parts[0]
+            argument = parts[1].strip() if len(parts) > 1 else ""
+
+            if command == "/exit":
+                console.print("[dim]Leaving chat shell.[/dim]")
+                return
+            if command == "/help":
+                _shell_help()
+                continue
+            if command == "/list":
+                list_chats(json_output=False)
+                continue
+            if command == "/show":
+                _render_session_summary(current_session)
+                console.print("")
+                _render_transcript(service.transcript(current_session.session_id))
+                continue
+            if command == "/mode":
+                _render_session_summary(current_session)
+                continue
+            if command == "/new":
+                title = _prompt_optional("Title", default="Free Conversation")
+                mode = _prompt_mode()
+                provider = _prompt_optional("Primary provider", default="auto") or "auto"
+                second_provider = "auto"
+                if mode != ChatMode.SINGLE:
+                    second_provider = _prompt_optional("Secondary provider", default="auto") or "auto"
+                try:
+                    current_session = service.open_session(
+                        title=title,
+                        mode=mode,
+                        provider=provider,
+                        second_provider=second_provider,
+                        project=_project_service().active_project_name(),
+                    )
+                except Exception as exc:
+                    console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+                console.print("")
+                _render_shell_header(current_session)
+                continue
+            if command == "/switch":
+                if not argument:
+                    console.print("[bold red]Usage:[/bold red] /switch <session_id>")
+                    continue
+                try:
+                    current_session = service.load_session(argument)
+                except Exception as exc:
+                    console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+                console.print("")
+                _render_shell_header(current_session)
+                console.print("")
+                _render_recent_messages(service.transcript(current_session.session_id), count=8)
+                continue
+
+            console.print(f"[bold red]Unknown command:[/bold red] {command}")
+            continue
+
+        try:
+            result = service.ask(session_id=current_session.session_id, content=raw)
+        except Exception as exc:
+            console.print(f"[bold red]Error:[/bold red] {exc}")
+            continue
+        current_session = result.session
+        console.print("")
+        _render_message_block(result.user_message)
+        for reply in result.replies:
+            _render_message_block(reply.message)
+
+
+@chat_app.callback()
+def chat_callback(
+    ctx: typer.Context,
+    title: str | None = typer.Option(None, "--title", help="Optional title when opening the shell."),
+    mode: ChatMode | None = typer.Option(None, "--mode", help="Optional mode when opening the shell."),
+    provider: str = typer.Option("auto", "--provider", help="Primary provider when opening the shell."),
+    second_provider: str = typer.Option("auto", "--second-provider", help="Secondary provider when opening the shell."),
+) -> None:
+    if ctx.invoked_subcommand is not None:
+        return
+    service = _chat_service()
+    try:
+        session, created = _open_default_session(
+            service=service,
+            title=title,
+            mode=mode,
+            provider=provider,
+            second_provider=second_provider,
+        )
+    except Exception as exc:
+        raise typer.Exit(code=_fail(str(exc), as_json=False))
+    if created:
+        console.print("[dim]Created a new chat session.[/dim]")
+    else:
+        console.print("[dim]Resuming the most recent chat session.[/dim]")
+    run_chat_shell(session=session, service=service)
+
+
+@chat_app.command("open")
+def open_chat(
+    title: str | None = typer.Option(None, "--title", help="Optional session title."),
+    mode: ChatMode | None = typer.Option(None, "--mode", help="single, round_robin, or parallel."),
+    provider: str = typer.Option("auto", "--provider", help="Primary provider: auto, claude, or codex."),
+    second_provider: str = typer.Option("auto", "--second-provider", help="Secondary provider for multi-agent modes."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    project = _project_service().active_project_name()
+    if not json_output:
+        console.print("[bold]Open Chat[/bold]")
+        console.print(f"[dim]Active project: {project or '(none)'}[/dim]")
+
+    resolved_title = title or _prompt_optional("Title", default="Free Conversation")
+    resolved_mode = mode or _prompt_mode()
+
+    service = _chat_service()
+    try:
+        session = service.open_session(
+            title=resolved_title,
+            mode=resolved_mode,
+            provider=provider,
+            second_provider=second_provider,
+            project=project,
+        )
+    except Exception as exc:
+        raise typer.Exit(code=_fail(str(exc), as_json=json_output))
+
+    if json_output:
+        _emit(session.model_dump(mode="json"), as_json=True)
+        return
+    _render_session_summary(session)
+
+
+@chat_app.command("list")
+def list_chats(
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    sessions = _chat_service().list_sessions()
+    if json_output:
+        _emit([session.model_dump(mode="json") for session in sessions], as_json=True)
+        return
+    if not sessions:
+        console.print("[dim]No chat sessions yet.[/dim]")
+        return
+    table = Table(title="Chat Sessions", show_header=True, header_style="bold magenta")
+    table.add_column("Session")
+    table.add_column("Title")
+    table.add_column("Mode")
+    table.add_column("Project")
+    table.add_column("Participants")
+    table.add_column("Status")
+    for session in sessions:
+        participants = ", ".join(item.name for item in session.participants)
+        table.add_row(
+            session.session_id,
+            session.title,
+            session.mode.value,
+            session.project or "(none)",
+            participants,
+            session.status.value,
+        )
+    console.print(table)
+
+
+@chat_app.command("show")
+def show_chat(
+    session_id: str = typer.Argument(..., help="Session id."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    service = _chat_service()
+    try:
+        session = service.load_session(session_id)
+        transcript = service.transcript(session_id)
+    except Exception as exc:
+        raise typer.Exit(code=_fail(str(exc), as_json=json_output))
+
+    if json_output:
+        _emit(
+            {
+                "session": session.model_dump(mode="json"),
+                "transcript": [message.model_dump(mode="json") for message in transcript],
+            },
+            as_json=True,
+        )
+        return
+
+    _render_session_summary(session)
+    console.print("")
+    _render_transcript(transcript)
+
+
+@chat_app.command("ask")
+def ask_chat(
+    session_id: str = typer.Argument(..., help="Session id."),
+    message: str | None = typer.Argument(None, help="Optional user message."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    service = _chat_service()
+    resolved_message = message or _prompt_text("Message")
+    try:
+        result = service.ask(session_id=session_id, content=resolved_message)
+    except Exception as exc:
+        raise typer.Exit(code=_fail(str(exc), as_json=json_output))
+
+    if json_output:
+        _emit(
+            {
+                "session": result.session.model_dump(mode="json"),
+                "user_message": result.user_message.model_dump(mode="json"),
+                "replies": [
+                    {
+                        "participant": reply.participant.model_dump(mode="json"),
+                        "message": reply.message.model_dump(mode="json"),
+                    }
+                    for reply in result.replies
+                ],
+                "context": result.context_snapshot.model_dump(mode="json"),
+            },
+            as_json=True,
+        )
+        return
+
+    _render_session_summary(result.session)
+    console.print("")
+    console.print(f"[bold][turn {result.user_message.turn_index}] user[/bold]")
+    console.print(result.user_message.content)
+    console.print("")
+    for reply in result.replies:
+        console.print(f"[cyan][turn {reply.message.turn_index}] {reply.participant.name}[/cyan]")
+        console.print(reply.message.content)
+        console.print("")
+
+
+@chat_app.command("resume")
+def resume_chat(
+    session_id: str = typer.Argument(..., help="Session id."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    service = _chat_service()
+    try:
+        session = service.load_session(session_id)
+        transcript = service.transcript(session_id)
+    except Exception as exc:
+        raise typer.Exit(code=_fail(str(exc), as_json=json_output))
+
+    if json_output:
+        _emit(
+            {
+                "session": session.model_dump(mode="json"),
+                "transcript": [message.model_dump(mode="json") for message in transcript],
+            },
+            as_json=True,
+        )
+        return
+
+    _render_session_summary(session)
+    console.print("")
+    _render_transcript(transcript[-8:])
+    next_message = _prompt_optional("Next message", default="")
+    if not next_message:
+        console.print("[dim]No new message sent.[/dim]")
+        return
+
+    try:
+        result = service.ask(session_id=session_id, content=next_message)
+    except Exception as exc:
+        raise typer.Exit(code=_fail(str(exc), as_json=False))
+
+    console.print(f"[bold][turn {result.user_message.turn_index}] user[/bold]")
+    console.print(result.user_message.content)
+    console.print("")
+    for reply in result.replies:
+        console.print(f"[cyan][turn {reply.message.turn_index}] {reply.participant.name}[/cyan]")
+        console.print(reply.message.content)
+        console.print("")
