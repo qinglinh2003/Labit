@@ -297,11 +297,15 @@ def _prompt_in_box(session) -> ComposerResult:
     participants = ", ".join(f"{item.name}:{item.provider.value}" for item in session.participants)
     prompt_prefix = " › "
     meta_line = f"{project} · {mode} · {participants}"
-    command_line = "Shortcuts: /help /memory /think /ltm /paste-image /exit"
+    shortcut_lines = [
+        "Shortcuts: Ctrl-V image · /help · /think · /ltm · /image · /exit",
+        "Research: /memory · /idea · /todo · /investigate · /hypothesis",
+    ]
 
     if not console.is_terminal:
         console.print(f"[dim]{meta_line}[/dim]")
-        console.print(f"[dim]{command_line}[/dim]")
+        for line in shortcut_lines:
+            console.print(f"[dim]{line}[/dim]")
         console.print(f"[yellow]{_box_top('Input', width)}[/yellow]")
         console.print(f"[yellow]{_box_line('', width)}[/yellow]")
         console.print(f"[yellow]│[/yellow]{prompt_prefix}", end="")
@@ -312,7 +316,8 @@ def _prompt_in_box(session) -> ComposerResult:
 
     if prompt_toolkit_available():
         console.print(f"[dim]{meta_line}[/dim]")
-        console.print(f"[dim]{command_line}[/dim]")
+        for line in shortcut_lines:
+            console.print(f"[dim]{line}[/dim]")
         return prompt_with_clipboard_image(
             console=console,
             paths=RepoPaths.discover(),
@@ -332,7 +337,8 @@ def _prompt_in_box(session) -> ComposerResult:
     reset = "\x1b[0m"
 
     console.print(f"[dim]{meta_line}[/dim]")
-    console.print(f"[dim]{command_line}[/dim]")
+    for line in shortcut_lines:
+        console.print(f"[dim]{line}[/dim]")
     stream.write(f"{yellow}{top}{reset}\n")
     stream.write(f"{yellow}{empty}{reset}\n")
     stream.write(f"{yellow}{prompt_line}{reset}\n")
