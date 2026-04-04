@@ -9,6 +9,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from labit.capture.drafter import IdeaDrafter
+from labit.capture.service import CaptureService
 from labit.chat.models import ChatMode
 from labit.chat.service import ChatService
 from labit.hypotheses.drafter import HypothesisDrafter
@@ -42,6 +44,14 @@ def _hypothesis_service() -> HypothesisService:
 
 def _hypothesis_drafter() -> HypothesisDrafter:
     return HypothesisDrafter(RepoPaths.discover())
+
+
+def _capture_service() -> CaptureService:
+    return CaptureService(RepoPaths.discover())
+
+
+def _idea_drafter() -> IdeaDrafter:
+    return IdeaDrafter(RepoPaths.discover())
 
 
 def _emit(data: object, *, as_json: bool) -> None:
@@ -212,7 +222,7 @@ def _prompt_in_box(session) -> str:
     participants = ", ".join(f"{item.name}:{item.provider.value}" for item in session.participants)
     prompt_prefix = " › "
     meta_line = f"{project} · {mode} · {participants}"
-    command_line = "Commands: /help /list /new /switch /show /mode /hypothesis /exit"
+    command_line = "Commands: /help /list /new /switch /show /mode /idea /note /todo /hypothesis /exit"
 
     if not console.is_terminal:
         console.print(f"[dim]{meta_line}[/dim]")
@@ -284,6 +294,9 @@ def _shell_help() -> None:
     table.add_row("/switch <session_id>", "Switch to another session.")
     table.add_row("/show", "Show the full transcript for the current session.")
     table.add_row("/mode", "Show current mode, participants, and session info.")
+    table.add_row("/idea [text]", "Save a lightweight project idea. With no text, show saved ideas.")
+    table.add_row("/note [text]", "Save a lightweight project note. With no text, show saved notes.")
+    table.add_row("/todo [text]", "Save an actionable project todo. With no text, show saved todos.")
     table.add_row("/hypothesis [idea]", "Draft and create a structured hypothesis from the current session.")
     table.add_row("/exit", "Leave the chat shell.")
     console.print(Panel(table, title="LABIT Chat Commands", border_style="magenta"))
@@ -314,6 +327,35 @@ def _render_hypothesis_preview(draft, *, project: str) -> None:
         console.print(Panel(Markdown(draft.rationale_markdown), title="Rationale", border_style="blue"))
     if draft.experiment_plan_markdown:
         console.print(Panel(Markdown(draft.experiment_plan_markdown), title="Experiment Plan", border_style="magenta"))
+
+
+def _render_idea_preview(draft) -> None:
+    console.print(
+        Panel(
+            (
+                f"[bold]Summary[/bold]:\n{draft.summary_markdown}\n\n"
+                f"[bold]Key question[/bold]: {draft.key_question}"
+            ),
+            title=f"[bold green]Idea Draft · {draft.title}[/bold green]",
+            border_style="green",
+        )
+    )
+
+
+def _render_capture_records(kind: str, records) -> None:
+    label_map = {
+        "idea": "Ideas",
+        "note": "Notes",
+        "todo": "Todos",
+    }
+    label = label_map.get(kind, f"{kind.title()}s")
+    console.print(f"[bold]{label}[/bold]")
+    if not records:
+        console.print(f"[dim]No {kind}s yet.[/dim]")
+        return
+    for item in records:
+        console.print(f"- [bold]{item.title}[/bold] [dim]({item.created_at or 'unknown date'})[/dim]")
+        console.print(f"  [dim]{item.path}[/dim]")
 
 
 def run_chat_shell(
@@ -353,6 +395,91 @@ def run_chat_shell(
                 continue
             if command == "/mode":
                 _render_session_summary(current_session)
+                continue
+            if command in {"/idea", "/note", "/todo"}:
+                kind_map = {
+                    "/idea": "idea",
+                    "/note": "note",
+                    "/todo": "todo",
+                }
+                kind = kind_map[command]
+                if not current_session.project:
+                    console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
+                    continue
+                capture_service = _capture_service()
+                if not argument:
+                    try:
+                        if kind == "idea":
+                            records = capture_service.list_ideas(current_session.project)
+                        elif kind == "note":
+                            records = capture_service.list_notes(current_session.project)
+                        else:
+                            records = capture_service.list_todos(current_session.project)
+                    except Exception as exc:
+                        console.print(f"[bold red]Error:[/bold red] {exc}")
+                        continue
+                    _render_capture_records(kind, records)
+                    continue
+
+                if kind == "idea":
+                    try:
+                        with console.status("[bold blue]Drafting idea from current session...[/bold blue]"):
+                            draft = _idea_drafter().draft_from_session(
+                                session=current_session,
+                                transcript=service.transcript(current_session.session_id),
+                                context_snapshot=service.context_snapshot(current_session.session_id),
+                                user_intent=argument,
+                                provider=current_session.participants[0].provider,
+                            )
+                    except Exception as exc:
+                        console.print(f"[bold red]Error:[/bold red] {exc}")
+                        continue
+
+                    console.print("")
+                    _render_idea_preview(draft)
+                    if not _confirm_in_shell("Save this idea?", default=True):
+                        console.print("[dim]Cancelled idea capture.[/dim]")
+                        continue
+
+                    try:
+                        record = capture_service.save_idea(
+                            project=current_session.project,
+                            draft=draft,
+                            session=current_session,
+                            intent=argument,
+                        )
+                    except Exception as exc:
+                        console.print(f"[bold red]Error:[/bold red] {exc}")
+                        continue
+                else:
+                    try:
+                        if kind == "note":
+                            record = capture_service.save_note(
+                                project=current_session.project,
+                                content=argument,
+                                session=current_session,
+                            )
+                        else:
+                            record = capture_service.save_todo(
+                                project=current_session.project,
+                                content=argument,
+                                session=current_session,
+                            )
+                    except Exception as exc:
+                        console.print(f"[bold red]Error:[/bold red] {exc}")
+                        continue
+
+                console.print(
+                    Panel(
+                        (
+                            f"[bold]Saved[/bold]: {record.title}\n"
+                            f"[bold]Path[/bold]: {record.path}\n"
+                            f"[bold]Source[/bold]: {record.source}"
+                        ),
+                        title=f"[bold green]{kind.title()} captured[/bold green]",
+                        border_style="green",
+                    )
+                )
                 continue
             if command == "/hypothesis":
                 user_intent = argument
