@@ -216,12 +216,12 @@ class PaperFocusContextProvider(ConversationContextProvider):
 
     def _coerce_excerpt_chars(self, value: object) -> int:
         if value is None:
-            return 20000
+            return 8000
         try:
             parsed = int(value)
         except (TypeError, ValueError):
-            return 20000
-        return max(2000, min(parsed, 80000))
+            return 8000
+        return max(2000, min(parsed, 40000))
 
     def _render_metadata(self, service: PaperService, meta, *, project: str | None) -> str:
         authors = ", ".join(meta.authors) or "(unknown)"

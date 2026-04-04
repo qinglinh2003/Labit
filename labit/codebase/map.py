@@ -86,7 +86,14 @@ class CodeMapBuilder:
             lines.append(excerpt[:readme_chars].rstrip())
         return "\n".join(lines)
 
-    def build_relevant_paths(self, project: str, *, query: str, max_items: int = 6) -> list[str]:
+    def build_relevant_paths(
+        self,
+        project: str,
+        *,
+        query: str,
+        max_items: int = 6,
+        allow_fallback: bool = False,
+    ) -> list[str]:
         snapshot = self.build_snapshot(project)
         if snapshot is None:
             return []
@@ -112,6 +119,8 @@ class CodeMapBuilder:
             ranked.append((score, candidate))
 
         if not ranked:
+            if not allow_fallback:
+                return []
             fallback = snapshot.entrypoints[:3] + snapshot.config_files[:2] + snapshot.notes[:2]
             deduped: list[str] = []
             for item in fallback:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Callable
 
 from labit.agents.models import AgentRequest, ProviderKind
 from labit.agents.orchestrator import ProviderRegistry
@@ -42,6 +43,9 @@ class ChatTurnResult:
 
 
 class ChatService:
+    DEFAULT_REASONING_EFFORT = "medium"
+    THINK_REASONING_EFFORT = "high"
+
     def __init__(
         self,
         paths: RepoPaths,
@@ -132,6 +136,40 @@ class ChatService:
         return self.store.load_context_snapshot(session_id)
 
     def ask(self, *, session_id: str, content: str) -> ChatTurnResult:
+        return self._ask_impl(session_id=session_id, content=content)
+
+    def ask_stream(
+        self,
+        *,
+        session_id: str,
+        content: str,
+        force_deep_context: bool = False,
+        reasoning_effort: str | None = None,
+        on_reply_start: Callable[[ChatParticipant], None] | None = None,
+        on_reply_delta: Callable[[ChatParticipant, str], None] | None = None,
+        on_reply_complete: Callable[[ChatParticipant, str], None] | None = None,
+    ) -> ChatTurnResult:
+        return self._ask_impl(
+            session_id=session_id,
+            content=content,
+            force_deep_context=force_deep_context,
+            reasoning_effort=reasoning_effort,
+            on_reply_start=on_reply_start,
+            on_reply_delta=on_reply_delta,
+            on_reply_complete=on_reply_complete,
+        )
+
+    def _ask_impl(
+        self,
+        *,
+        session_id: str,
+        content: str,
+        force_deep_context: bool = False,
+        reasoning_effort: str | None = None,
+        on_reply_start: Callable[[ChatParticipant], None] | None = None,
+        on_reply_delta: Callable[[ChatParticipant, str], None] | None = None,
+        on_reply_complete: Callable[[ChatParticipant, str], None] | None = None,
+    ) -> ChatTurnResult:
         session = self.load_session(session_id)
         if session.status != ChatStatus.ACTIVE:
             raise ValueError(f"Chat session '{session_id}' is not active.")
@@ -168,6 +206,11 @@ class ChatService:
                         snapshot=snapshot,
                         turn_index=turn_index,
                         reply_to=user_message.message_id,
+                        force_deep_context=force_deep_context,
+                        reasoning_effort=reasoning_effort,
+                        on_reply_start=on_reply_start,
+                        on_reply_delta=on_reply_delta,
+                        on_reply_complete=on_reply_complete,
                     )
                 )
         else:
@@ -181,6 +224,11 @@ class ChatService:
                     snapshot=snapshot,
                     turn_index=turn_index,
                     reply_to=user_message.message_id,
+                    force_deep_context=force_deep_context,
+                    reasoning_effort=reasoning_effort,
+                    on_reply_start=on_reply_start,
+                    on_reply_delta=on_reply_delta,
+                    on_reply_complete=on_reply_complete,
                 )
                 replies.append(reply)
                 working_transcript.append(reply.message)
@@ -278,6 +326,11 @@ class ChatService:
         snapshot: ContextSnapshot,
         turn_index: int,
         reply_to: str,
+        force_deep_context: bool = False,
+        reasoning_effort: str | None = None,
+        on_reply_start: Callable[[ChatParticipant], None] | None = None,
+        on_reply_delta: Callable[[ChatParticipant, str], None] | None = None,
+        on_reply_complete: Callable[[ChatParticipant, str], None] | None = None,
     ) -> ChatReply:
         adapter = self.registry.get(participant.provider)
         request = AgentRequest(
@@ -287,19 +340,41 @@ class ChatService:
                 participant=participant,
                 transcript=transcript,
                 snapshot=snapshot,
+                force_deep_context=force_deep_context,
             ),
             cwd=str(self.paths.root),
             timeout_seconds=120,
-            extra_args=self._conversation_extra_args(participant.provider),
+            extra_args=self._conversation_extra_args(
+                participant.provider,
+                reasoning_effort=reasoning_effort or self.DEFAULT_REASONING_EFFORT,
+            ),
         )
-        response = adapter.run(request)
+        accumulated = ""
+
+        def _handle_delta(chunk: str) -> None:
+            nonlocal accumulated
+            accumulated += chunk
+            if on_reply_delta is not None:
+                on_reply_delta(participant, accumulated)
+
+        if on_reply_start is not None:
+            on_reply_start(participant)
+
+        if on_reply_delta is not None or on_reply_start is not None or on_reply_complete is not None:
+            response = adapter.run_stream(request, on_text=_handle_delta)
+        else:
+            response = adapter.run(request)
+
+        final_content = response.raw_output.strip()
+        if on_reply_complete is not None:
+            on_reply_complete(participant, final_content)
         message = ChatMessage(
             session_id=session.session_id,
             turn_index=turn_index,
             message_type=MessageType.AGENT,
             speaker=participant.name,
             provider=participant.provider,
-            content=response.raw_output.strip(),
+            content=final_content,
             reply_to=reply_to,
             metadata={"command": response.command},
         )
@@ -359,9 +434,24 @@ class ChatService:
         participant: ChatParticipant,
         transcript: list[ChatMessage],
         snapshot: ContextSnapshot,
+        force_deep_context: bool = False,
     ) -> str:
+        working_memory = self.session_context_store.load_working_memory(session.session_id)
+        if self._use_compact_chat_prompt(session=session) and not force_deep_context:
+            return self._build_compact_chat_prompt(
+                session=session,
+                participant=participant,
+                transcript=transcript,
+                working_memory=working_memory,
+            )
+
         participants = ", ".join(item.name for item in session.participants)
-        assembled_context = self._assemble_context(session=session, transcript=transcript, snapshot=snapshot)
+        assembled_context = self._assemble_context(
+            session=session,
+            transcript=transcript,
+            snapshot=snapshot,
+            deep_memory=force_deep_context,
+        )
 
         return f"""You are `{participant.name}` in a LABIT shared conversation.
 
@@ -391,6 +481,7 @@ Reply as `{participant.name}` only. Use plain text or markdown.
         session: ChatSession,
         transcript: list[ChatMessage],
         snapshot: ContextSnapshot,
+        deep_memory: bool = False,
     ) -> str:
         task_header = "\n".join(
             [
@@ -423,6 +514,7 @@ Reply as `{participant.name}` only. Use plain text or markdown.
             query=base_query_text,
             evidence_refs=evidence_refs,
             exclude_paper_ids=self._bound_paper_ids(session),
+            allow_fallback=deep_memory,
         )
         memory_query_text = self.context_map_builder.shape_memory_query(
             base_query=base_query_text,
@@ -434,7 +526,7 @@ Reply as `{participant.name}` only. Use plain text or markdown.
                 project=session.project,
                 query=memory_query_text,
                 evidence_refs=evidence_refs,
-                limit=6,
+                limit=12 if deep_memory else 6,
             )
         assembled = self.assembler.assemble(
             task_header=task_header,
@@ -447,15 +539,18 @@ Reply as `{participant.name}` only. Use plain text or markdown.
         return assembled.render()
 
     def _format_recent_transcript(self, transcript: list[ChatMessage]) -> str:
+        return self._format_transcript_window(transcript, max_turns=50, max_tokens=60000)
+
+    def _format_transcript_window(self, transcript: list[ChatMessage], *, max_turns: int, max_tokens: int) -> str:
         if not transcript:
             return "(empty conversation)"
-        recent = self._recent_turn_window(transcript, max_turns=50)
+        recent = self._recent_turn_window(transcript, max_turns=max_turns)
         lines: list[str] = []
         for message in recent:
             provider = f" ({message.provider.value})" if message.provider else ""
             lines.append(f"[turn {message.turn_index}] {message.speaker}{provider}: {message.content}")
         rendered = "\n\n".join(lines)
-        return self.assembler.clip_to_tokens(rendered, max_tokens=60000)
+        return self.assembler.clip_to_tokens(rendered, max_tokens=max_tokens)
 
     def _recent_turn_window(self, transcript: list[ChatMessage], *, max_turns: int) -> list[ChatMessage]:
         if not transcript:
@@ -490,6 +585,81 @@ Reply as `{participant.name}` only. Use plain text or markdown.
             parts.extend(working_memory.evidence_refs[-6:])
         return "\n".join(part for part in parts if part).strip()
 
+    def _use_lightweight_prompt(
+        self,
+        *,
+        session: ChatSession,
+        snapshot: ContextSnapshot,
+        working_memory: WorkingMemorySnapshot | None,
+    ) -> bool:
+        return self._use_compact_chat_prompt(session=session)
+
+    def _use_compact_chat_prompt(self, *, session: ChatSession) -> bool:
+        return not any(binding.provider != "none" for binding in session.context_bindings)
+
+    def _build_compact_chat_prompt(
+        self,
+        *,
+        session: ChatSession,
+        participant: ChatParticipant,
+        transcript: list[ChatMessage],
+        working_memory: WorkingMemorySnapshot | None,
+    ) -> str:
+        recent_transcript = self._format_transcript_window(transcript, max_turns=50, max_tokens=60000)
+        project_label = session.project or "(none)"
+        participants = ", ".join(item.name for item in session.participants)
+        working_memory_text = self._render_compact_working_memory(working_memory)
+        return f"""You are `{participant.name}` in a LABIT research conversation.
+
+Project: {project_label}
+Mode: {session.mode.value}
+Participants: {participants}
+
+Guidelines:
+- Continue the conversation naturally.
+- Use the recent transcript and working memory as the shared state.
+- Distinguish evidence from inference when it matters.
+- Be concise and specific.
+
+Working memory:
+{working_memory_text}
+
+Recent transcript:
+{recent_transcript}
+
+Reply as `{participant.name}` only. Use plain text or markdown.
+"""
+
+    def _render_compact_working_memory(self, snapshot: WorkingMemorySnapshot | None) -> str:
+        if snapshot is None:
+            return "(empty)"
+        parts: list[str] = []
+        if snapshot.current_goal:
+            parts.append(f"Current goal: {snapshot.current_goal}")
+        if snapshot.active_artifacts:
+            parts.append(f"Active artifacts: {', '.join(snapshot.active_artifacts)}")
+        if snapshot.decisions_made:
+            parts.append("Decisions:")
+            parts.extend(f"- {item}" for item in snapshot.decisions_made[-4:])
+        if snapshot.open_questions:
+            parts.append("Open questions:")
+            parts.extend(f"- {item}" for item in snapshot.open_questions[-4:])
+        if snapshot.discussion_state.consensus:
+            parts.append("Consensus:")
+            parts.extend(f"- {item}" for item in snapshot.discussion_state.consensus[-3:])
+        if snapshot.discussion_state.disagreements:
+            parts.append("Disagreements:")
+            parts.extend(f"- {item}" for item in snapshot.discussion_state.disagreements[-3:])
+        if snapshot.followups:
+            parts.append("Follow-ups:")
+            parts.extend(f"- {item}" for item in snapshot.followups[-4:])
+        if snapshot.evidence_refs:
+            meaningful_refs = [ref for ref in snapshot.evidence_refs if not ref.startswith("project:")]
+            if meaningful_refs:
+                parts.append("Evidence refs:")
+                parts.extend(f"- {item}" for item in meaningful_refs[-6:])
+        return "\n".join(parts) if parts else "(empty)"
+
     def _bound_paper_ids(self, session: ChatSession) -> list[str]:
         paper_ids: list[str] = []
         for binding in session.context_bindings:
@@ -500,12 +670,35 @@ Reply as `{participant.name}` only. Use plain text or markdown.
                 paper_ids.append(paper_id)
         return paper_ids
 
-    def _conversation_extra_args(self, provider: ProviderKind) -> list[str]:
+    def _conversation_extra_args(self, provider: ProviderKind, *, reasoning_effort: str) -> list[str]:
         if provider == ProviderKind.CLAUDE:
-            return ["--effort", "medium"]
+            return [
+                "--effort",
+                self._claude_effort(reasoning_effort),
+                "--disable-slash-commands",
+                "--no-session-persistence",
+                "--tools",
+                "Read,LS,Glob,Grep",
+                "--permission-mode",
+                "bypassPermissions",
+            ]
         if provider == ProviderKind.CODEX:
-            return ["-c", 'model_reasoning_effort="medium"']
+            return ["-c", f'model_reasoning_effort="{self._codex_effort(reasoning_effort)}"']
         return []
+
+    def _claude_effort(self, effort: str) -> str:
+        normalized = effort.strip().lower()
+        if normalized in {"low", "medium", "high"}:
+            return normalized
+        return self.DEFAULT_REASONING_EFFORT
+
+    def _codex_effort(self, effort: str) -> str:
+        normalized = effort.strip().lower()
+        if normalized == "high":
+            return "high"
+        if normalized == "low":
+            return "low"
+        return "medium"
 
     def _append_message_event(self, *, session: ChatSession, message: ChatMessage) -> None:
         kind_map = {
@@ -513,9 +706,6 @@ Reply as `{participant.name}` only. Use plain text or markdown.
             MessageType.AGENT: SessionEventKind.MESSAGE_AGENT,
             MessageType.SYSTEM: SessionEventKind.MESSAGE_SYSTEM,
         }
-        refs: list[str] = []
-        if session.project:
-            refs.append(f"project:{session.project}")
         self.session_context_store.append_event(
             SessionEvent(
                 session_id=session.session_id,
@@ -530,7 +720,7 @@ Reply as `{participant.name}` only. Use plain text or markdown.
                     "reply_to": message.reply_to,
                     "metadata": message.metadata,
                 },
-                evidence_refs=refs,
+                evidence_refs=[],
             )
         )
 

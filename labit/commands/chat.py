@@ -4,6 +4,7 @@ import json
 
 import typer
 from rich.console import Console
+from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
@@ -152,10 +153,28 @@ def _render_message_block(message) -> None:
         console.print("")
         return
 
-    provider_name = message.provider.value if message.provider else "agent"
+    console.print(
+        _agent_panel(
+            message.speaker,
+            message.provider.value if message.provider else "agent",
+            message.content,
+            turn_index=message.turn_index,
+        )
+    )
+    console.print("")
+
+
+def _agent_panel(speaker: str, provider_name: str, content: str, *, turn_index: int | None = None) -> Panel:
     color, label = _PROVIDER_STYLES.get(provider_name, ("cyan", provider_name.upper()))
-    title = f"{label} · {message.speaker} · turn {message.turn_index}"
-    console.print(Panel(message.content, title=title, border_style=color))
+    title = f"{label} · {speaker}"
+    if turn_index is not None:
+        title = f"{title} · turn {turn_index}"
+    body = content if content.strip() else "[dim]Generating…[/dim]"
+    return Panel(body, title=title, border_style=color)
+
+
+def _render_user_shell_message(content: str) -> None:
+    console.print(Panel(content, title="user", border_style="white"))
     console.print("")
 
 
@@ -239,7 +258,7 @@ def _prompt_in_box(session) -> str:
     participants = ", ".join(f"{item.name}:{item.provider.value}" for item in session.participants)
     prompt_prefix = " › "
     meta_line = f"{project} · {mode} · {participants}"
-    command_line = "Commands: /help /list /new /switch /show /mode /memory /idea /note /todo /synthesize /investigate /hypothesis /exit"
+    command_line = "Commands: /help /list /new /switch /show /mode /memory /think /long-term-memory /think-long-term /idea /note /todo /synthesize /investigate /hypothesis /exit"
 
     if not console.is_terminal:
         console.print(f"[dim]{meta_line}[/dim]")
@@ -312,6 +331,9 @@ def _shell_help() -> None:
     table.add_row("/show", "Show the full transcript for the current session.")
     table.add_row("/mode", "Show current mode, participants, and session info.")
     table.add_row("/memory [id|kind]", "Show recent project memory, one memory by id, or filter by memory kind.")
+    table.add_row("/think <question>", "Ask the next turn with the highest reasoning effort, while keeping the normal chat context shape.")
+    table.add_row("/long-term-memory <question>", "Run a deep long-term memory search for this turn, then answer from the richer retrieved context.")
+    table.add_row("/think-long-term <question>", "Run the next turn with both deep long-term memory search and the highest reasoning effort.")
     table.add_row("/idea [text]", "Save a lightweight project idea. With no text, show saved ideas.")
     table.add_row("/note [text]", "Save a lightweight project note. With no text, show saved notes.")
     table.add_row("/todo [text]", "Save an actionable project todo. With no text, show saved todos.")
@@ -490,6 +512,52 @@ def _session_evidence_refs(session) -> list[str]:
     return refs
 
 
+def _run_streaming_turn(
+    *,
+    service: ChatService,
+    session,
+    query: str,
+    force_deep_context: bool = False,
+    reasoning_effort: str | None = None,
+) -> object | None:
+    _render_user_shell_message(query)
+    participant_panels: dict[str, str] = {}
+
+    def _render_live() -> list[Panel]:
+        panels: list[Panel] = []
+        for participant in session.participants:
+            provider_name = participant.provider.value
+            content = participant_panels.get(participant.name, "")
+            panels.append(_agent_panel(participant.name, provider_name, content))
+        return panels
+
+    def _on_reply_start(participant) -> None:
+        participant_panels[participant.name] = ""
+
+    def _on_reply_delta(participant, content: str) -> None:
+        participant_panels[participant.name] = content
+        live.update(_render_live(), refresh=True)
+
+    def _on_reply_complete(participant, content: str) -> None:
+        participant_panels[participant.name] = content
+        live.update(_render_live(), refresh=True)
+
+    with Live(_render_live(), console=console, refresh_per_second=8, transient=False) as live:
+        try:
+            return service.ask_stream(
+                session_id=session.session_id,
+                content=query,
+                force_deep_context=force_deep_context,
+                reasoning_effort=reasoning_effort,
+                on_reply_start=_on_reply_start,
+                on_reply_delta=_on_reply_delta,
+                on_reply_complete=_on_reply_complete,
+            )
+        except Exception as exc:
+            console.print(f"[bold red]Error:[/bold red] {exc}")
+            return None
+
+
 def run_chat_shell(
     *,
     session,
@@ -552,6 +620,49 @@ def run_chat_shell(
                     console.print(f"[bold red]Error:[/bold red] {exc}")
                     continue
                 _render_memory_detail(record)
+                continue
+            if command == "/think":
+                query = argument.strip()
+                if not query:
+                    console.print("[bold red]Usage:[/bold red] /think <question>")
+                    continue
+                result = _run_streaming_turn(
+                    service=service,
+                    session=current_session,
+                    query=query,
+                    reasoning_effort=ChatService.THINK_REASONING_EFFORT,
+                )
+                if result is not None:
+                    current_session = result.session
+                continue
+            if command in {"/think-long-term", "/think-ltm"}:
+                query = argument.strip()
+                if not query:
+                    console.print("[bold red]Usage:[/bold red] /think-long-term <question>")
+                    continue
+                result = _run_streaming_turn(
+                    service=service,
+                    session=current_session,
+                    query=query,
+                    force_deep_context=True,
+                    reasoning_effort=ChatService.THINK_REASONING_EFFORT,
+                )
+                if result is not None:
+                    current_session = result.session
+                continue
+            if command in {"/long-term-memory", "/ltm"}:
+                query = argument.strip()
+                if not query:
+                    console.print("[bold red]Usage:[/bold red] /long-term-memory <question>")
+                    continue
+                result = _run_streaming_turn(
+                    service=service,
+                    session=current_session,
+                    query=query,
+                    force_deep_context=True,
+                )
+                if result is not None:
+                    current_session = result.session
                 continue
             if command == "/synthesize":
                 try:
@@ -905,16 +1016,56 @@ def run_chat_shell(
             console.print(f"[bold red]Unknown command:[/bold red] {command}")
             continue
 
+        current_live: Live | None = None
+        current_stream_participant: str | None = None
+
+        def _on_reply_start(participant) -> None:
+            nonlocal current_live, current_stream_participant
+            current_stream_participant = participant.name
+            console.print("")
+            current_live = Live(
+                _agent_panel(participant.name, participant.provider.value, ""),
+                console=console,
+                refresh_per_second=12,
+                transient=False,
+            )
+            current_live.start()
+
+        def _on_reply_delta(participant, content: str) -> None:
+            if current_live is None or current_stream_participant != participant.name:
+                _on_reply_start(participant)
+            assert current_live is not None
+            current_live.update(_agent_panel(participant.name, participant.provider.value, content))
+
+        def _on_reply_complete(participant, content: str) -> None:
+            nonlocal current_live, current_stream_participant
+            if current_live is None:
+                console.print("")
+                console.print(_agent_panel(participant.name, participant.provider.value, content))
+                console.print("")
+                return
+            current_live.update(_agent_panel(participant.name, participant.provider.value, content))
+            current_live.stop()
+            current_live = None
+            current_stream_participant = None
+            console.print("")
+
+        console.print("")
+        _render_user_shell_message(raw)
         try:
-            result = service.ask(session_id=current_session.session_id, content=raw)
+            result = service.ask_stream(
+                session_id=current_session.session_id,
+                content=raw,
+                on_reply_start=_on_reply_start,
+                on_reply_delta=_on_reply_delta,
+                on_reply_complete=_on_reply_complete,
+            )
         except Exception as exc:
+            if current_live is not None:
+                current_live.stop()
             console.print(f"[bold red]Error:[/bold red] {exc}")
             continue
         current_session = result.session
-        console.print("")
-        _render_message_block(result.user_message)
-        for reply in result.replies:
-            _render_message_block(reply.message)
 
 
 @chat_app.callback()

@@ -47,8 +47,11 @@ class ContextMapBuilder:
         query: str,
         evidence_refs: list[str] | None = None,
         exclude_paper_ids: list[str] | None = None,
+        allow_fallback: bool = False,
     ) -> list[ContextSection]:
         if not project:
+            return []
+        if not self._has_query_signal(query=query, evidence_refs=evidence_refs or []):
             return []
 
         sections: list[ContextSection] = []
@@ -57,23 +60,29 @@ class ContextMapBuilder:
             query=query,
             evidence_refs=evidence_refs or [],
             exclude_paper_ids=exclude_paper_ids or [],
+            allow_fallback=allow_fallback,
         )
         if paper_section is not None:
             sections.append(paper_section)
 
-        report_section = self._build_report_section(project=project, query=query)
+        report_section = self._build_report_section(project=project, query=query, allow_fallback=allow_fallback)
         if report_section is not None:
             sections.append(report_section)
 
-        docs_section = self._build_docs_section(project=project, query=query)
+        docs_section = self._build_docs_section(project=project, query=query, allow_fallback=allow_fallback)
         if docs_section is not None:
             sections.append(docs_section)
 
-        code_section = self._build_code_section(project=project, query=query)
+        code_section = self._build_code_section(project=project, query=query, allow_fallback=allow_fallback)
         if code_section is not None:
             sections.append(code_section)
 
         return sections
+
+    def _has_query_signal(self, *, query: str, evidence_refs: list[str]) -> bool:
+        if evidence_refs:
+            return True
+        return bool(self._tokenize(query))
 
     def shape_memory_query(self, *, base_query: str, sections: list[ContextSection], max_chars: int = 4000) -> str:
         parts: list[str] = []
@@ -97,6 +106,7 @@ class ContextMapBuilder:
         query: str,
         evidence_refs: list[str],
         exclude_paper_ids: list[str],
+        allow_fallback: bool,
     ) -> ContextSection | None:
         query_tokens = self._tokenize(query)
         exclude = set(exclude_paper_ids)
@@ -128,7 +138,7 @@ class ContextMapBuilder:
                 )
             )
 
-        if not ranked:
+        if not ranked and allow_fallback:
             fallback_entries = sorted(
                 self.paper_service.list_project_index_entries(project),
                 key=lambda entry: (entry.status.value == "ingested", entry.added_at),
@@ -165,9 +175,9 @@ class ContextMapBuilder:
             content="\n".join(lines),
         )
 
-    def _build_report_section(self, *, project: str, query: str) -> ContextSection | None:
+    def _build_report_section(self, *, project: str, query: str, allow_fallback: bool) -> ContextSection | None:
         reports = self.investigation_service.find_related_reports(project, query, limit=4)
-        if not reports:
+        if not reports and allow_fallback:
             reports = self.investigation_service.list_reports(project)[:3]
         if not reports:
             return None
@@ -190,11 +200,13 @@ class ContextMapBuilder:
             content="\n".join(lines),
         )
 
-    def _build_code_section(self, *, project: str, query: str) -> ContextSection | None:
+    def _build_code_section(self, *, project: str, query: str, allow_fallback: bool) -> ContextSection | None:
         snapshot = self.code_map_builder.build_snapshot(project)
         if snapshot is None:
             return None
-        relevant_paths = self.code_map_builder.build_relevant_paths(project, query=query)
+        relevant_paths = self.code_map_builder.build_relevant_paths(project, query=query, allow_fallback=allow_fallback)
+        if not relevant_paths and not allow_fallback:
+            return None
         return ContextSection(
             title="Code Map",
             source="map:code",
@@ -202,7 +214,7 @@ class ContextMapBuilder:
             content=self.code_map_builder.render_snapshot_with_relevant(snapshot, relevant_paths=relevant_paths),
         )
 
-    def _build_docs_section(self, *, project: str, query: str) -> ContextSection | None:
+    def _build_docs_section(self, *, project: str, query: str, allow_fallback: bool) -> ContextSection | None:
         query_tokens = self._tokenize(query)
         ranked: list[_RankedDoc] = []
         for kind, records in (
@@ -227,7 +239,7 @@ class ContextMapBuilder:
                     )
                 )
 
-        if not ranked:
+        if not ranked and allow_fallback:
             fallback: list[_RankedDoc] = []
             for kind, records in (
                 ("todo", self.capture_service.list_todos(project)),

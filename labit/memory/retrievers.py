@@ -32,6 +32,8 @@ class MemoryRetriever:
 
         query_tokens = self._tokenize(query)
         ref_set = set(evidence_refs or [])
+        if not query_tokens and not ref_set:
+            return []
         scored: list[RetrievedMemory] = []
 
         for record in records:
