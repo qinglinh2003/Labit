@@ -271,10 +271,29 @@ External tools you will realistically want:
 - `ssh`
 - `rclone` for `labit sync`
 
-Install locally:
+Install `labit` locally:
 
 ```bash
 pip install -e .
+```
+
+Install the agent CLIs:
+
+```bash
+npm install -g @openai/codex @anthropic-ai/claude-code
+```
+
+If you want a single copy-paste bootstrap on a fresh machine with Python and Node already installed:
+
+```bash
+pip install -e . && npm install -g @openai/codex @anthropic-ai/claude-code
+```
+
+After install, authenticate the tools in the normal way for your environment:
+
+```bash
+codex
+claude
 ```
 
 ## Notes
