@@ -8,6 +8,7 @@ from labit.agents.orchestrator import ProviderRegistry
 from labit.agents.providers import discussion_provider_kinds, provider_available, resolve_provider_kind
 from labit.chat.context import ConversationContextRegistry
 from labit.chat.models import (
+    ChatAttachment,
     ChatMessage,
     ChatMode,
     ChatParticipant,
@@ -135,14 +136,21 @@ class ChatService:
     def context_snapshot(self, session_id: str) -> ContextSnapshot:
         return self.store.load_context_snapshot(session_id)
 
-    def ask(self, *, session_id: str, content: str) -> ChatTurnResult:
-        return self._ask_impl(session_id=session_id, content=content)
+    def ask(
+        self,
+        *,
+        session_id: str,
+        content: str,
+        attachments: list[ChatAttachment] | None = None,
+    ) -> ChatTurnResult:
+        return self._ask_impl(session_id=session_id, content=content, attachments=attachments)
 
     def ask_stream(
         self,
         *,
         session_id: str,
         content: str,
+        attachments: list[ChatAttachment] | None = None,
         force_deep_context: bool = False,
         reasoning_effort: str | None = None,
         on_reply_start: Callable[[ChatParticipant], None] | None = None,
@@ -152,6 +160,7 @@ class ChatService:
         return self._ask_impl(
             session_id=session_id,
             content=content,
+            attachments=attachments,
             force_deep_context=force_deep_context,
             reasoning_effort=reasoning_effort,
             on_reply_start=on_reply_start,
@@ -164,6 +173,7 @@ class ChatService:
         *,
         session_id: str,
         content: str,
+        attachments: list[ChatAttachment] | None = None,
         force_deep_context: bool = False,
         reasoning_effort: str | None = None,
         on_reply_start: Callable[[ChatParticipant], None] | None = None,
@@ -182,6 +192,7 @@ class ChatService:
             message_type=MessageType.USER,
             speaker="user",
             content=content,
+            attachments=attachments or [],
         )
         self.store.append_message(user_message)
         self._append_message_event(session=session, message=user_message)
@@ -344,6 +355,7 @@ class ChatService:
             ),
             cwd=str(self.paths.root),
             timeout_seconds=120,
+            image_paths=self._recent_image_paths(transcript),
             extra_args=self._conversation_extra_args(
                 participant.provider,
                 reasoning_effort=reasoning_effort or self.DEFAULT_REASONING_EFFORT,
@@ -548,7 +560,11 @@ Reply as `{participant.name}` only. Use plain text or markdown.
         lines: list[str] = []
         for message in recent:
             provider = f" ({message.provider.value})" if message.provider else ""
-            lines.append(f"[turn {message.turn_index}] {message.speaker}{provider}: {message.content}")
+            attachment_text = self._message_attachment_summary(message)
+            line = f"[turn {message.turn_index}] {message.speaker}{provider}: {message.content}"
+            if attachment_text:
+                line = f"{line}\n{attachment_text}"
+            lines.append(line)
         rendered = "\n\n".join(lines)
         return self.assembler.clip_to_tokens(rendered, max_tokens=max_tokens)
 
@@ -584,6 +600,29 @@ Reply as `{participant.name}` only. Use plain text or markdown.
             parts.extend(working_memory.active_artifacts[-4:])
             parts.extend(working_memory.evidence_refs[-6:])
         return "\n".join(part for part in parts if part).strip()
+
+    def _recent_image_paths(self, transcript: list[ChatMessage], *, max_images: int = 4) -> list[str]:
+        image_paths: list[str] = []
+        recent = self._recent_turn_window(transcript, max_turns=50)
+        for message in reversed(recent):
+            for attachment in reversed(message.attachments):
+                if attachment.kind.value != "image":
+                    continue
+                if attachment.path in image_paths:
+                    continue
+                image_paths.append(attachment.path)
+                if len(image_paths) >= max_images:
+                    return list(reversed(image_paths))
+        return list(reversed(image_paths))
+
+    def _message_attachment_summary(self, message: ChatMessage) -> str:
+        if not message.attachments:
+            return ""
+        lines: list[str] = []
+        for attachment in message.attachments:
+            label = attachment.label or attachment.path.rsplit("/", 1)[-1]
+            lines.append(f"  [attached {attachment.kind.value}] {label} @ {attachment.path}")
+        return "\n".join(lines)
 
     def _use_lightweight_prompt(
         self,
@@ -718,6 +757,7 @@ Reply as `{participant.name}` only. Use plain text or markdown.
                     "message_id": message.message_id,
                     "provider": message.provider.value if message.provider else None,
                     "reply_to": message.reply_to,
+                    "attachments": [attachment.model_dump(mode="json") for attachment in message.attachments],
                     "metadata": message.metadata,
                 },
                 evidence_refs=[],
@@ -726,6 +766,12 @@ Reply as `{participant.name}` only. Use plain text or markdown.
 
     def _event_summary_for_message(self, message: ChatMessage, *, max_chars: int = 280) -> str:
         text = " ".join(message.content.strip().split())
+        if message.attachments:
+            attachment_bits = ", ".join(
+                f"{attachment.kind.value}:{attachment.label or attachment.path.rsplit('/', 1)[-1]}"
+                for attachment in message.attachments
+            )
+            text = f"{text} [attachments: {attachment_bits}]".strip()
         if len(text) <= max_chars:
             return text
         return f"{text[: max_chars - 1]}…"

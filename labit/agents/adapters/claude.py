@@ -12,6 +12,7 @@ class ClaudeAdapter(AgentAdapter):
     provider = ProviderKind.CLAUDE
 
     def run(self, request: AgentRequest) -> AgentResponse:
+        request = request.model_copy(update={"prompt": self._augment_prompt(request)})
         cmd = self._build_command(request, stream=False)
 
         try:
@@ -61,6 +62,7 @@ class ClaudeAdapter(AgentAdapter):
         if request.output_schema:
             return super().run_stream(request, on_text=on_text)
 
+        request = request.model_copy(update={"prompt": self._augment_prompt(request)})
         cmd = self._build_command(request, stream=True)
         final_text = ""
         streamed_parts: list[str] = []
@@ -146,3 +148,14 @@ class ClaudeAdapter(AgentAdapter):
         if request.extra_args:
             cmd.extend(request.extra_args)
         return cmd
+
+    def _augment_prompt(self, request: AgentRequest) -> str:
+        if not request.image_paths:
+            return request.prompt
+        image_lines = "\n".join(f"- {path}" for path in request.image_paths)
+        return (
+            f"{request.prompt}\n\n"
+            "Attached image file(s):\n"
+            f"{image_lines}\n\n"
+            "Treat these image files as part of the user input. Inspect them directly when answering."
+        )

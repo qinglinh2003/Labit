@@ -136,6 +136,7 @@ class AgentRequest(BaseModel):
     session_id: str | None = None
     timeout_seconds: int | None = None
     allowed_tools: list[str] = Field(default_factory=list)
+    image_paths: list[str] = Field(default_factory=list)
     extra_args: list[str] = Field(default_factory=list)
 
     @field_validator("prompt")

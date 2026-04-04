@@ -34,6 +34,10 @@ class MessageType(str, Enum):
     SYSTEM = "system"
 
 
+class AttachmentKind(str, Enum):
+    IMAGE = "image"
+
+
 class ContextBinding(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -76,6 +80,25 @@ class ChatParticipant(BaseModel):
         value = value.strip()
         if not value:
             raise ValueError("Participant name cannot be empty.")
+        return value
+
+
+class ChatAttachment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    attachment_id: str = Field(default_factory=short_id)
+    kind: AttachmentKind
+    path: str
+    label: str = ""
+    mime_type: str | None = None
+    source: str = "clipboard"
+
+    @field_validator("path", "source")
+    @classmethod
+    def validate_text_fields(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("This field cannot be empty.")
         return value
 
 
@@ -137,6 +160,7 @@ class ChatMessage(BaseModel):
     provider: ProviderKind | None = None
     content: str
     reply_to: str | None = None
+    attachments: list[ChatAttachment] = Field(default_factory=list)
     metadata: dict = Field(default_factory=dict)
     created_at: str = Field(default_factory=utc_now_iso)
 

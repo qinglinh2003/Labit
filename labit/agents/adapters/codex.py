@@ -45,6 +45,10 @@ class CodexAdapter(AgentAdapter):
                 schema_handle.flush()
                 cmd.extend(["--output-schema", str(schema_path)])
 
+            if request.image_paths:
+                for image_path in request.image_paths:
+                    cmd.extend(["--image", image_path])
+
             if request.extra_args:
                 cmd.extend(request.extra_args)
 
@@ -112,6 +116,9 @@ class CodexAdapter(AgentAdapter):
         ]
         if request.cwd:
             cmd[2:2] = ["-C", request.cwd]
+        if request.image_paths:
+            for image_path in request.image_paths:
+                cmd.extend(["--image", image_path])
         if request.extra_args:
             cmd.extend(request.extra_args)
         cmd.append("-")

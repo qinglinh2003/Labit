@@ -15,6 +15,9 @@ class ChatStore:
     def session_dir(self, session_id: str) -> Path:
         return self.paths.conversations_dir / session_id
 
+    def attachments_dir(self, session_id: str) -> Path:
+        return self.session_dir(session_id) / "attachments"
+
     def initialize_session(self, session: ChatSession, snapshot: ContextSnapshot) -> Path:
         session_dir = self.session_dir(session.session_id)
         session_dir.mkdir(parents=True, exist_ok=True)
@@ -24,6 +27,7 @@ class ChatStore:
         transcript_path.touch(exist_ok=True)
         events_path = session_dir / "events.jsonl"
         events_path.touch(exist_ok=True)
+        self.attachments_dir(session.session_id).mkdir(parents=True, exist_ok=True)
         return session_dir
 
     def write_session(self, session: ChatSession) -> Path:
