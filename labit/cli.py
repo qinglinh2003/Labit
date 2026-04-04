@@ -11,6 +11,7 @@ from labit.commands.memory import memory_app
 from labit.commands.paper import paper_app
 from labit.commands.project import project_app
 from labit.commands.sync import sync_app
+from labit.commands.weekly_summary import weekly_summary_app
 
 app = typer.Typer(help="LABIT: local-first control plane for research workflows.", invoke_without_command=True)
 app.add_typer(project_app, name="project")
@@ -21,6 +22,7 @@ app.add_typer(memory_app, name="memory")
 app.add_typer(sync_app, name="sync")
 app.add_typer(chat_app, name="chat")
 app.add_typer(daily_summary_app)
+app.add_typer(weekly_summary_app)
 
 
 @app.callback()

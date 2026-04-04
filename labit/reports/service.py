@@ -24,10 +24,14 @@ from labit.paths import RepoPaths
 from labit.reports.models import (
     DailyActivityItem,
     DailyCommitItem,
+    DailySummaryArtifact,
     DailyEventItem,
     DailySummaryDraft,
     DailySummaryInputs,
     DailySummaryResult,
+    WeeklySummaryDraft,
+    WeeklySummaryInputs,
+    WeeklySummaryResult,
 )
 from labit.services.project_service import ProjectService
 
@@ -578,3 +582,308 @@ Inputs:
             handle.write(content)
             temp_path = Path(handle.name)
         temp_path.replace(path)
+
+
+class WeeklySummaryService(DailySummaryService):
+    def generate(
+        self,
+        *,
+        project: str,
+        target_date: date | None = None,
+        provider: str | ProviderKind | None = None,
+    ) -> WeeklySummaryResult:
+        resolved = self._require_project(project)
+        target = target_date or self._local_now().date()
+        timezone_text = self._timezone_label()
+        inputs = self.collect_inputs(project=resolved, target_date=target, timezone_text=timezone_text)
+        markdown = self._draft_markdown(inputs=inputs, provider=provider)
+        markdown_path, yaml_path = self._write_outputs(project=resolved, week_label=inputs.week_label, markdown=markdown, inputs=inputs)
+        return WeeklySummaryResult(
+            project=resolved,
+            week_label=inputs.week_label,
+            week_start=inputs.week_start,
+            week_end=inputs.week_end,
+            timezone=inputs.timezone,
+            markdown_path=str(markdown_path.relative_to(self.paths.root)),
+            yaml_path=str(yaml_path.relative_to(self.paths.root)),
+            markdown=markdown,
+        )
+
+    def collect_inputs(self, *, project: str, target_date: date, timezone_text: str) -> WeeklySummaryInputs:
+        resolved = self._require_project(project)
+        week_start, week_end, week_label = self._week_window(target_date)
+        daily_inputs: list[DailySummaryInputs] = []
+        daily_artifacts: list[DailySummaryArtifact] = []
+
+        for offset in range(7):
+            day = week_start + timedelta(days=offset)
+            inputs, artifact = self._load_or_collect_daily_summary(project=resolved, target_date=day, timezone_text=timezone_text)
+            daily_inputs.append(inputs)
+            if artifact is not None:
+                daily_artifacts.append(artifact)
+
+        event_counts: Counter[str] = Counter()
+        for item in daily_inputs:
+            event_counts.update(item.event_counts)
+
+        return WeeklySummaryInputs(
+            project=resolved,
+            week_label=week_label,
+            week_start=week_start.isoformat(),
+            week_end=week_end.isoformat(),
+            timezone=timezone_text,
+            day_count=len(daily_artifacts),
+            daily_summaries=daily_artifacts,
+            event_counts=dict(sorted(event_counts.items())),
+            discussion_syntheses=self._merge_activity_items(*(item.discussion_syntheses for item in daily_inputs)),
+            hypotheses_created=self._merge_activity_items(*(item.hypotheses_created for item in daily_inputs)),
+            hypotheses_updated=self._merge_activity_items(*(item.hypotheses_updated for item in daily_inputs)),
+            hypotheses_closed=self._merge_activity_items(*(item.hypotheses_closed for item in daily_inputs)),
+            experiments_created=self._merge_activity_items(*(item.experiments_created for item in daily_inputs)),
+            experiments_updated=self._merge_activity_items(*(item.experiments_updated for item in daily_inputs)),
+            tasks_submitted=self._merge_activity_items(*(item.tasks_submitted for item in daily_inputs)),
+            tasks_finished=self._merge_activity_items(*(item.tasks_finished for item in daily_inputs)),
+            reports=self._merge_activity_items(*(item.reports for item in daily_inputs)),
+            ideas=self._merge_activity_items(*(item.ideas for item in daily_inputs)),
+            notes=self._merge_activity_items(*(item.notes for item in daily_inputs)),
+            todos=self._merge_activity_items(*(item.todos for item in daily_inputs)),
+            papers_pulled=self._merge_activity_items(*(item.papers_pulled for item in daily_inputs)),
+            papers_ingested=self._merge_activity_items(*(item.papers_ingested for item in daily_inputs)),
+            memory_updates=self._merge_activity_items(*(item.memory_updates for item in daily_inputs)),
+            research_os_commits=self._merge_commits(*(item.research_os_commits for item in daily_inputs)),
+            project_code_commits=self._merge_commits(*(item.project_code_commits for item in daily_inputs)),
+        )
+
+    def _draft_markdown(self, *, inputs: WeeklySummaryInputs, provider: str | ProviderKind | None = None) -> str:
+        provider_kind = resolve_provider_kind(provider)
+        request = AgentRequest(
+            role=AgentRole.WRITER,
+            prompt=self._build_weekly_prompt(inputs),
+            cwd=str(self.paths.root),
+            output_schema=self._weekly_draft_schema(),
+            timeout_seconds=180,
+            extra_args=self._extra_args(provider_kind),
+        )
+        try:
+            response = self.registry.get(provider_kind).run(request)
+            payload = response.structured_output
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            if not isinstance(payload, dict):
+                raise ValueError("Weekly summary drafter returned an invalid payload.")
+            draft = WeeklySummaryDraft.model_validate(payload)
+            return self._render_weekly_markdown(inputs=inputs, draft=draft)
+        except Exception:
+            return self._render_weekly_markdown(inputs=inputs, draft=self._fallback_weekly_draft(inputs))
+
+    def _write_outputs(self, *, project: str, week_label: str, markdown: str, inputs: WeeklySummaryInputs) -> tuple[Path, Path]:
+        weekly_dir = self.paths.vault_projects_dir / project / "docs" / "weekly"
+        weekly_dir.mkdir(parents=True, exist_ok=True)
+        markdown_path = weekly_dir / f"{week_label}.md"
+        yaml_path = weekly_dir / f"{week_label}.yaml"
+        self._atomic_write(markdown_path, markdown.rstrip() + "\n")
+        self._atomic_write(yaml_path, yaml.safe_dump(inputs.model_dump(mode="json"), sort_keys=False, allow_unicode=False))
+        return markdown_path, yaml_path
+
+    def _load_or_collect_daily_summary(
+        self,
+        *,
+        project: str,
+        target_date: date,
+        timezone_text: str,
+    ) -> tuple[DailySummaryInputs, DailySummaryArtifact | None]:
+        daily_dir = self.paths.vault_projects_dir / project / "docs" / "daily"
+        stem = target_date.isoformat()
+        yaml_path = daily_dir / f"{stem}.yaml"
+        markdown_path = daily_dir / f"{stem}.md"
+
+        if yaml_path.exists():
+            payload = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
+            inputs = DailySummaryInputs.model_validate(payload)
+        else:
+            inputs = DailySummaryService.collect_inputs(self, project=project, target_date=target_date, timezone_text=timezone_text)
+
+        markdown_excerpt = ""
+        if markdown_path.exists():
+            markdown_excerpt = self._truncate(markdown_path.read_text(encoding="utf-8"), 5000)
+        elif self._daily_inputs_have_signal(inputs):
+            markdown_excerpt = self._truncate(
+                DailySummaryService._render_markdown(self, inputs=inputs, draft=DailySummaryService._fallback_draft(self, inputs)),
+                5000,
+            )
+
+        artifact: DailySummaryArtifact | None = None
+        if markdown_excerpt or self._daily_inputs_have_signal(inputs):
+            artifact = DailySummaryArtifact(
+                date=stem,
+                markdown_path=str(markdown_path.relative_to(self.paths.root)) if markdown_path.exists() else "",
+                yaml_path=str(yaml_path.relative_to(self.paths.root)) if yaml_path.exists() else "",
+                markdown_excerpt=markdown_excerpt,
+            )
+        return inputs, artifact
+
+    def _build_weekly_prompt(self, inputs: WeeklySummaryInputs) -> str:
+        snapshot = json.dumps(inputs.model_dump(mode="json"), indent=2, sort_keys=True)
+        return f"""You are writing a LABIT weekly summary for one research project.
+
+Return JSON only. Do not add markdown fences or commentary.
+
+This summary should be longer and more synthetic than a daily summary. Write from the provided weekly inputs, which already aggregate the week's daily summaries plus raw structured activity.
+Do not invent experiments, commits, hypotheses, papers, or results that are not present in the inputs.
+
+The final markdown will contain these sections:
+- Weekly Progress
+- Evidence And Results
+- Hypothesis Evolution
+- Papers, Reports, And Key Reads
+- Code And Infrastructure
+- Carry-Over Risks
+- Next Week Plan
+- Free Write
+
+Requirements:
+- Each list field should contain 0 to 8 concise bullet items.
+- `free_write` should be 2 to 6 short paragraphs.
+- Synthesize across days; do not simply restate each day in sequence.
+- Prefer concrete artifact names and ids when available.
+- Emphasize what changed this week, what evidence accumulated, and where next week's effort should go.
+
+Inputs:
+{snapshot}
+"""
+
+    def _weekly_draft_schema(self) -> dict:
+        properties = {
+            "weekly_progress": {"type": "array", "items": {"type": "string"}},
+            "evidence_and_results": {"type": "array", "items": {"type": "string"}},
+            "hypothesis_evolution": {"type": "array", "items": {"type": "string"}},
+            "papers_reports_and_key_reads": {"type": "array", "items": {"type": "string"}},
+            "code_and_infrastructure": {"type": "array", "items": {"type": "string"}},
+            "carry_over_risks": {"type": "array", "items": {"type": "string"}},
+            "next_week_plan": {"type": "array", "items": {"type": "string"}},
+            "free_write": {"type": "string"},
+        }
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": properties,
+            "required": list(properties.keys()),
+        }
+
+    def _render_weekly_markdown(self, *, inputs: WeeklySummaryInputs, draft: WeeklySummaryDraft) -> str:
+        sections = [
+            ("Weekly Progress", draft.weekly_progress),
+            ("Evidence And Results", draft.evidence_and_results),
+            ("Hypothesis Evolution", draft.hypothesis_evolution),
+            ("Papers, Reports, And Key Reads", draft.papers_reports_and_key_reads),
+            ("Code And Infrastructure", draft.code_and_infrastructure),
+            ("Carry-Over Risks", draft.carry_over_risks),
+            ("Next Week Plan", draft.next_week_plan),
+        ]
+        lines = [
+            f"# Weekly Summary — {inputs.week_label}",
+            f"**Project**: {inputs.project}",
+            f"**Week**: {inputs.week_start} to {inputs.week_end}",
+            f"**Timezone**: {inputs.timezone}",
+            "",
+        ]
+        for title, items in sections:
+            lines.append(f"## {title}")
+            lines.append("")
+            if items:
+                lines.extend(f"- {item}" for item in items)
+            else:
+                lines.append("- None.")
+            lines.append("")
+        lines.extend(["## Free Write", "", draft.free_write or "No weekly narrative summary was generated.", ""])
+        return "\n".join(lines).rstrip()
+
+    def _fallback_weekly_draft(self, inputs: WeeklySummaryInputs) -> WeeklySummaryDraft:
+        weekly_progress = []
+        weekly_progress.extend(item.title for item in inputs.hypotheses_created[:3])
+        weekly_progress.extend(item.title for item in inputs.experiments_created[:3])
+        weekly_progress.extend(item.title for item in inputs.papers_ingested[:2])
+        evidence = [item.title or item.summary for item in [*inputs.tasks_finished, *inputs.reports, *inputs.memory_updates][:8]]
+        hypothesis_evolution = [
+            item.title or item.summary
+            for item in [*inputs.hypotheses_created, *inputs.hypotheses_updated, *inputs.hypotheses_closed][:8]
+        ]
+        key_reads = [
+            item.title
+            for item in [*inputs.papers_ingested, *inputs.papers_pulled, *inputs.reports, *inputs.ideas][:8]
+        ]
+        code_and_infra = [
+            f"{item.repo_label}: {item.sha[:7]} {item.message}"
+            for item in [*inputs.research_os_commits, *inputs.project_code_commits][:8]
+        ]
+        carry_over = [item.title or item.summary for item in [*inputs.todos, *inputs.discussion_syntheses][:8]]
+        next_week = carry_over[:5] or ["Continue the highest-priority open loops from this week."]
+        free_write = (
+            "This weekly summary was synthesized from the week's daily summaries and structured LABIT artifacts. "
+            "Use it as a strategic review of what changed this week, what evidence accumulated, and what deserves focus next week."
+        )
+        return WeeklySummaryDraft(
+            weekly_progress=weekly_progress[:8],
+            evidence_and_results=evidence[:8],
+            hypothesis_evolution=hypothesis_evolution[:8],
+            papers_reports_and_key_reads=key_reads[:8],
+            code_and_infrastructure=code_and_infra[:8],
+            carry_over_risks=carry_over[:8],
+            next_week_plan=next_week[:8],
+            free_write=free_write,
+        )
+
+    def _week_window(self, target_date: date) -> tuple[date, date, str]:
+        iso = target_date.isocalendar()
+        week_start = target_date - timedelta(days=target_date.weekday())
+        week_end = week_start + timedelta(days=6)
+        return week_start, week_end, f"{iso.year}-W{iso.week:02d}"
+
+    def _daily_inputs_have_signal(self, inputs: DailySummaryInputs) -> bool:
+        return any(
+            [
+                inputs.event_counts,
+                inputs.discussion_syntheses,
+                inputs.hypotheses_created,
+                inputs.hypotheses_updated,
+                inputs.hypotheses_closed,
+                inputs.experiments_created,
+                inputs.experiments_updated,
+                inputs.tasks_submitted,
+                inputs.tasks_finished,
+                inputs.reports,
+                inputs.ideas,
+                inputs.notes,
+                inputs.todos,
+                inputs.papers_pulled,
+                inputs.papers_ingested,
+                inputs.memory_updates,
+                inputs.research_os_commits,
+                inputs.project_code_commits,
+            ]
+        )
+
+    def _merge_activity_items(self, *groups: list[DailyActivityItem]) -> list[DailyActivityItem]:
+        merged: dict[str, DailyActivityItem] = {}
+        for group in groups:
+            for item in group:
+                key = item.path or "::".join([item.title, item.created_at, item.updated_at, item.status])
+                merged[key] = item
+        return sorted(
+            merged.values(),
+            key=lambda item: (item.updated_at or item.created_at, item.title),
+            reverse=True,
+        )
+
+    def _merge_commits(self, *groups: list[DailyCommitItem]) -> list[DailyCommitItem]:
+        merged: dict[str, DailyCommitItem] = {}
+        for group in groups:
+            for item in group:
+                merged[item.sha] = item
+        return sorted(merged.values(), key=lambda item: item.authored_at, reverse=True)
+
+    def _truncate(self, text: str, limit: int) -> str:
+        stripped = text.strip()
+        if len(stripped) <= limit:
+            return stripped
+        return stripped[: limit - 3].rstrip() + "..."
