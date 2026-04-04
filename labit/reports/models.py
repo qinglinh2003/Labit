@@ -1,0 +1,175 @@
+from __future__ import annotations
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class DailyActivityItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str
+    summary: str = ""
+    path: str = ""
+    status: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+    refs: list[str] = Field(default_factory=list)
+
+    @field_validator("title", "summary", "path", "status", "created_at", "updated_at", mode="before")
+    @classmethod
+    def strip_text(cls, value: object) -> object:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("refs", mode="before")
+    @classmethod
+    def normalize_refs(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [item.strip() for item in value.split(",")]
+        if not isinstance(value, list):
+            raise ValueError("refs must be a list of strings.")
+        cleaned: list[str] = []
+        for item in value:
+            text = str(item).strip()
+            if text and text not in cleaned:
+                cleaned.append(text)
+        return cleaned
+
+
+class DailyCommitItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sha: str
+    message: str
+    authored_at: str = ""
+    repo_label: str
+    repo_path: str = ""
+
+    @field_validator("sha", "message", "authored_at", "repo_label", "repo_path", mode="before")
+    @classmethod
+    def strip_text(cls, value: object) -> object:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+
+class DailyEventItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+    summary: str
+    created_at: str
+    actor: str = ""
+    evidence_refs: list[str] = Field(default_factory=list)
+
+    @field_validator("kind", "summary", "created_at", "actor", mode="before")
+    @classmethod
+    def strip_text(cls, value: object) -> object:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("evidence_refs", mode="before")
+    @classmethod
+    def normalize_refs(cls, value: object) -> list[str]:
+        return DailyActivityItem.normalize_refs(value)
+
+
+class DailySummaryInputs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project: str
+    date: str
+    timezone: str
+    event_counts: dict[str, int] = Field(default_factory=dict)
+    events: list[DailyEventItem] = Field(default_factory=list)
+    discussion_syntheses: list[DailyActivityItem] = Field(default_factory=list)
+    hypotheses_created: list[DailyActivityItem] = Field(default_factory=list)
+    hypotheses_updated: list[DailyActivityItem] = Field(default_factory=list)
+    hypotheses_closed: list[DailyActivityItem] = Field(default_factory=list)
+    experiments_created: list[DailyActivityItem] = Field(default_factory=list)
+    experiments_updated: list[DailyActivityItem] = Field(default_factory=list)
+    tasks_submitted: list[DailyActivityItem] = Field(default_factory=list)
+    tasks_finished: list[DailyActivityItem] = Field(default_factory=list)
+    reports: list[DailyActivityItem] = Field(default_factory=list)
+    ideas: list[DailyActivityItem] = Field(default_factory=list)
+    notes: list[DailyActivityItem] = Field(default_factory=list)
+    todos: list[DailyActivityItem] = Field(default_factory=list)
+    papers_pulled: list[DailyActivityItem] = Field(default_factory=list)
+    papers_ingested: list[DailyActivityItem] = Field(default_factory=list)
+    memory_updates: list[DailyActivityItem] = Field(default_factory=list)
+    research_os_commits: list[DailyCommitItem] = Field(default_factory=list)
+    project_code_commits: list[DailyCommitItem] = Field(default_factory=list)
+
+    @field_validator("project", "date", "timezone", mode="before")
+    @classmethod
+    def strip_text(cls, value: object) -> object:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+
+class DailySummaryDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    what_moved_today: list[str] = Field(default_factory=list)
+    evidence_produced: list[str] = Field(default_factory=list)
+    hypothesis_state: list[str] = Field(default_factory=list)
+    papers_reports_and_captures: list[str] = Field(default_factory=list)
+    code_changes: list[str] = Field(default_factory=list)
+    open_loops: list[str] = Field(default_factory=list)
+    tomorrow_plan: list[str] = Field(default_factory=list)
+    free_write: str = ""
+
+    @field_validator(
+        "what_moved_today",
+        "evidence_produced",
+        "hypothesis_state",
+        "papers_reports_and_captures",
+        "code_changes",
+        "open_loops",
+        "tomorrow_plan",
+        mode="before",
+    )
+    @classmethod
+    def normalize_lists(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [item.strip() for item in value.split("\n")]
+        if not isinstance(value, list):
+            raise ValueError("This field must be a list of strings.")
+        cleaned: list[str] = []
+        for item in value:
+            text = str(item).strip()
+            if text and text not in cleaned:
+                cleaned.append(text)
+        return cleaned
+
+    @field_validator("free_write", mode="before")
+    @classmethod
+    def strip_free_write(cls, value: object) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+
+class DailySummaryResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project: str
+    date: str
+    timezone: str
+    markdown_path: str
+    yaml_path: str
+    markdown: str

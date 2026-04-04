@@ -4,6 +4,7 @@ import typer
 
 from labit import __version__
 from labit.commands.chat import chat_app
+from labit.commands.daily_summary import daily_summary_app
 from labit.commands.experiment import experiment_app
 from labit.commands.hypothesis import hypothesis_app
 from labit.commands.memory import memory_app
@@ -19,6 +20,7 @@ app.add_typer(experiment_app, name="experiment")
 app.add_typer(memory_app, name="memory")
 app.add_typer(sync_app, name="sync")
 app.add_typer(chat_app, name="chat")
+app.add_typer(daily_summary_app)
 
 
 @app.callback()
