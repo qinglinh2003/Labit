@@ -1934,6 +1934,7 @@ def open_chat(
         _emit(session.model_dump(mode="json"), as_json=True)
         return
     _render_session_summary(session)
+    run_chat_shell(session=session, service=service)
 
 
 @chat_app.command("list")
