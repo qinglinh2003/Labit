@@ -716,7 +716,7 @@ Reply as `{participant.name}` only. Use plain text or markdown.
                 "--disable-slash-commands",
                 "--no-session-persistence",
                 "--tools",
-                "Read,LS,Glob,Grep,Edit,Write",
+                "Read,LS,Glob,Grep,Edit,Write,Bash",
                 "--permission-mode",
                 "bypassPermissions",
             ]
