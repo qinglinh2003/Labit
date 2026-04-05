@@ -52,7 +52,7 @@ class ProjectService:
             return ProjectSpec.model_validate(raw, extra="ignore")
         except ValidationError as exc:
             raise ValueError(
-                f"Project '{resolved}' uses an outdated config format. Recreate it under the new compute-profile schema.\n{exc}"
+                f"Project '{resolved}' uses an outdated config format. Recreate it under the new project-profile schema.\n{exc}"
             ) from exc
 
     def load_project_seed(self, seed_path: Path) -> ProjectSeed:
@@ -224,6 +224,14 @@ class ProjectService:
         return len(structured_ids | legacy_ids)
 
     def count_project_papers(self, name: str) -> int:
+        key_papers_index = self.paths.vault_projects_dir / name / "key_papers" / "index.yaml"
+        if key_papers_index.exists():
+            raw = yaml.safe_load(key_papers_index.read_text()) or {}
+            if isinstance(raw, dict):
+                papers = raw.get("papers")
+                if isinstance(papers, list):
+                    return len(papers)
+
         index_path = self.paths.vault_projects_dir / name / "papers.yaml"
         if index_path.exists():
             data = yaml.safe_load(index_path.read_text()) or []

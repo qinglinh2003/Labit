@@ -15,6 +15,7 @@ class RepoPaths:
     configs_dir: Path
     project_configs_dir: Path
     compute_configs_dir: Path
+    storage_configs_dir: Path
     active_project_path: Path
     vault_dir: Path
     vault_projects_dir: Path
@@ -34,6 +35,7 @@ class RepoPaths:
             configs_dir=root / "configs",
             project_configs_dir=root / "configs" / "projects",
             compute_configs_dir=root / "configs" / "compute",
+            storage_configs_dir=root / "configs" / "storage",
             active_project_path=root / "configs" / "active_project",
             vault_dir=root / "vault",
             vault_projects_dir=root / "vault" / "projects",

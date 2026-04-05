@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import shlex
 import subprocess
@@ -80,7 +79,7 @@ class ComputeService:
 
     def test_compute(self, name: str, *, on_step: Callable[[str], None] | None = None) -> ComputeCheckResult:
         profile = self.load_compute(name)
-        ssh_command = self._ssh_command(profile)
+        ssh_command = self.build_ssh_command(profile)
 
         if on_step:
             on_step("Checking SSH connection")
@@ -208,7 +207,7 @@ class ComputeService:
             message=message,
         )
 
-    def _ssh_command(self, profile: ComputeProfile) -> list[str]:
+    def build_ssh_command(self, profile: ComputeProfile) -> list[str]:
         command = ["ssh"]
         if profile.connection.port != 22:
             command.extend(["-p", str(profile.connection.port)])

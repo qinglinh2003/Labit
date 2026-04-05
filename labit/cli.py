@@ -16,6 +16,7 @@ from labit.commands.hypothesis import hypothesis_app
 from labit.commands.memory import memory_app
 from labit.commands.paper import paper_app
 from labit.commands.project import project_app
+from labit.commands.storage import storage_app
 from labit.commands.sync import sync_app
 from labit.commands.weekly_summary import weekly_summary_app
 from labit.paths import RepoPaths
@@ -24,6 +25,7 @@ from labit.services.project_service import ProjectService
 app = typer.Typer(help="LABIT: local-first control plane for research workflows.", invoke_without_command=True)
 app.add_typer(project_app, name="project")
 app.add_typer(compute_app, name="compute")
+app.add_typer(storage_app, name="storage")
 app.add_typer(paper_app, name="paper")
 app.add_typer(hypothesis_app, name="hypothesis")
 app.add_typer(experiment_app, name="experiment")
