@@ -51,6 +51,7 @@ TMUX
 # Install LABIT in editable mode
 if [ -f ~/research-os/pyproject.toml ]; then
     pip install --break-system-packages -e ~/research-os
+    labit --install-completion bash 2>/dev/null || true
 fi
 
 # Setup cron jobs

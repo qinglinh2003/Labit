@@ -2112,23 +2112,5 @@ def resume_chat(
         )
         return
 
-    _render_session_summary(session)
-    console.print("")
-    _render_transcript(transcript[-8:])
-    next_message = _prompt_optional("Next message", default="")
-    if not next_message:
-        console.print("[dim]No new message sent.[/dim]")
-        return
-
-    try:
-        result = service.ask(session_id=session_id, content=next_message)
-    except Exception as exc:
-        raise typer.Exit(code=_fail(str(exc), as_json=False))
-
-    console.print(f"[bold][turn {result.user_message.turn_index}] user[/bold]")
-    console.print(result.user_message.content)
-    console.print("")
-    for reply in result.replies:
-        console.print(f"[cyan][turn {reply.message.turn_index}] {reply.participant.name}[/cyan]")
-        console.print(_md(reply.message.content))
-        console.print("")
+    console.print(f"[dim]Resuming chat session {session_id}.[/dim]")
+    run_chat_shell(session=session, service=service)
