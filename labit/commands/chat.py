@@ -552,7 +552,7 @@ def _shell_help() -> None:
     table.add_row("/new", "Create a new session and switch into it.")
     table.add_row("/switch <session_id>", "Switch to another session.")
     table.add_row("/show", "Show the full transcript for the current session.")
-    table.add_row("/mode", "Show current mode, participants, and session info.")
+    table.add_row("/mode [mode]", "Show or switch mode (single, round_robin, parallel).")
     table.add_row("/memory [id|kind]", "Show recent project memory, one memory by id, or filter by memory kind.")
     table.add_row("/think <question>", "Ask the next turn with the highest reasoning effort, while keeping the normal chat context shape.")
     table.add_row("/long-term-memory <question>", "Run a deep long-term memory search for this turn, then answer from the richer retrieved context.")
@@ -1032,7 +1032,23 @@ def run_chat_shell(
                 _render_transcript(service.transcript(current_session.session_id))
                 continue
             if command == "/mode":
-                _render_session_summary(current_session)
+                if not argument:
+                    _render_session_summary(current_session)
+                    continue
+                mode_str = argument.strip().lower()
+                try:
+                    new_mode = ChatMode(mode_str)
+                except ValueError:
+                    console.print(f"[bold red]Invalid mode:[/bold red] {mode_str}. Use single, round_robin, or parallel.")
+                    continue
+                if new_mode == current_session.mode:
+                    console.print(f"[dim]Already in {new_mode.value} mode.[/dim]")
+                    continue
+                current_session = service.update_mode(current_session.session_id, new_mode)
+                console.print(f"[bold #0080ff]Switched to {new_mode.value} mode.[/bold #0080ff]")
+                if new_mode != ChatMode.SINGLE:
+                    names = ", ".join(p.name for p in current_session.participants)
+                    console.print(f"[dim]Participants: {names}[/dim]")
                 continue
             if command == "/memory":
                 if not current_session.project:

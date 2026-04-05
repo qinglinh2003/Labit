@@ -262,6 +262,19 @@ class ChatService:
             context_snapshot=snapshot,
         )
 
+    def update_mode(self, session_id: str, mode: ChatMode) -> ChatSession:
+        session = self.load_session(session_id)
+        updates: dict = {"mode": mode, "updated_at": utc_now_iso()}
+        if mode != ChatMode.SINGLE and len(session.participants) < 2:
+            existing = session.participants[0] if session.participants else None
+            existing_kind = existing.provider if existing else None
+            second_kind = self._other_provider(existing_kind) if existing_kind else resolve_provider_kind(None)
+            second = ChatParticipant(name=second_kind.value, provider=second_kind)
+            updates["participants"] = list(session.participants) + [second]
+        updated = session.model_copy(update=updates)
+        self.store.write_session(updated)
+        return updated
+
     def close(self, session_id: str) -> ChatSession:
         session = self.load_session(session_id)
         updated = session.model_copy(update={"status": ChatStatus.CLOSED, "updated_at": utc_now_iso()})
