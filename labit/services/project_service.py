@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 import yaml
+from pydantic import ValidationError
 
 from labit.models import ProjectDraft, ProjectSeed, ProjectSpec, ProjectSummary, SemanticBrief
 from labit.paths import RepoPaths
@@ -47,7 +48,12 @@ class ProjectService:
         # Existing repo configs may carry legacy metadata such as `docs`.
         # Ignore unknown fields when reading repo-owned config files so
         # inspection commands remain backward-compatible.
-        return ProjectSpec.model_validate(raw, extra="ignore")
+        try:
+            return ProjectSpec.model_validate(raw, extra="ignore")
+        except ValidationError as exc:
+            raise ValueError(
+                f"Project '{resolved}' uses an outdated config format. Recreate it under the new compute-profile schema.\n{exc}"
+            ) from exc
 
     def load_project_seed(self, seed_path: Path) -> ProjectSeed:
         raw = yaml.safe_load(seed_path.read_text()) or {}
@@ -152,7 +158,13 @@ class ProjectService:
         )
 
     def list_project_summaries(self) -> list[ProjectSummary]:
-        return [self.get_project_summary(name) for name in self.list_project_names()]
+        summaries: list[ProjectSummary] = []
+        for name in self.list_project_names():
+            try:
+                summaries.append(self.get_project_summary(name))
+            except ValueError:
+                continue
+        return summaries
 
     def planned_create_actions(self, spec: ProjectSpec, *, set_active: bool = False) -> list[str]:
         actions = [

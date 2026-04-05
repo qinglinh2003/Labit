@@ -118,22 +118,22 @@ class ExperimentExecutionProfile(BaseModel):
 
     backend: ExecutionBackend
     profile: str = "default"
+    user: str = "root"
     host: str = ""
+    port: int = 22
+    ssh_key: str = ""
     workdir: str = ""
     datadir: str = ""
-    runtime: ExecutionRuntime = ExecutionRuntime.PLAIN
-    conda_env: str = ""
-    conda_init: str = ""
-    uv_project: str = ""
+    setup_script: str = ""
 
     @field_validator(
         "profile",
+        "user",
         "host",
+        "ssh_key",
         "workdir",
         "datadir",
-        "conda_env",
-        "conda_init",
-        "uv_project",
+        "setup_script",
         mode="before",
     )
     @classmethod
@@ -147,13 +147,10 @@ class ExperimentExecutionProfile(BaseModel):
     @model_validator(mode="after")
     def validate_runtime_requirements(self) -> "ExperimentExecutionProfile":
         if self.backend == ExecutionBackend.SSH:
-            if not self.host or not self.workdir:
-                raise ValueError("SSH execution requires both host and workdir.")
-        if self.runtime == ExecutionRuntime.CONDA:
-            if not self.conda_env or not self.conda_init:
-                raise ValueError("Conda execution requires conda_env and conda_init.")
-        if self.runtime == ExecutionRuntime.UV and not self.uv_project:
-            raise ValueError("UV execution requires uv_project.")
+            if not self.user or not self.host or not self.workdir:
+                raise ValueError("SSH execution requires user, host, and workdir.")
+        if self.port < 1 or self.port > 65535:
+            raise ValueError("SSH execution requires a valid port.")
         return self
 
 
@@ -558,7 +555,10 @@ class LaunchArtifact(BaseModel):
     experiment_id: str
     project: str
     executor: ExecutionBackend
+    remote_user: str = "root"
     remote_host: str = ""
+    remote_port: int = 22
+    ssh_key: str = ""
     status: LaunchStatus = LaunchStatus.PREPARED
     frozen_spec: FrozenLaunchSpec
     code_snapshot: CodeSnapshot = Field(default_factory=CodeSnapshot)
@@ -575,7 +575,9 @@ class LaunchArtifact(BaseModel):
         "task_id",
         "experiment_id",
         "project",
+        "remote_user",
         "remote_host",
+        "ssh_key",
         "run_sh_path",
         "run_py_path",
         "env_json_path",
