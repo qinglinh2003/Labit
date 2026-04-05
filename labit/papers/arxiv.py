@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -74,6 +75,24 @@ def strip_arxiv_version(identifier: str) -> str:
 
 
 class ArxivClient:
+    _MIN_INTERVAL = 3.0  # seconds between requests (arXiv policy)
+
+    def __init__(self) -> None:
+        self._last_request_at = 0.0
+
+    def _throttle(self) -> None:
+        """Sleep if needed so consecutive requests are ≥ _MIN_INTERVAL apart."""
+        elapsed = time.monotonic() - self._last_request_at
+        if elapsed < self._MIN_INTERVAL:
+            time.sleep(self._MIN_INTERVAL - elapsed)
+
+    def _urlopen(self, url: str, *, timeout: int = 30) -> bytes:
+        self._throttle()
+        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            self._last_request_at = time.monotonic()
+            return response.read()
+
     def search(self, query: str, *, max_results: int = 10, sort_by: str = "relevance") -> list[ArxivPaperSource]:
         query = query.strip()
         if not query:
@@ -84,10 +103,8 @@ class ArxivClient:
             f"{ARXIV_API_URL}?search_query=all:{encoded}"
             f"&start=0&max_results={max_results}&sortBy={sort_by}&sortOrder=descending"
         )
-        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
-                payload = response.read()
+            payload = self._urlopen(url)
         except urllib.error.URLError as exc:
             raise ArxivResolutionError(f"Failed to search arXiv: {exc}") from exc
 
@@ -104,10 +121,8 @@ class ArxivClient:
             )
 
         url = f"{ARXIV_API_URL}?id_list={urllib.parse.quote(identifier)}"
-        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
-                payload = response.read()
+            payload = self._urlopen(url)
         except urllib.error.URLError as exc:
             raise ArxivResolutionError(f"Failed to fetch arXiv metadata: {exc}") from exc
 
@@ -138,9 +153,11 @@ class ArxivClient:
         return data
 
     def _download_bytes(self, url: str) -> tuple[bytes, str]:
+        self._throttle()
         request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                self._last_request_at = time.monotonic()
                 return response.read(), response.headers.get_content_type()
         except urllib.error.HTTPError as exc:
             raise ArxivResolutionError(f"Download failed for {url}: HTTP {exc.code}") from exc

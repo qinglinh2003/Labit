@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from labit.agents.models import ContextPack, MemorySnapshot, ProjectSnapshot, TaskSpec, WorkspaceSnapshot
 from labit.codebase.map import CodeMapBuilder
 from labit.hypotheses.service import HypothesisService
