@@ -9,6 +9,7 @@ from rich.table import Table
 
 from labit import __version__
 from labit.commands.chat import chat_app
+from labit.commands.compute import compute_app
 from labit.commands.daily_summary import daily_summary_app
 from labit.commands.experiment import experiment_app
 from labit.commands.hypothesis import hypothesis_app
@@ -22,6 +23,7 @@ from labit.services.project_service import ProjectService
 
 app = typer.Typer(help="LABIT: local-first control plane for research workflows.", invoke_without_command=True)
 app.add_typer(project_app, name="project")
+app.add_typer(compute_app, name="compute")
 app.add_typer(paper_app, name="paper")
 app.add_typer(hypothesis_app, name="hypothesis")
 app.add_typer(experiment_app, name="experiment")
@@ -46,7 +48,7 @@ def _render_home() -> None:
     paths = RepoPaths.discover()
     service = _project_service()
     active_project = service.active_project_name()
-    project_names = service.list_project_names()
+    project_summaries = service.list_project_summaries()
 
     console.print(
         Panel(
@@ -62,12 +64,12 @@ def _render_home() -> None:
     status.add_column("Status")
     status.add_row("Repo root", str(paths.root))
     status.add_row("Active project", active_project or "(none)")
-    status.add_row("Projects", str(len(project_names)))
+    status.add_row("Projects", str(len(project_summaries)))
     status.add_row("Claude CLI", _tool_status("claude"))
     status.add_row("Codex CLI", _tool_status("codex"))
     console.print(status)
 
-    if not project_names:
+    if not project_summaries:
         next_steps = [
             "Create your first research workspace with `labit project new`.",
             "Then open a session with `labit chat`.",

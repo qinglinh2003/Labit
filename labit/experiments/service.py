@@ -13,7 +13,6 @@ import yaml
 from labit.experiments.models import (
     CodeSnapshot,
     ExecutionBackend,
-    ExecutionRuntime,
     ExperimentDetail,
     ExperimentDraft,
     ExperimentAssessment,
@@ -38,9 +37,9 @@ from labit.experiments.models import (
     TaskSummary,
     utc_now_iso,
 )
-from labit.models import ComputeBackend, RuntimeKind
 from labit.hypotheses.service import HypothesisService
 from labit.paths import RepoPaths
+from labit.services.compute_service import ComputeService
 from labit.services.project_service import ProjectService
 
 
@@ -50,10 +49,12 @@ class ExperimentService:
         paths: RepoPaths,
         *,
         project_service: ProjectService | None = None,
+        compute_service: ComputeService | None = None,
         hypothesis_service: HypothesisService | None = None,
     ):
         self.paths = paths
         self.project_service = project_service or ProjectService(paths)
+        self.compute_service = compute_service or ComputeService(paths)
         self.hypothesis_service = hypothesis_service or HypothesisService(paths)
 
     def list_experiments(self, project: str) -> list[ExperimentSummary]:
@@ -353,7 +354,10 @@ class ExperimentService:
             experiment_id=experiment_id,
             project=resolved,
             executor=detail.record.execution.backend,
+            remote_user=detail.record.execution.user,
             remote_host=detail.record.execution.host,
+            remote_port=detail.record.execution.port,
+            ssh_key=detail.record.execution.ssh_key,
             frozen_spec=frozen_spec,
             code_snapshot=snapshot,
             submission=receipt,
@@ -503,30 +507,22 @@ class ExperimentService:
     def build_default_execution_profile(self, project: str) -> ExperimentExecutionProfile:
         resolved = self._require_project(project)
         spec = self.project_service.load_project(resolved)
-        compute = spec.compute
-        if compute.backend == ComputeBackend.NONE:
+        compute_name = spec.compute_profile.strip()
+        if not compute_name:
             raise ValueError(
-                f"Project '{resolved}' does not declare a compute backend. Configure compute before using experiment execution."
+                f"Project '{resolved}' is not connected to a compute profile. Run 'labit project edit {resolved}' to attach one."
             )
-        if compute.backend != ComputeBackend.SSH:
-            raise ValueError(
-                f"Project '{resolved}' uses unsupported compute backend '{compute.backend.value}' for experiment v1."
-            )
-        runtime_map = {
-            RuntimeKind.PLAIN: ExecutionRuntime.PLAIN,
-            RuntimeKind.CONDA: ExecutionRuntime.CONDA,
-            RuntimeKind.UV: ExecutionRuntime.UV,
-        }
+        compute = self.compute_service.load_compute(compute_name)
         return ExperimentExecutionProfile(
             backend=ExecutionBackend.SSH,
-            profile="default",
-            host=compute.host or "",
-            workdir=compute.workdir or "",
-            datadir=compute.datadir or "",
-            runtime=runtime_map.get(compute.runtime, ExecutionRuntime.PLAIN),
-            conda_env=compute.conda_env or "",
-            conda_init=compute.conda_init or "",
-            uv_project=compute.uv_project or "",
+            profile=compute.name,
+            user=compute.connection.user,
+            host=compute.connection.host,
+            port=compute.connection.port,
+            ssh_key=compute.connection.ssh_key or "",
+            workdir=compute.workspace.workdir,
+            datadir=compute.workspace.datadir or "",
+            setup_script=compute.setup.script,
         )
 
     def build_code_snapshot(self, project: str, *, branch_hint: str = "") -> CodeSnapshot:
@@ -700,14 +696,10 @@ class ExperimentService:
 
     def _render_runtime_preamble(self, execution: ExperimentExecutionProfile) -> list[str]:
         lines: list[str] = []
-        if execution.runtime == ExecutionRuntime.CONDA and execution.conda_init and execution.conda_env:
-            lines.append(execution.conda_init)
-            lines.append(f"conda activate {execution.conda_env}")
-        target_dir = execution.workdir
-        if execution.runtime == ExecutionRuntime.UV and execution.uv_project:
-            target_dir = str(Path(execution.workdir) / execution.uv_project)
-        if target_dir:
-            lines.append(f'cd "{self._shell_path(target_dir)}"')
+        if execution.setup_script:
+            lines.extend(execution.setup_script.splitlines())
+        if execution.workdir:
+            lines.append(f'cd "{self._shell_path(execution.workdir)}"')
         if execution.datadir:
             escaped = self._shell_path(execution.datadir).replace('"', '\\"')
             lines.append(f'export LABIT_DATA_DIR="{escaped}"')
