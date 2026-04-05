@@ -35,7 +35,6 @@ class IdeaDrafter:
             ),
             cwd=str(self.paths.root),
             output_schema=self._schema(),
-            timeout_seconds=120,
             extra_args=self._extra_args(provider_kind),
         )
         response = self.registry.get(provider_kind).run(request)
