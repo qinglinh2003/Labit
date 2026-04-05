@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import json
+import re
+import time
 
 import typer
-from rich.console import Console
+from rich.console import Console, RenderableType
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
 
 from labit.capture.drafter import IdeaDrafter
 from labit.capture.service import CaptureService
 from labit.chat.clipboard import ClipboardImageError, capture_clipboard_image
+from labit.chat.latex_unicode import latex_to_unicode
 from labit.chat.composer import ComposerResult, prompt_toolkit_available, prompt_with_clipboard_image
 from labit.chat.models import ChatMode
 from labit.chat.service import ChatService
@@ -182,12 +186,86 @@ def _render_message_block(message) -> None:
     console.print("")
 
 
-def _agent_panel(speaker: str, provider_name: str, content: str, *, turn_index: int | None = None) -> Panel:
+class _ThinkingIndicator:
+    """Animated spinner with elapsed time for the generating placeholder."""
+
+    def __init__(self) -> None:
+        self._start = time.monotonic()
+        self._spinner = Spinner("dots", style="dim")
+
+    def __rich_console__(self, console: Console, options: object):  # noqa: ANN001
+        elapsed = time.monotonic() - self._start
+        # Build a single-line Text: spinner frame + label
+        text = self._spinner.render(time.monotonic())
+        text.append(f" Thinking… {elapsed:.1f}s", style="dim")
+        yield text
+
+
+_FENCE_INLINE_RE = re.compile(r"(`{3,})(.+)$", re.MULTILINE)
+
+
+def _sanitize_markdown(text: str) -> str:
+    """Fix common AI markdown issues that break the Rich parser.
+
+    1. Closing ``` stuck on the end of a code line → move to its own line.
+    2. Ensure fenced code blocks are always properly closed.
+    """
+    # Fix closing ``` appended to the end of a code line, e.g.:
+    #   python train.py --config foo.yaml```
+    # becomes:
+    #   python train.py --config foo.yaml
+    #   ```
+    in_fence = False
+    lines = text.split("\n")
+    result: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not in_fence:
+            # Opening fence: ```python or just ```
+            if stripped.startswith("```"):
+                in_fence = True
+                result.append(line)
+                # If line is both opening and closing on same line like ```code```
+                # count backticks
+                if stripped.count("```") >= 2 and len(stripped) > 3:
+                    in_fence = False
+            else:
+                result.append(line)
+        else:
+            # Inside a fence — check if line ends with ``` (closing stuck to content)
+            if stripped == "```":
+                in_fence = False
+                result.append(line)
+            elif stripped.endswith("```") and not stripped.startswith("```"):
+                # e.g. "python train.py```" → split into two lines
+                result.append(line[: line.rfind("```")])
+                result.append("```")
+                in_fence = False
+            else:
+                result.append(line)
+    # If still in an unclosed fence, close it
+    if in_fence:
+        result.append("```")
+    fixed = "\n".join(result)
+    # Convert LaTeX math to Unicode, but skip code fences.
+    # Split on fence boundaries and only convert non-code sections.
+    parts = re.split(r"(```[^\n]*\n[\s\S]*?```)", fixed)
+    return "".join(latex_to_unicode(p) if not p.startswith("```") else p for p in parts)
+
+
+def _agent_panel(
+    speaker: str,
+    provider_name: str,
+    content: str,
+    *,
+    turn_index: int | None = None,
+    thinking: _ThinkingIndicator | None = None,
+) -> Panel:
     color, label = _PROVIDER_STYLES.get(provider_name, ("cyan", provider_name.upper()))
     title = f"{label} · {speaker}"
     if turn_index is not None:
         title = f"{title} · turn {turn_index}"
-    body: Markdown | str = Markdown(content) if content.strip() else "[dim]Generating…[/dim]"
+    body: RenderableType = Markdown(_sanitize_markdown(content)) if content.strip() else (thinking or _ThinkingIndicator())
     return Panel(body, title=title, border_style=color)
 
 
@@ -1703,13 +1781,15 @@ def run_chat_shell(
 
         current_live: Live | None = None
         current_stream_participant: str | None = None
+        current_thinking: _ThinkingIndicator | None = None
 
         def _on_reply_start(participant) -> None:
-            nonlocal current_live, current_stream_participant
+            nonlocal current_live, current_stream_participant, current_thinking
             current_stream_participant = participant.name
+            current_thinking = _ThinkingIndicator()
             console.print("")
             current_live = Live(
-                _agent_panel(participant.name, participant.provider.value, ""),
+                _agent_panel(participant.name, participant.provider.value, "", thinking=current_thinking),
                 console=console,
                 refresh_per_second=12,
                 transient=False,
@@ -1717,13 +1797,19 @@ def run_chat_shell(
             current_live.start()
 
         def _on_reply_delta(participant, content: str) -> None:
+            nonlocal current_thinking
             if current_live is None or current_stream_participant != participant.name:
                 _on_reply_start(participant)
             assert current_live is not None
-            current_live.update(_agent_panel(participant.name, participant.provider.value, content))
+            if content.strip():
+                current_thinking = None
+            current_live.update(
+                _agent_panel(participant.name, participant.provider.value, content, thinking=current_thinking)
+            )
 
         def _on_reply_complete(participant, content: str) -> None:
-            nonlocal current_live, current_stream_participant
+            nonlocal current_live, current_stream_participant, current_thinking
+            current_thinking = None
             if current_live is None:
                 console.print("")
                 console.print(_agent_panel(participant.name, participant.provider.value, content))
