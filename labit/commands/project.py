@@ -9,9 +9,11 @@ from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
-from labit.models import ComputeBackend, ProjectSpec, RuntimeKind
+from labit.models import ProjectSpec
 from labit.paths import RepoPaths
+from labit.services.compute_service import ComputeService
 from labit.services.project_service import ProjectService
+from labit.services.storage_service import StorageService
 
 project_app = typer.Typer(help="Manage project state and project specs.")
 console = Console()
@@ -22,12 +24,17 @@ def _service() -> ProjectService:
     return ProjectService(RepoPaths.discover())
 
 
+def _compute_service() -> ComputeService:
+    return ComputeService(RepoPaths.discover())
+
+
+def _storage_service() -> StorageService:
+    return StorageService(RepoPaths.discover())
+
+
 def _emit(data: object, *, as_json: bool) -> None:
     if as_json:
         typer.echo(json.dumps(data, indent=2, sort_keys=True))
-        return
-    if isinstance(data, str):
-        console.print(data)
         return
     console.print(data)
 
@@ -43,30 +50,12 @@ def _prompt_text(label: str, *, default: str = "", required: bool = False) -> st
 def _prompt_edit_text(label: str, *, default: str = "", required: bool = False) -> str:
     help_suffix = " [enter keeps current; '-' clears]" if default and not required else ""
     while True:
-        value = typer.prompt(
-            f"{label}{help_suffix}",
-            default=default,
-            show_default=bool(default),
-        ).strip()
+        value = typer.prompt(f"{label}{help_suffix}", default=default, show_default=bool(default)).strip()
         if value == "-" and not required:
             return ""
         if value or not required:
             return value
         console.print("[bold red]This field is required.[/bold red]")
-
-
-def _prompt_choice(label: str, choices: list[str], *, default: str) -> str:
-    normalized = {choice.lower(): choice for choice in choices}
-    rendered = "/".join(choices)
-    while True:
-        value = typer.prompt(
-            f"{label} [{rendered}]",
-            default=default,
-            show_default=True,
-        ).strip().lower()
-        if value in normalized:
-            return normalized[value]
-        console.print(f"[bold red]Choose one of:[/bold red] {', '.join(choices)}")
 
 
 def _prompt_csv(label: str, *, default: str = "") -> list[str]:
@@ -78,27 +67,43 @@ def _prompt_edit_csv(label: str, *, default: list[str] | None = None) -> list[st
     default_items = default or []
     default_text = ", ".join(default_items)
     help_suffix = " [enter keeps current; '-' clears]" if default_items else ""
-    raw = typer.prompt(
-        f"{label}{help_suffix}",
-        default=default_text,
-        show_default=bool(default_text),
-    ).strip()
+    raw = typer.prompt(f"{label}{help_suffix}", default=default_text, show_default=bool(default_text)).strip()
     if raw == "-":
         return []
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
-def _run_step(
-    label: str,
-    *,
-    step: int,
-    total: int,
-    as_json: bool,
-    fn: Callable[[], T],
-) -> T:
+def _prompt_compute_profile(*, default: str = "") -> str:
+    service = _compute_service()
+    names = service.list_compute_names()
+    if not names:
+        raise typer.Exit(code=_fail("No compute profiles found. Run 'labit compute add' first.", as_json=False))
+    console.print("Available compute profiles: " + ", ".join(names))
+    while True:
+        value = typer.prompt("Compute profile", default=default or names[0], show_default=True).strip()
+        resolved = service.resolve_compute_name(value)
+        if resolved is not None:
+            return resolved
+        console.print(f"[bold red]Choose one of:[/bold red] {', '.join(names)}")
+
+
+def _prompt_storage_profile(*, default: str = "") -> str:
+    service = _storage_service()
+    names = service.list_storage_names()
+    if not names:
+        raise typer.Exit(code=_fail("No storage profiles found. Run 'labit storage add' first.", as_json=False))
+    console.print("Available storage profiles: " + ", ".join(names))
+    while True:
+        value = typer.prompt("Storage profile", default=default or names[0], show_default=True).strip()
+        resolved = service.resolve_storage_name(value)
+        if resolved is not None:
+            return resolved
+        console.print(f"[bold red]Choose one of:[/bold red] {', '.join(names)}")
+
+
+def _run_step(label: str, *, step: int, total: int, as_json: bool, fn: Callable[[], T]) -> T:
     if as_json:
         return fn()
-
     console.print(f"[bold cyan][{step}/{total}][/bold cyan] {label}")
     with console.status(f"{label}...", spinner="dots", spinner_style="cyan"):
         result = fn()
@@ -126,51 +131,10 @@ def _prompt_project_fields_for_edit(spec: ProjectSpec) -> ProjectSpec:
     keywords = _prompt_edit_csv("Keywords (comma-separated)", default=spec.keywords)
     arxiv_categories = _prompt_edit_csv("arXiv categories (comma-separated)", default=spec.arxiv_categories)
     relevance_criteria = _prompt_edit_text("Relevance criteria", default=spec.relevance_criteria)
-
     console.print("\n[bold]Compute[/bold]")
-    backend = _prompt_choice(
-        "Compute backend",
-        [backend.value for backend in ComputeBackend],
-        default=spec.compute.backend.value,
-    )
-    host = spec.compute.host or ""
-    workdir = spec.compute.workdir or ""
-    datadir = spec.compute.datadir or ""
-    if backend == ComputeBackend.SSH.value:
-        host = _prompt_edit_text("SSH host", default=spec.compute.host or "", required=True)
-        workdir = _prompt_edit_text("SSH workdir", default=spec.compute.workdir or "", required=True)
-        datadir = _prompt_edit_text("Data directory", default=spec.compute.datadir or "")
-    elif backend == ComputeBackend.SKYPILOT.value:
-        workdir = _prompt_edit_text("Workdir", default=spec.compute.workdir or "")
-        datadir = _prompt_edit_text("Data directory", default=spec.compute.datadir or "")
-        host = ""
-    else:
-        host = ""
-        workdir = ""
-        datadir = ""
-
-    runtime = _prompt_choice(
-        "Runtime",
-        [runtime.value for runtime in RuntimeKind],
-        default=spec.compute.runtime.value,
-    )
-    conda_env = spec.compute.conda_env or ""
-    conda_init = spec.compute.conda_init or ""
-    uv_project = spec.compute.uv_project or ""
-    if runtime == RuntimeKind.CONDA.value:
-        conda_env = _prompt_edit_text("Conda environment", default=spec.compute.conda_env or "", required=True)
-        conda_init = _prompt_edit_text("Conda init command", default=spec.compute.conda_init or "", required=True)
-        uv_project = ""
-    elif runtime == RuntimeKind.UV.value:
-        uv_project = _prompt_edit_text("UV project directory", default=spec.compute.uv_project or "", required=True)
-        conda_env = ""
-        conda_init = ""
-    else:
-        conda_env = ""
-        conda_init = ""
-        uv_project = ""
-
-    console.print("\n[bold]Sync[/bold]")
+    compute_profile = _prompt_compute_profile(default=spec.compute_profile)
+    console.print("\n[bold]Storage[/bold]")
+    storage_profile = _prompt_storage_profile(default=spec.storage_profile)
     sync_dirs = _prompt_edit_csv("Sync directories (comma-separated)", default=spec.sync_dirs)
 
     return ProjectSpec.model_validate(
@@ -181,23 +145,15 @@ def _prompt_project_fields_for_edit(spec: ProjectSpec) -> ProjectSpec:
             "keywords": keywords,
             "arxiv_categories": arxiv_categories,
             "relevance_criteria": relevance_criteria,
-            "compute": {
-                "backend": backend,
-                "host": host or None,
-                "workdir": workdir or None,
-                "datadir": datadir or None,
-                "runtime": runtime,
-                "conda_env": conda_env or None,
-                "conda_init": conda_init or None,
-                "uv_project": uv_project or None,
-            },
+            "compute_profile": compute_profile,
+            "storage_profile": storage_profile,
             "sync_dirs": sync_dirs,
         }
     )
 
 
 def _render_spec_review(spec: ProjectSpec) -> None:
-    table = Table(title="New Project Review")
+    table = Table(title="Project Review")
     table.add_column("Field")
     table.add_column("Value")
     table.add_row("Name", spec.name)
@@ -206,22 +162,14 @@ def _render_spec_review(spec: ProjectSpec) -> None:
     table.add_row("Keywords", ", ".join(spec.keywords) or "(blank)")
     table.add_row("arXiv Categories", ", ".join(spec.arxiv_categories) or "(blank)")
     table.add_row("Relevance", spec.relevance_criteria or "(blank)")
-    table.add_row("Compute Backend", spec.compute.backend.value)
-    table.add_row("Host", spec.compute.host or "(blank)")
-    table.add_row("Workdir", spec.compute.workdir or "(blank)")
-    table.add_row("Datadir", spec.compute.datadir or "(blank)")
-    table.add_row("Runtime", spec.compute.runtime.value)
-    table.add_row("Conda Env", spec.compute.conda_env or "(blank)")
-    table.add_row("Conda Init", spec.compute.conda_init or "(blank)")
-    table.add_row("UV Project", spec.compute.uv_project or "(blank)")
-    table.add_row("Sync Dirs", ", ".join(spec.sync_dirs))
+    table.add_row("Compute Profile", spec.compute_profile)
+    table.add_row("Storage Profile", spec.storage_profile)
+    table.add_row("Sync Dirs", ", ".join(spec.sync_dirs) or "(blank)")
     console.print(table)
 
 
 @project_app.command("new", help="Create a project interactively.")
-def new_project(
-    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
-) -> None:
+def new_project(json_output: bool = typer.Option(False, "--json", help="Emit JSON output.")) -> None:
     service = _service()
 
     console.print("[bold]Basic[/bold]")
@@ -230,10 +178,7 @@ def new_project(
     if existing_name is not None:
         raise typer.Exit(
             code=_fail(
-                f"Project '{existing_name}' already exists. "
-                f"Use 'labit project show {existing_name}' to inspect it, "
-                f"'labit project switch {existing_name}' to activate it, or "
-                f"'labit project list' to browse all projects.",
+                f"Project '{existing_name}' already exists. Use 'labit project show {existing_name}' to inspect it.",
                 as_json=json_output,
             )
         )
@@ -245,38 +190,10 @@ def new_project(
     relevance_criteria = _prompt_text("Relevance criteria")
 
     console.print("\n[bold]Compute[/bold]")
-    backend = _prompt_choice(
-        "Compute backend",
-        [backend.value for backend in ComputeBackend],
-        default=ComputeBackend.NONE.value,
-    )
-    host = ""
-    workdir = ""
-    datadir = ""
-    if backend == ComputeBackend.SSH.value:
-        host = _prompt_text("SSH host", required=True)
-        workdir = _prompt_text("SSH workdir", required=True)
-        datadir = _prompt_text("Data directory")
-    elif backend == ComputeBackend.SKYPILOT.value:
-        workdir = _prompt_text("Workdir")
-        datadir = _prompt_text("Data directory")
-
-    runtime = _prompt_choice(
-        "Runtime",
-        [runtime.value for runtime in RuntimeKind],
-        default=RuntimeKind.PLAIN.value,
-    )
-    conda_env = ""
-    conda_init = ""
-    uv_project = ""
-    if runtime == RuntimeKind.CONDA.value:
-        conda_env = _prompt_text("Conda environment", required=True)
-        conda_init = _prompt_text("Conda init command", required=True)
-    elif runtime == RuntimeKind.UV.value:
-        uv_project = _prompt_text("UV project directory", required=True)
-
-    console.print("\n[bold]Sync[/bold]")
-    sync_dirs = _prompt_csv("Sync directories (comma-separated)", default="outputs")
+    compute_profile = _prompt_compute_profile()
+    console.print("\n[bold]Storage[/bold]")
+    storage_profile = _prompt_storage_profile()
+    sync_dirs = _prompt_csv("Sync directories (comma-separated)")
 
     try:
         project_spec = ProjectSpec.model_validate(
@@ -287,16 +204,8 @@ def new_project(
                 "keywords": keywords,
                 "arxiv_categories": arxiv_categories,
                 "relevance_criteria": relevance_criteria,
-                "compute": {
-                    "backend": backend,
-                    "host": host or None,
-                    "workdir": workdir or None,
-                    "datadir": datadir or None,
-                    "runtime": runtime,
-                    "conda_env": conda_env or None,
-                    "conda_init": conda_init or None,
-                    "uv_project": uv_project or None,
-                },
+                "compute_profile": compute_profile,
+                "storage_profile": storage_profile,
                 "sync_dirs": sync_dirs,
             }
         )
@@ -339,12 +248,7 @@ def new_project(
                 fn=lambda: service.clone_project_code(project_spec.name),
             )
         except (FileNotFoundError, FileExistsError, ValueError, RuntimeError) as exc:
-            payload = {
-                "initialized": False,
-                "created": created,
-                "clone_requested": True,
-                "error": str(exc),
-            }
+            payload = {"initialized": False, "created": created, "clone_requested": True, "error": str(exc)}
             if json_output:
                 _emit(payload, as_json=True)
             else:
@@ -353,19 +257,14 @@ def new_project(
                     [
                         ("Name", created["name"]),
                         ("Config", created["config_path"]),
-                        ("Overlay", created["project_dir"]),
+                        ("Workspace", created["project_dir"]),
                         ("Clone error", str(exc)),
                         ("Retry", f"labit project clone-code {created['name']}"),
                     ],
                 )
             raise typer.Exit(code=1)
 
-    payload = {
-        "initialized": True,
-        "created": created,
-        "clone_requested": clone,
-        "cloned": cloned,
-    }
+    payload = {"initialized": True, "created": created, "clone_requested": clone, "cloned": cloned}
     if json_output:
         _emit(payload, as_json=True)
         return
@@ -373,7 +272,10 @@ def new_project(
     rows = [
         ("Name", created["name"]),
         ("Config", created["config_path"]),
-        ("Overlay", created["project_dir"]),
+        ("Workspace", created["project_dir"]),
+        ("Compute", project_spec.compute_profile),
+        ("Storage", project_spec.storage_profile),
+        ("Sync dirs", ", ".join(project_spec.sync_dirs) or "(blank)"),
     ]
     if set_active:
         rows.append(("Active project", created["name"]))
@@ -393,11 +295,15 @@ def current(json_output: bool = typer.Option(False, "--json", help="Emit JSON ou
 
     try:
         summary = service.get_project_summary(active)
-    except FileNotFoundError as exc:
+        spec = service.load_project(active)
+    except (FileNotFoundError, ValueError) as exc:
         raise typer.Exit(code=_fail(str(exc), as_json=json_output))
 
     payload = summary.model_dump()
     payload["active_project"] = payload.pop("name")
+    payload["compute_profile"] = spec.compute_profile
+    payload["storage_profile"] = spec.storage_profile
+    payload["sync_dirs"] = spec.sync_dirs
     if json_output:
         _emit(payload, as_json=True)
         return
@@ -407,6 +313,9 @@ def current(json_output: bool = typer.Option(False, "--json", help="Emit JSON ou
     table.add_column("Value")
     table.add_row("Name", payload["active_project"])
     table.add_row("Description", payload["description"])
+    table.add_row("Compute", payload["compute_profile"])
+    table.add_row("Storage", payload["storage_profile"])
+    table.add_row("Sync dirs", ", ".join(payload["sync_dirs"]) or "(blank)")
     table.add_row("Keywords", str(payload["keyword_count"]))
     table.add_row("Papers", str(payload["paper_count"]))
     table.add_row("Hypotheses", str(payload["hypothesis_count"]))
@@ -415,26 +324,16 @@ def current(json_output: bool = typer.Option(False, "--json", help="Emit JSON ou
 
 
 @project_app.command("list", help="List all projects.")
-def list_projects(
-    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
-) -> None:
+def list_projects(json_output: bool = typer.Option(False, "--json", help="Emit JSON output.")) -> None:
     service = _service()
-    summaries = [
-        {
-            "name": summary.name,
-            "active": summary.is_active,
-        }
-        for summary in service.list_project_summaries()
-    ]
+    summaries = [{"name": summary.name, "active": summary.is_active} for summary in service.list_project_summaries()]
     if json_output:
         _emit({"projects": summaries}, as_json=True)
         return
-
     console.print("[bold]Projects[/bold]")
     if not summaries:
         console.print("- (none)")
         return
-
     for item in summaries:
         suffix = " (active)" if item["active"] else ""
         console.print(f"- {item['name']}{suffix}")
@@ -453,25 +352,31 @@ def show_project(
     try:
         spec = service.load_project(project_name)
         summary = service.get_project_summary(project_name)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, ValueError) as exc:
         raise typer.Exit(code=_fail(str(exc), as_json=json_output))
 
-    payload = {
-        "summary": summary.model_dump(),
-        "spec": spec.model_dump(mode="json", exclude_none=True),
-    }
+    payload = {"summary": summary.model_dump(), "spec": spec.model_dump(mode="json", exclude_none=True)}
     if json_output:
         _emit(payload, as_json=True)
         return
 
     if name is None:
         console.print(f"[dim]Showing active project: {summary.name}[/dim]")
-    console.print(f"[bold]{summary.name}[/bold]")
-    console.print(summary.description)
-    console.print(f"Keywords: {summary.keyword_count}")
-    console.print(f"Papers: {summary.paper_count}")
-    console.print(f"Hypotheses: {summary.hypothesis_count}")
-    console.print(f"Config: {summary.config_path}")
+    table = Table(title=summary.name)
+    table.add_column("Field")
+    table.add_column("Value")
+    table.add_row("Description", summary.description or "(blank)")
+    table.add_row("Compute profile", spec.compute_profile)
+    table.add_row("Storage profile", spec.storage_profile)
+    table.add_row("Sync dirs", ", ".join(spec.sync_dirs) or "(blank)")
+    table.add_row("Repo", spec.repo or "(blank)")
+    table.add_row("Keywords", ", ".join(spec.keywords) or "(blank)")
+    table.add_row("arXiv Categories", ", ".join(spec.arxiv_categories) or "(blank)")
+    table.add_row("Relevance", spec.relevance_criteria or "(blank)")
+    table.add_row("Papers", str(summary.paper_count))
+    table.add_row("Hypotheses", str(summary.hypothesis_count))
+    table.add_row("Config", summary.config_path)
+    console.print(table)
 
 
 @project_app.command("edit", help="Edit project config.")
@@ -486,7 +391,7 @@ def edit_project(
 
     try:
         existing = service.load_project(project_name)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, ValueError) as exc:
         raise typer.Exit(code=_fail(str(exc), as_json=json_output))
 
     try:
@@ -505,20 +410,11 @@ def edit_project(
         raise typer.Exit(code=1)
 
     try:
-        result = _run_step(
-            "Updating project files",
-            step=1,
-            total=1,
-            as_json=json_output,
-            fn=lambda: service.save_project(updated_spec, force=True, set_active=False),
-        )
+        result = _run_step("Updating project files", step=1, total=1, as_json=json_output, fn=lambda: service.save_project(updated_spec, force=True, set_active=False))
     except (FileExistsError, FileNotFoundError) as exc:
         raise typer.Exit(code=_fail(str(exc), as_json=json_output))
 
-    payload = {
-        "updated": True,
-        "project": result,
-    }
+    payload = {"updated": True, "project": result}
     if json_output:
         _emit(payload, as_json=True)
         return
@@ -528,33 +424,28 @@ def edit_project(
         [
             ("Name", result["name"]),
             ("Config", result["config_path"]),
-            ("Overlay", result["project_dir"]),
+            ("Workspace", result["project_dir"]),
+            ("Compute", updated_spec.compute_profile),
+            ("Storage", updated_spec.storage_profile),
+            ("Sync dirs", ", ".join(updated_spec.sync_dirs) or "(blank)"),
             ("Next", f"labit project show {result['name']}"),
         ],
     )
 
 
 @project_app.command("switch", help="Switch active project.")
-def switch_project(
-    name: str = typer.Argument(..., help="Project name to activate."),
-    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
-) -> None:
+def switch_project(name: str = typer.Argument(..., help="Project name to activate."), json_output: bool = typer.Option(False, "--json", help="Emit JSON output.")) -> None:
     service = _service()
     try:
         service.set_active_project(name)
         summary = service.get_project_summary(name)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, ValueError) as exc:
         raise typer.Exit(code=_fail(str(exc), as_json=json_output))
 
-    payload = {
-        "active_project": summary.name,
-        "description": summary.description,
-        "config_path": summary.config_path,
-    }
+    payload = {"active_project": summary.name, "description": summary.description, "config_path": summary.config_path}
     if json_output:
         _emit(payload, as_json=True)
         return
-
     console.print(f"Switched active project to [bold]{summary.name}[/bold].")
     console.print(summary.description)
 
@@ -580,7 +471,7 @@ def delete_project(
             [
                 ("Name", summary.name),
                 ("Config", summary.config_path),
-                ("Overlay", str(service.paths.vault_projects_dir / summary.name)),
+                ("Workspace", str(service.paths.vault_projects_dir / summary.name)),
                 ("Active", "yes" if summary.is_active else "no"),
             ],
         )
@@ -593,29 +484,16 @@ def delete_project(
         raise typer.Exit(code=1)
 
     try:
-        result = _run_step(
-            "Deleting project files",
-            step=1,
-            total=1,
-            as_json=json_output,
-            fn=lambda: service.delete_project(summary.name),
-        )
+        result = _run_step("Deleting project files", step=1, total=1, as_json=json_output, fn=lambda: service.delete_project(summary.name))
     except FileNotFoundError as exc:
         raise typer.Exit(code=_fail(str(exc), as_json=json_output))
 
-    payload = {
-        "deleted": True,
-        "project": result,
-    }
+    payload = {"deleted": True, "project": result}
     if json_output:
         _emit(payload, as_json=True)
         return
 
-    rows = [
-        ("Name", result["name"]),
-        ("Deleted config", result["config_path"]),
-        ("Deleted overlay", result["project_dir"]),
-    ]
+    rows = [("Name", result["name"]), ("Deleted config", result["config_path"]), ("Deleted workspace", result["project_dir"])]
     if result["cleared_active"]:
         rows.append(("Active project", "cleared"))
     rows.append(("Next", "labit project list"))
@@ -633,11 +511,7 @@ def validate_project(
     except ValidationError as exc:
         raise typer.Exit(code=_fail(str(exc), as_json=json_output))
 
-    payload = {
-        "valid": True,
-        "spec_path": str(spec.resolve()),
-        "project": project_spec.model_dump(mode="json", exclude_none=True),
-    }
+    payload = {"valid": True, "spec_path": str(spec.resolve()), "project": project_spec.model_dump(mode="json", exclude_none=True)}
     if json_output:
         _emit(payload, as_json=True)
         return
@@ -680,8 +554,9 @@ def draft_project(
 
     console.print(f"[bold green]Drafted project spec[/bold green]: {project_spec.name}")
     console.print(f"Description: {project_draft.description}")
-    console.print(f"Keywords: {', '.join(project_draft.keywords)}")
-    console.print(f"Categories: {', '.join(project_draft.arxiv_categories)}")
+    console.print(f"Compute profile: {project_spec.compute_profile}")
+    console.print(f"Storage profile: {project_spec.storage_profile}")
+    console.print("Sync dirs: " + (", ".join(project_spec.sync_dirs) or "(blank)"))
     if output is not None:
         console.print(f"Wrote spec draft: {output.resolve()}")
 
@@ -702,11 +577,7 @@ def create_project(
 
     actions = service.planned_create_actions(project_spec, set_active=set_active)
     if dry_run:
-        payload = {
-            "dry_run": True,
-            "project": project_spec.model_dump(mode="json", exclude_none=True),
-            "actions": actions,
-        }
+        payload = {"dry_run": True, "project": project_spec.model_dump(mode="json", exclude_none=True), "actions": actions}
         if json_output:
             _emit(payload, as_json=True)
             return
@@ -716,21 +587,11 @@ def create_project(
         return
 
     try:
-        result = _run_step(
-            "Creating project files",
-            step=1,
-            total=1,
-            as_json=json_output,
-            fn=lambda: service.save_project(project_spec, force=force, set_active=set_active),
-        )
+        result = _run_step("Creating project files", step=1, total=1, as_json=json_output, fn=lambda: service.save_project(project_spec, force=force, set_active=set_active))
     except (FileExistsError, FileNotFoundError) as exc:
         raise typer.Exit(code=_fail(str(exc), as_json=json_output))
 
-    payload = {
-        "created": True,
-        "project": result,
-        "actions": actions,
-    }
+    payload = {"created": True, "project": result, "actions": actions}
     if json_output:
         _emit(payload, as_json=True)
         return
@@ -738,7 +599,10 @@ def create_project(
     rows = [
         ("Name", result["name"]),
         ("Config", result["config_path"]),
-        ("Overlay", result["project_dir"]),
+        ("Workspace", result["project_dir"]),
+        ("Compute", project_spec.compute_profile),
+        ("Storage", project_spec.storage_profile),
+        ("Sync dirs", ", ".join(project_spec.sync_dirs) or "(blank)"),
     ]
     if set_active:
         rows.append(("Active project", result["name"]))
@@ -754,13 +618,7 @@ def clone_code(
 ) -> None:
     service = _service()
     if name and (name.startswith(("git@", "https://", "http://", "ssh://")) or "/" in name):
-        raise typer.Exit(
-            code=_fail(
-                "clone-code expects a project name, not a repository URL or path. "
-                "Use 'labit project new' or create the project first.",
-                as_json=json_output,
-            )
-        )
+        raise typer.Exit(code=_fail("clone-code expects a project name, not a repository URL or path.", as_json=json_output))
 
     project_name = name or service.active_project_name()
     if project_name is None:
@@ -776,13 +634,7 @@ def clone_code(
         raise typer.Exit(code=_fail(f"Project '{spec.name}' does not declare a repository URL.", as_json=json_output))
 
     if dry_run:
-        payload = {
-            "dry_run": True,
-            "project": spec.name,
-            "repo": spec.repo,
-            "target_dir": str(service.project_code_dir(spec.name)),
-            "actions": [action],
-        }
+        payload = {"dry_run": True, "project": spec.name, "repo": spec.repo, "target_dir": str(service.project_code_dir(spec.name)), "actions": [action]}
         if json_output:
             _emit(payload, as_json=True)
             return
@@ -791,33 +643,16 @@ def clone_code(
         return
 
     try:
-        result = _run_step(
-            "Cloning repository (this may take a moment)",
-            step=1,
-            total=1,
-            as_json=json_output,
-            fn=lambda: service.clone_project_code(spec.name),
-        )
+        result = _run_step("Cloning repository (this may take a moment)", step=1, total=1, as_json=json_output, fn=lambda: service.clone_project_code(spec.name))
     except (FileNotFoundError, FileExistsError, ValueError, RuntimeError) as exc:
         raise typer.Exit(code=_fail(str(exc), as_json=json_output))
 
-    payload = {
-        "cloned": True,
-        "project": result,
-    }
+    payload = {"cloned": True, "project": result}
     if json_output:
         _emit(payload, as_json=True)
         return
 
-    _print_kv_summary(
-        "Project code ready",
-        [
-            ("Project", result["name"]),
-            ("Repo", result["repo"]),
-            ("Code dir", result["target_dir"]),
-            ("Next", f"labit project show {result['name']}"),
-        ],
-    )
+    _print_kv_summary("Project code ready", [("Project", result["name"]), ("Repo", result["repo"]), ("Code dir", result["target_dir"]), ("Next", f"labit project show {result['name']}")])
 
 
 @project_app.command("init", help="Create from spec YAML + clone repo.")
@@ -841,11 +676,7 @@ def init_project(
         actions.append(clone_action)
 
     if dry_run:
-        payload = {
-            "dry_run": True,
-            "project": project_spec.model_dump(mode="json", exclude_none=True),
-            "actions": actions,
-        }
+        payload = {"dry_run": True, "project": project_spec.model_dump(mode="json", exclude_none=True), "actions": actions}
         if json_output:
             _emit(payload, as_json=True)
             return
@@ -856,33 +687,16 @@ def init_project(
 
     total_steps = 2 if clone_action else 1
     try:
-        created = _run_step(
-            "Creating project files",
-            step=1,
-            total=total_steps,
-            as_json=json_output,
-            fn=lambda: service.save_project(project_spec, force=force, set_active=set_active),
-        )
+        created = _run_step("Creating project files", step=1, total=total_steps, as_json=json_output, fn=lambda: service.save_project(project_spec, force=force, set_active=set_active))
     except (FileExistsError, FileNotFoundError) as exc:
         raise typer.Exit(code=_fail(str(exc), as_json=json_output))
 
     cloned = None
     if clone_action:
         try:
-            cloned = _run_step(
-                "Cloning repository (this may take a moment)",
-                step=2,
-                total=total_steps,
-                as_json=json_output,
-                fn=lambda: service.clone_project_code(project_spec.name),
-            )
+            cloned = _run_step("Cloning repository (this may take a moment)", step=2, total=total_steps, as_json=json_output, fn=lambda: service.clone_project_code(project_spec.name))
         except (FileNotFoundError, FileExistsError, ValueError, RuntimeError) as exc:
-            payload = {
-                "initialized": False,
-                "created": created,
-                "clone_requested": True,
-                "error": str(exc),
-            }
+            payload = {"initialized": False, "created": created, "clone_requested": True, "error": str(exc)}
             if json_output:
                 _emit(payload, as_json=True)
             else:
@@ -891,20 +705,14 @@ def init_project(
                     [
                         ("Name", created["name"]),
                         ("Config", created["config_path"]),
-                        ("Overlay", created["project_dir"]),
+                        ("Workspace", created["project_dir"]),
                         ("Clone error", str(exc)),
                         ("Retry", f"labit project clone-code {created['name']}"),
                     ],
                 )
             raise typer.Exit(code=1)
 
-    payload = {
-        "initialized": True,
-        "created": created,
-        "clone_requested": bool(clone_action),
-        "cloned": cloned,
-        "actions": actions,
-    }
+    payload = {"initialized": True, "created": created, "clone_requested": bool(clone_action), "cloned": cloned, "actions": actions}
     if json_output:
         _emit(payload, as_json=True)
         return
@@ -912,7 +720,10 @@ def init_project(
     rows = [
         ("Name", created["name"]),
         ("Config", created["config_path"]),
-        ("Overlay", created["project_dir"]),
+        ("Workspace", created["project_dir"]),
+        ("Compute", project_spec.compute_profile),
+        ("Storage", project_spec.storage_profile),
+        ("Sync dirs", ", ".join(project_spec.sync_dirs) or "(blank)"),
     ]
     if set_active:
         rows.append(("Active project", created["name"]))

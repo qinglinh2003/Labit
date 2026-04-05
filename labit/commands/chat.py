@@ -720,10 +720,12 @@ def _render_experiment_launch_preview(
         f"[bold]GPU[/bold]: {defaults.get('gpu') or '(blank)'}\n"
         f"[bold]Output dir[/bold]: {defaults.get('output_dir') or '(blank)'}\n"
         f"[bold]Command[/bold]: {defaults.get('command') or '(blank)'}\n\n"
+        f"[bold]Compute[/bold]: {execution.profile}\n"
         f"[bold]Backend[/bold]: {execution.backend.value}\n"
+        f"[bold]User[/bold]: {execution.user or '(blank)'}\n"
         f"[bold]Host[/bold]: {execution.host or '(blank)'}\n"
         f"[bold]Workdir[/bold]: {execution.workdir or '(blank)'}\n"
-        f"[bold]Runtime[/bold]: {execution.runtime.value}"
+        f"[bold]Setup[/bold]: {'configured' if execution.setup_script else '(blank)'}"
     )
     console.print(Panel(body, title="[bold green]Launch Experiment Preview[/bold green]", border_style="green"))
 
@@ -770,9 +772,11 @@ def _launch_markdown(
         f"- Task: {task_id}",
         f"- Launch: {launch_id}",
         f"- Accepted: {'yes' if receipt.accepted else 'no'}",
+        f"- Compute: {execution.profile}",
         f"- Backend: {execution.backend.value}",
+        f"- User: {execution.user or '(blank)'}",
         f"- Host: {receipt.remote_host or execution.host or '(blank)'}",
-        f"- Runtime: {execution.runtime.value}",
+        f"- Setup: {'configured' if execution.setup_script else '(blank)'}",
         f"- Branch: {defaults.get('branch') or '(blank)'}",
         f"- Config: {defaults.get('config_ref') or '(blank)'}",
         f"- GPU: {defaults.get('gpu') or '(blank)'}",

@@ -354,7 +354,6 @@ class ChatService:
                 force_deep_context=force_deep_context,
             ),
             cwd=str(self.paths.root),
-            timeout_seconds=120,
             image_paths=self._recent_image_paths(transcript),
             extra_args=self._conversation_extra_args(
                 participant.provider,
@@ -717,7 +716,7 @@ Reply as `{participant.name}` only. Use plain text or markdown.
                 "--disable-slash-commands",
                 "--no-session-persistence",
                 "--tools",
-                "Read,LS,Glob,Grep,Edit,Write",
+                "Read,LS,Glob,Grep,Edit,Write,Bash",
                 "--permission-mode",
                 "bypassPermissions",
             ]

@@ -2,62 +2,144 @@ from __future__ import annotations
 
 import re
 from enum import Enum
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ComputeBackend(str, Enum):
-    NONE = "none"
     SSH = "ssh"
-    SKYPILOT = "skypilot"
 
 
-class RuntimeKind(str, Enum):
-    PLAIN = "plain"
-    CONDA = "conda"
-    UV = "uv"
+class StorageBackend(str, Enum):
+    RCLONE = "rclone"
 
 
-class ComputeConfig(BaseModel):
+class SSHConnectionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    backend: ComputeBackend = ComputeBackend.NONE
-    host: str | None = None
-    workdir: str | None = None
+    user: str = "root"
+    host: str
+    port: int = 22
+    ssh_key: str | None = None
+
+    @field_validator("user")
+    @classmethod
+    def validate_user(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("SSH user cannot be empty.")
+        return value
+
+    @field_validator("host")
+    @classmethod
+    def validate_host(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("SSH host cannot be empty.")
+        return value
+
+    @field_validator("port")
+    @classmethod
+    def validate_port(cls, value: int) -> int:
+        if value < 1 or value > 65535:
+            raise ValueError("SSH port must be between 1 and 65535.")
+        return value
+
+    @field_validator("ssh_key")
+    @classmethod
+    def strip_key(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
+class ComputeWorkspaceConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workdir: str
     datadir: str | None = None
-    runtime: RuntimeKind = RuntimeKind.PLAIN
-    conda_env: str | None = None
-    conda_init: str | None = None
-    uv_project: str | None = None
 
-    @model_validator(mode="after")
-    def validate_compute_requirements(self) -> "ComputeConfig":
-        if self.backend == ComputeBackend.SSH:
-            if not self.host or not self.workdir:
-                raise ValueError("SSH compute requires both 'host' and 'workdir'.")
+    @field_validator("workdir")
+    @classmethod
+    def validate_workdir(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Workdir cannot be empty.")
+        return value
 
-        if self.runtime == RuntimeKind.CONDA:
-            if not self.conda_env or not self.conda_init:
-                raise ValueError("Conda runtime requires both 'conda_env' and 'conda_init'.")
+    @field_validator("datadir")
+    @classmethod
+    def strip_datadir(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
 
-        if self.runtime == RuntimeKind.UV and not self.uv_project:
-            raise ValueError("UV runtime requires 'uv_project'.")
 
-        return self
+class ComputeSetupConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    script: str = ""
+
+    @field_validator("script")
+    @classmethod
+    def strip_script(cls, value: str) -> str:
+        return value.strip()
+
+
+class ComputeHardwareConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    gpu_count: int = 0
+    gpu_type: str | None = None
+
+    @field_validator("gpu_count")
+    @classmethod
+    def validate_gpu_count(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("GPU count cannot be negative.")
+        return value
+
+    @field_validator("gpu_type")
+    @classmethod
+    def strip_gpu_type(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
+class ComputeProfile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    backend: ComputeBackend = ComputeBackend.SSH
+    connection: SSHConnectionConfig
+    workspace: ComputeWorkspaceConfig
+    setup: ComputeSetupConfig = Field(default_factory=ComputeSetupConfig)
+    hardware: ComputeHardwareConfig = Field(default_factory=ComputeHardwareConfig)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        return _validate_name(value)
+
 
 
 def _validate_name(value: str) -> str:
     value = value.strip()
     if not value:
-        raise ValueError("Project name cannot be empty.")
+        raise ValueError("Name cannot be empty.")
     allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
     if any(ch not in allowed for ch in value):
         raise ValueError(
-            "Project name may only contain letters, numbers, '.', '_' and '-'."
+            "Name may only contain letters, numbers, '.', '_' and '-'."
         )
     return value
+
 
 
 def _strip_required_text(value: str) -> str:
@@ -67,10 +149,12 @@ def _strip_required_text(value: str) -> str:
     return value
 
 
+
 def _strip_optional_text(value: str | None) -> str:
     if value is None:
         return ""
     return value.strip()
+
 
 
 def _validate_repo(value: str | None) -> str | None:
@@ -90,6 +174,7 @@ def _validate_repo(value: str | None) -> str | None:
     return value
 
 
+
 def _normalize_keywords(values: list[str]) -> list[str]:
     cleaned: list[str] = []
     seen: set[str] = set()
@@ -103,6 +188,7 @@ def _normalize_keywords(values: list[str]) -> list[str]:
         cleaned.append(item)
         seen.add(key)
     return cleaned
+
 
 
 def _normalize_arxiv_categories(values: list[str]) -> list[str]:
@@ -120,24 +206,23 @@ def _normalize_arxiv_categories(values: list[str]) -> list[str]:
     return cleaned
 
 
-def _validate_sync_dirs(values: list[str]) -> list[str]:
+
+def _normalize_sync_dirs(values: list[str]) -> list[str]:
     cleaned: list[str] = []
     seen: set[str] = set()
     for value in values:
         item = value.strip().strip("/")
         if not item:
             continue
-        path = PurePosixPath(item)
-        if path.is_absolute() or ".." in path.parts:
-            raise ValueError("sync_dirs must be relative paths without '..'.")
-        key = str(path)
+        if item.startswith(".") or item.startswith("~") or "/" in item:
+            raise ValueError("Sync directories must be simple project-relative directory names.")
+        key = item.lower()
         if key in seen:
             continue
-        cleaned.append(key)
+        cleaned.append(item)
         seen.add(key)
-    if not cleaned:
-        raise ValueError("At least one sync directory is required.")
     return cleaned
+
 
 
 def _extract_phrases(text: str, *, max_items: int = 12) -> list[str]:
@@ -163,12 +248,13 @@ class ProjectSeed(BaseModel):
 
     name: str
     repo: str | None = None
-    compute: ComputeConfig = Field(default_factory=ComputeConfig)
-    sync_dirs: list[str] = Field(default_factory=lambda: ["outputs"])
+    compute_profile: str
+    storage_profile: str
+    sync_dirs: list[str] = Field(default_factory=list)
 
-    @field_validator("name")
+    @field_validator("name", "compute_profile", "storage_profile")
     @classmethod
-    def validate_name(cls, value: str) -> str:
+    def validate_name_fields(cls, value: str) -> str:
         return _validate_name(value)
 
     @field_validator("repo")
@@ -178,8 +264,8 @@ class ProjectSeed(BaseModel):
 
     @field_validator("sync_dirs")
     @classmethod
-    def validate_sync_dirs(cls, values: list[str]) -> list[str]:
-        return _validate_sync_dirs(values)
+    def normalize_sync_dirs(cls, values: list[str]) -> list[str]:
+        return _normalize_sync_dirs(values)
 
     def to_yaml_dict(self) -> dict[str, Any]:
         return self.model_dump(mode="json", exclude_none=True)
@@ -264,12 +350,13 @@ class ProjectSpec(BaseModel):
     keywords: list[str] = Field(default_factory=list)
     arxiv_categories: list[str] = Field(default_factory=list)
     relevance_criteria: str = ""
-    compute: ComputeConfig = Field(default_factory=ComputeConfig)
-    sync_dirs: list[str] = Field(default_factory=lambda: ["outputs"])
+    compute_profile: str
+    storage_profile: str
+    sync_dirs: list[str] = Field(default_factory=list)
 
-    @field_validator("name")
+    @field_validator("name", "compute_profile", "storage_profile")
     @classmethod
-    def validate_name(cls, value: str) -> str:
+    def validate_name_fields(cls, value: str) -> str:
         return _validate_name(value)
 
     @field_validator("description", "relevance_criteria")
@@ -294,15 +381,16 @@ class ProjectSpec(BaseModel):
 
     @field_validator("sync_dirs")
     @classmethod
-    def validate_sync_dirs(cls, values: list[str]) -> list[str]:
-        return _validate_sync_dirs(values)
+    def normalize_sync_dirs(cls, values: list[str]) -> list[str]:
+        return _normalize_sync_dirs(values)
 
     @classmethod
     def from_seed_and_draft(cls, seed: ProjectSeed, draft: ProjectDraft) -> "ProjectSpec":
         return cls(
             name=seed.name,
             repo=seed.repo,
-            compute=seed.compute,
+            compute_profile=seed.compute_profile,
+            storage_profile=seed.storage_profile,
             sync_dirs=seed.sync_dirs,
             description=draft.description,
             keywords=draft.keywords,
@@ -314,7 +402,8 @@ class ProjectSpec(BaseModel):
         return ProjectSeed(
             name=self.name,
             repo=self.repo,
-            compute=self.compute,
+            compute_profile=self.compute_profile,
+            storage_profile=self.storage_profile,
             sync_dirs=self.sync_dirs,
         )
 
@@ -338,3 +427,60 @@ class ProjectSummary(BaseModel):
     hypothesis_count: int
     is_active: bool
     config_path: str
+
+
+class RcloneStorageConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    remote: str
+    bucket: str
+
+    @field_validator("remote", "bucket")
+    @classmethod
+    def strip_required_text(cls, value: str) -> str:
+        return _strip_required_text(value)
+
+
+class StorageLayoutConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path_template: str = "{project}/{dir}"
+
+    @field_validator("path_template")
+    @classmethod
+    def validate_template(cls, value: str) -> str:
+        value = _strip_required_text(value)
+        allowed = {"{project}", "{dir}"}
+        used = {token for token in allowed if token in value}
+        if "{project}" not in used or "{dir}" not in used:
+            raise ValueError("Storage path template must include both '{project}' and '{dir}'.")
+        return value
+
+
+class StoragePolicyConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: str = "compute-managed"
+
+    @field_validator("mode")
+    @classmethod
+    def validate_mode(cls, value: str) -> str:
+        value = _strip_required_text(value)
+        if value != "compute-managed":
+            raise ValueError("Storage policy mode must be 'compute-managed'.")
+        return value
+
+
+class StorageProfile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    backend: StorageBackend = StorageBackend.RCLONE
+    rclone: RcloneStorageConfig
+    layout: StorageLayoutConfig = Field(default_factory=StorageLayoutConfig)
+    policy: StoragePolicyConfig = Field(default_factory=StoragePolicyConfig)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        return _validate_name(value)
