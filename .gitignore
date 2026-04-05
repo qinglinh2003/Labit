@@ -17,5 +17,7 @@ experiments/
 !labit/experiments/**/*.py
 configs/active_project
 configs/projects/
+configs/compute/
+configs/storage/
 scratch/
 .labit/
