@@ -57,7 +57,7 @@ _LABIT_THEME = Theme(
         "markdown.h5": "grey70 underline",
         "markdown.h6": "dim italic",
         # ── Inline ───────────────────────────────────────────────
-        "markdown.strong": "bold",
+        "markdown.strong": "bold #0080ff",
         "markdown.em": "italic dim",
         "markdown.emph": "italic dim",
         "markdown.s": "dim strike",
