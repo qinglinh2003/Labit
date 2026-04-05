@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
-from labit.chat.clipboard import ClipboardImageError, capture_clipboard_image
 from labit.chat.models import ChatAttachment
 from labit.paths import RepoPaths
 
@@ -11,7 +10,7 @@ if TYPE_CHECKING:
     from rich.console import Console
 
 
-COMPOSER_HELP_TEXT = "Ctrl-V attaches one clipboard image. Enter sends."
+ACCENT_COLOR = "#a0a000"
 
 
 @dataclass
@@ -34,9 +33,10 @@ def prompt_with_clipboard_image(
     paths: RepoPaths,
     session_id: str,
     prompt_prefix: str = " › ",
-    show_frame: bool = False,
+    slash_commands: Iterable[str] | None = None,
 ) -> ComposerResult:
     try:
+        from prompt_toolkit.enums import EditingMode
         from prompt_toolkit.formatted_text import HTML
         from prompt_toolkit import PromptSession
         from prompt_toolkit.key_binding import KeyBindings
@@ -46,48 +46,44 @@ def prompt_with_clipboard_image(
         return ComposerResult(text=raw)
 
     attachments: list[ChatAttachment] = []
-    status_message = COMPOSER_HELP_TEXT
+    commands = tuple(sorted(set(slash_commands or ())))
     prompt_session = PromptSession()
     bindings = KeyBindings()
     style = Style.from_dict(
         {
-            "frame.border": "#a0a000",
-            "frame.label": "bold #a0a000",
-            "bottom-toolbar": "fg:#d0d0d0 bg:#303030",
-            "prompt": "bold #a0a000",
-            "placeholder": "#7a7a7a",
+            "frame.border": ACCENT_COLOR,
+            "frame.label": f"bold {ACCENT_COLOR}",
+            "prompt": f"bold {ACCENT_COLOR}",
+            "placeholder": "#7a7a7a italic",
         }
     )
 
-    def _toolbar():
-        suffix = ""
-        if attachments:
-            labels = ", ".join(attachment.label or "image" for attachment in attachments[-2:])
-            if len(attachments) > 2:
-                labels = f"{labels}, +{len(attachments) - 2} more"
-            suffix = f" | Attached: {labels}"
-        return HTML(f"<bottom-toolbar> {status_message}{suffix} </bottom-toolbar>")
+    @bindings.add("enter")
+    def _submit(event) -> None:
+        event.app.exit(result=event.app.current_buffer.text)
 
-    @bindings.add("c-v")
-    def _paste_image(event) -> None:
-        nonlocal status_message
-        try:
-            attachment = capture_clipboard_image(paths=paths, session_id=session_id)
-        except ClipboardImageError as exc:
-            status_message = f"Paste failed: {exc}"
-            event.app.invalidate()
+    @bindings.add("tab")
+    def _complete_if_unique(event) -> None:
+        buffer = event.app.current_buffer
+        text = buffer.document.text_before_cursor
+        if not text.startswith("/") or " " in text:
             return
-        attachments.append(attachment)
-        status_message = f"Attached image: {attachment.label or attachment.path.rsplit('/', 1)[-1]}"
-        event.app.invalidate()
+        matches = [command for command in commands if command.startswith(text)]
+        if len(matches) == 1:
+            buffer.delete_before_cursor(count=len(text))
+            buffer.insert_text(matches[0])
+
+    @bindings.add("c-c")
+    def _cancel(event) -> None:
+        raise KeyboardInterrupt
 
     raw = prompt_session.prompt(
         HTML(f"<prompt>{prompt_prefix}</prompt>"),
         key_bindings=bindings,
-        bottom_toolbar=_toolbar,
-        placeholder=HTML("<placeholder>Type a message or paste an image…</placeholder>"),
         style=style,
-        show_frame=show_frame,
+        placeholder=HTML("<placeholder>Ask a question or paste an image...</placeholder>"),
+        show_frame=True,
+        editing_mode=EditingMode.EMACS,
     )
     if attachments and not raw.strip():
         raw = "Please inspect the attached image and describe anything important."

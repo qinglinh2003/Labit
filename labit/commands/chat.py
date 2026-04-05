@@ -79,11 +79,40 @@ _LABIT_THEME = Theme(
 _CODE_THEME = "default"
 
 console = Console(theme=_LABIT_THEME)
+_COMMAND_COLOR = "#0080ff"
+_ACCENT_COLOR = "#a0a000"
 
 _PROVIDER_STYLES = {
     "claude": ("blue", "CLAUDE"),
     "codex": ("green", "CODEX"),
 }
+
+_CHAT_SHELL_COMMANDS = (
+    "/help",
+    "/list",
+    "/show",
+    "/mode",
+    "/memory",
+    "/paste-image",
+    "/image",
+    "/think",
+    "/think-long-term",
+    "/think-ltm",
+    "/long-term-memory",
+    "/ltm",
+    "/synthesize",
+    "/investigate",
+    "/idea",
+    "/note",
+    "/todo",
+    "/hypothesis",
+    "/launch-exp",
+    "/debrief",
+    "/review-results",
+    "/new",
+    "/switch",
+    "/exit",
+)
 
 
 def _chat_service() -> ChatService:
@@ -363,7 +392,7 @@ def _render_shell_header(session) -> None:
         f"[bold]Mode[/bold]: {mode_label}\n"
         f"[bold]Participants[/bold]: {participants}\n"
         f"[bold]Session ID[/bold]: {session.session_id}\n"
-        "[dim]Type a message to continue. Ctrl-V pastes one clipboard image. Use /help to see shell commands.[/dim]"
+        "[dim]Type a message to continue. Use /help to see shell commands.[/dim]"
     )
     console.print(Panel(body, title=f"[bold green]LABIT Chat · {session.title}[/bold green]", border_style="green"))
 
@@ -401,6 +430,39 @@ def _box_bottom(width: int) -> str:
     return f"╰{'─' * (width - 2)}╯"
 
 
+def _command_chip(label: str) -> str:
+    return f"[bold {_COMMAND_COLOR}]{label}[/bold {_COMMAND_COLOR}]"
+
+
+def _render_console_header(*, project: str, mode: str, participants: str) -> None:
+    console.print(f"[dim]{project} · {mode} · {participants}[/dim]")
+    console.print(
+        "Shortcuts: "
+        + " · ".join(
+            [
+                _command_chip("/help"),
+                _command_chip("/think"),
+                _command_chip("/think-ltm"),
+                _command_chip("/ltm"),
+                _command_chip("/image"),
+                _command_chip("/exit"),
+            ]
+        )
+    )
+    console.print(
+        "Research: "
+        + " · ".join(
+            [
+                _command_chip("/memory"),
+                _command_chip("/idea"),
+                _command_chip("/todo"),
+                _command_chip("/investigate"),
+                _command_chip("/hypothesis"),
+            ]
+        )
+    )
+
+
 def _prompt_in_box(session) -> ComposerResult:
     width = _box_width()
     inner_width = width - 2
@@ -408,16 +470,8 @@ def _prompt_in_box(session) -> ComposerResult:
     mode = session.mode.value
     participants = ", ".join(f"{item.name}:{item.provider.value}" for item in session.participants)
     prompt_prefix = " › "
-    meta_line = f"{project} · {mode} · {participants}"
-    shortcut_lines = [
-        "Shortcuts: Ctrl-V image · /help · /think · /ltm · /image · /exit",
-        "Research: /memory · /idea · /todo · /investigate · /hypothesis",
-    ]
-
     if not console.is_terminal:
-        console.print(f"[dim]{meta_line}[/dim]")
-        for line in shortcut_lines:
-            console.print(f"[dim]{line}[/dim]")
+        _render_console_header(project=project, mode=mode, participants=participants)
         console.print(f"[yellow]{_box_top('Input', width)}[/yellow]")
         console.print(f"[yellow]{_box_line('', width)}[/yellow]")
         console.print(f"[yellow]│[/yellow]{prompt_prefix}", end="")
@@ -427,15 +481,13 @@ def _prompt_in_box(session) -> ComposerResult:
         return ComposerResult(text=raw)
 
     if prompt_toolkit_available():
-        console.print(f"[dim]{meta_line}[/dim]")
-        for line in shortcut_lines:
-            console.print(f"[dim]{line}[/dim]")
+        _render_console_header(project=project, mode=mode, participants=participants)
         return prompt_with_clipboard_image(
             console=console,
             paths=RepoPaths.discover(),
             session_id=session.session_id,
-            prompt_prefix="› ",
-            show_frame=True,
+            prompt_prefix=prompt_prefix,
+            slash_commands=_CHAT_SHELL_COMMANDS,
         )
 
     top = _box_top("Input", width)
@@ -448,9 +500,7 @@ def _prompt_in_box(session) -> ComposerResult:
     yellow = "\x1b[33m"
     reset = "\x1b[0m"
 
-    console.print(f"[dim]{meta_line}[/dim]")
-    for line in shortcut_lines:
-        console.print(f"[dim]{line}[/dim]")
+    _render_console_header(project=project, mode=mode, participants=participants)
     stream.write(f"{yellow}{top}{reset}\n")
     stream.write(f"{yellow}{empty}{reset}\n")
     stream.write(f"{yellow}{prompt_line}{reset}\n")
@@ -494,8 +544,8 @@ def _open_default_session(
 
 
 def _shell_help() -> None:
-    table = Table(show_header=True, header_style="bold magenta")
-    table.add_column("Command", style="bold")
+    table = Table(show_header=True, header_style=f"bold {_COMMAND_COLOR}")
+    table.add_column("Command", style=f"bold {_COMMAND_COLOR}")
     table.add_column("What It Does")
     table.add_row("/help", "Show shell commands.")
     table.add_row("/list", "List existing chat sessions.")
@@ -507,7 +557,6 @@ def _shell_help() -> None:
     table.add_row("/think <question>", "Ask the next turn with the highest reasoning effort, while keeping the normal chat context shape.")
     table.add_row("/long-term-memory <question>", "Run a deep long-term memory search for this turn, then answer from the richer retrieved context.")
     table.add_row("/think-long-term <question>", "Run the next turn with both deep long-term memory search and the highest reasoning effort.")
-    table.add_row("Ctrl-V", "Attach one image from the clipboard to the current turn.")
     table.add_row("/paste-image [question]", "Read one image from the system clipboard, save it under .labit/, and send it as this turn's image input.")
     table.add_row("/idea [text]", "Save a lightweight project idea. With no text, show saved ideas.")
     table.add_row("/note [text]", "Save a lightweight project note. With no text, show saved notes.")
@@ -519,7 +568,7 @@ def _shell_help() -> None:
     table.add_row("/debrief", "Inspect active experiment launches and show their latest runtime state.")
     table.add_row("/review-results <hypothesis_id>", "Summarize experiments linked to a hypothesis, suggest a resolution, and optionally write the decision back.")
     table.add_row("/exit", "Leave the chat shell.")
-    console.print(Panel(table, title="LABIT Chat Commands", border_style="magenta"))
+    console.print(Panel(table, title="LABIT Chat Commands", border_style=_COMMAND_COLOR))
 
 
 def _confirm_in_shell(prompt: str, *, default: bool = True) -> bool:
@@ -950,7 +999,11 @@ def run_chat_shell(
 
     current_session = session
     while True:
-        composer_result = _prompt_in_box(current_session)
+        try:
+            composer_result = _prompt_in_box(current_session)
+        except KeyboardInterrupt:
+            console.print("\n[dim]Leaving chat shell.[/dim]")
+            return
         raw = composer_result.text.strip()
         attachments = composer_result.attachments
         if not raw:
@@ -1948,7 +2001,7 @@ def list_chats(
     if not sessions:
         console.print("[dim]No chat sessions yet.[/dim]")
         return
-    table = Table(title="Chat Sessions", show_header=True, header_style="bold magenta")
+    table = Table(title="Chat Sessions", show_header=True, header_style=f"bold {_COMMAND_COLOR}")
     table.add_column("Session")
     table.add_column("Title")
     table.add_column("Mode")

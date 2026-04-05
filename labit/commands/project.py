@@ -218,7 +218,7 @@ def _render_spec_review(spec: ProjectSpec) -> None:
     console.print(table)
 
 
-@project_app.command("new")
+@project_app.command("new", help="Create a project interactively.")
 def new_project(
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
@@ -384,7 +384,7 @@ def new_project(
     _print_kv_summary("Project ready", rows)
 
 
-@project_app.command("current")
+@project_app.command("current", help="Show the active project name.")
 def current(json_output: bool = typer.Option(False, "--json", help="Emit JSON output.")) -> None:
     service = _service()
     active = service.active_project_name()
@@ -414,7 +414,7 @@ def current(json_output: bool = typer.Option(False, "--json", help="Emit JSON ou
     console.print(table)
 
 
-@project_app.command("list")
+@project_app.command("list", help="List all projects.")
 def list_projects(
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
@@ -440,7 +440,7 @@ def list_projects(
         console.print(f"- {item['name']}{suffix}")
 
 
-@project_app.command("show")
+@project_app.command("show", help="Show project details.")
 def show_project(
     name: str | None = typer.Argument(None, help="Project name. Defaults to the active project."),
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
@@ -474,7 +474,7 @@ def show_project(
     console.print(f"Config: {summary.config_path}")
 
 
-@project_app.command("edit")
+@project_app.command("edit", help="Edit project config.")
 def edit_project(
     name: str | None = typer.Argument(None, help="Project name. Defaults to the active project."),
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
@@ -534,7 +534,7 @@ def edit_project(
     )
 
 
-@project_app.command("switch")
+@project_app.command("switch", help="Switch active project.")
 def switch_project(
     name: str = typer.Argument(..., help="Project name to activate."),
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
@@ -559,7 +559,7 @@ def switch_project(
     console.print(summary.description)
 
 
-@project_app.command("delete")
+@project_app.command("delete", help="Delete a project.")
 def delete_project(
     name: str | None = typer.Argument(None, help="Project name. Defaults to the active project."),
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
@@ -622,7 +622,7 @@ def delete_project(
     _print_kv_summary("Project deleted", rows)
 
 
-@project_app.command("validate")
+@project_app.command("validate", help="Validate a spec YAML.")
 def validate_project(
     spec: Path = typer.Option(..., exists=True, dir_okay=False, readable=True, help="Path to a project spec YAML."),
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
@@ -646,7 +646,7 @@ def validate_project(
     console.print(f"Spec: {spec.resolve()}")
 
 
-@project_app.command("draft")
+@project_app.command("draft", help="Draft a spec YAML from seed + brief.")
 def draft_project(
     seed: Path = typer.Option(..., exists=True, dir_okay=False, readable=True, help="Path to a ProjectSeed YAML."),
     brief: Path = typer.Option(..., exists=True, dir_okay=False, readable=True, help="Path to a SemanticBrief YAML."),
@@ -686,7 +686,7 @@ def draft_project(
         console.print(f"Wrote spec draft: {output.resolve()}")
 
 
-@project_app.command("create")
+@project_app.command("create", help="Create a project from spec YAML.")
 def create_project(
     spec: Path = typer.Option(..., exists=True, dir_okay=False, readable=True, help="Path to a project spec YAML."),
     set_active: bool = typer.Option(False, "--set-active", help="Set the new project as active."),
@@ -746,7 +746,7 @@ def create_project(
     _print_kv_summary("Project ready", rows)
 
 
-@project_app.command("clone-code")
+@project_app.command("clone-code", help="Clone a project's code repo.")
 def clone_code(
     name: str | None = typer.Argument(None, help="Project name. Defaults to the active project."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show the clone action without executing it."),
@@ -820,7 +820,7 @@ def clone_code(
     )
 
 
-@project_app.command("init")
+@project_app.command("init", help="Create from spec YAML + clone repo.")
 def init_project(
     spec: Path = typer.Option(..., exists=True, dir_okay=False, readable=True, help="Path to a project spec YAML."),
     set_active: bool = typer.Option(False, "--set-active", help="Set the new project as active."),
