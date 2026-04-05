@@ -13,6 +13,7 @@ dependencies = [
   "prompt_toolkit>=3.0,<4",
   "rich>=13.0,<14",
   "typer>=0.12,<1",
+  "unicodeit>=0.7,<1",
 ]
 
 [project.optional-dependencies]

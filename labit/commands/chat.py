@@ -12,11 +12,11 @@ from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
+from rich.theme import Theme
 
 from labit.capture.drafter import IdeaDrafter
 from labit.capture.service import CaptureService
 from labit.chat.clipboard import ClipboardImageError, capture_clipboard_image
-from labit.chat.latex_unicode import latex_to_unicode
 from labit.chat.composer import ComposerResult, prompt_toolkit_available, prompt_with_clipboard_image
 from labit.chat.models import ChatMode
 from labit.chat.service import ChatService
@@ -46,7 +46,39 @@ chat_app = typer.Typer(
     help="Shared free conversation sessions with one or more agent backends.",
     invoke_without_command=True,
 )
-console = Console()
+_LABIT_THEME = Theme(
+    {
+        # ── Headers ──────────────────────────────────────────────
+        "markdown.h1": "bold bright_cyan",
+        "markdown.h1.border": "bright_cyan",
+        "markdown.h2": "bold bright_white underline",
+        "markdown.h3": "bold dodger_blue2",
+        "markdown.h4": "bold grey70",
+        "markdown.h5": "grey70 underline",
+        "markdown.h6": "dim italic",
+        # ── Inline ───────────────────────────────────────────────
+        "markdown.strong": "bold",
+        "markdown.em": "italic dim",
+        "markdown.emph": "italic dim",
+        "markdown.s": "dim strike",
+        # ── Code ─────────────────────────────────────────────────
+        "markdown.code": "bold cyan",
+        "markdown.code_block": "",
+        # ── Blocks ───────────────────────────────────────────────
+        "markdown.block_quote": "dim",
+        "markdown.hr": "dim cyan",
+        # ── Lists ────────────────────────────────────────────────
+        "markdown.item.bullet": "bright_cyan",
+        "markdown.item.number": "bright_cyan",
+        # ── Links ────────────────────────────────────────────────
+        "markdown.link": "bright_blue underline",
+        "markdown.link_url": "dim blue",
+    }
+)
+
+_CODE_THEME = "default"
+
+console = Console(theme=_LABIT_THEME)
 
 _PROVIDER_STYLES = {
     "claude": ("blue", "CLAUDE"),
@@ -246,11 +278,13 @@ def _sanitize_markdown(text: str) -> str:
     # If still in an unclosed fence, close it
     if in_fence:
         result.append("```")
-    fixed = "\n".join(result)
-    # Convert LaTeX math to Unicode, but skip code fences.
-    # Split on fence boundaries and only convert non-code sections.
-    parts = re.split(r"(```[^\n]*\n[\s\S]*?```)", fixed)
-    return "".join(latex_to_unicode(p) if not p.startswith("```") else p for p in parts)
+    return "\n".join(result)
+
+
+def _md(content: str, *, sanitize: bool = True) -> Markdown:
+    """Create a themed Markdown renderable."""
+    text = _sanitize_markdown(content) if sanitize else content
+    return Markdown(text, code_theme=_CODE_THEME)
 
 
 def _agent_panel(
@@ -265,7 +299,7 @@ def _agent_panel(
     title = f"{label} · {speaker}"
     if turn_index is not None:
         title = f"{title} · turn {turn_index}"
-    body: RenderableType = Markdown(_sanitize_markdown(content)) if content.strip() else (thinking or _ThinkingIndicator())
+    body: RenderableType = _md(content) if content.strip() else (thinking or _ThinkingIndicator())
     return Panel(body, title=title, border_style=color)
 
 
@@ -510,9 +544,9 @@ def _render_hypothesis_preview(draft, *, project: str) -> None:
     if draft.motivation:
         console.print(Panel(draft.motivation, title="Motivation", border_style="cyan"))
     if draft.rationale_markdown:
-        console.print(Panel(Markdown(draft.rationale_markdown), title="Rationale", border_style="blue"))
+        console.print(Panel(_md(draft.rationale_markdown, sanitize=False), title="Rationale", border_style="blue"))
     if draft.experiment_plan_markdown:
-        console.print(Panel(Markdown(draft.experiment_plan_markdown), title="Experiment Plan", border_style="magenta"))
+        console.print(Panel(_md(draft.experiment_plan_markdown, sanitize=False), title="Experiment Plan", border_style="magenta"))
 
 
 def _render_idea_preview(draft) -> None:
@@ -1998,7 +2032,7 @@ def ask_chat(
     console.print("")
     for reply in result.replies:
         console.print(f"[cyan][turn {reply.message.turn_index}] {reply.participant.name}[/cyan]")
-        console.print(Markdown(reply.message.content))
+        console.print(_md(reply.message.content))
         console.print("")
 
 
@@ -2042,5 +2076,5 @@ def resume_chat(
     console.print("")
     for reply in result.replies:
         console.print(f"[cyan][turn {reply.message.turn_index}] {reply.participant.name}[/cyan]")
-        console.print(Markdown(reply.message.content))
+        console.print(_md(reply.message.content))
         console.print("")
