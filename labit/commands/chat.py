@@ -12,6 +12,8 @@ from rich.text import Text
 
 from labit.capture.drafter import IdeaDrafter
 from labit.capture.service import CaptureService
+from labit.chat.clipboard import ClipboardImageError, capture_clipboard_image
+from labit.chat.composer import ComposerResult, prompt_toolkit_available, prompt_with_clipboard_image
 from labit.chat.models import ChatMode
 from labit.chat.service import ChatService
 from labit.chat.synthesizer import DiscussionSynthesizer
@@ -155,7 +157,7 @@ def _render_compact_transcript(messages) -> None:
         return
     for message in messages:
         if message.message_type.value == "user":
-            console.print(Panel.fit(message.content, title=f"user · turn {message.turn_index}", border_style="white"))
+            console.print(Panel.fit(_message_body(message), title=f"user · turn {message.turn_index}", border_style="white"))
             continue
         provider_name = message.provider.value if message.provider else "agent"
         color, label = _PROVIDER_STYLES.get(provider_name, ("cyan", provider_name.upper()))
@@ -165,7 +167,7 @@ def _render_compact_transcript(messages) -> None:
 
 def _render_message_block(message) -> None:
     if message.message_type.value == "user":
-        console.print(Panel(message.content, title=f"user · turn {message.turn_index}", border_style="white"))
+        console.print(Panel(_message_body(message), title=f"user · turn {message.turn_index}", border_style="white"))
         console.print("")
         return
 
@@ -189,8 +191,12 @@ def _agent_panel(speaker: str, provider_name: str, content: str, *, turn_index: 
     return Panel(body, title=title, border_style=color)
 
 
-def _render_user_shell_message(content: str) -> None:
-    console.print(Panel(content, title="user", border_style="white"))
+def _render_user_shell_message(content: str, *, attachments: list | None = None) -> None:
+    if attachments:
+        body = _message_body(type("ShellMessage", (), {"content": content, "attachments": attachments})())
+    else:
+        body = content
+    console.print(Panel(body, title="user", border_style="white"))
     console.print("")
 
 
@@ -213,7 +219,24 @@ def _transcript_preview_text(messages) -> Text:
                 text.append(f" ({message.provider.value})", style="dim")
         text.append(": ")
         text.append(message.content)
+        if getattr(message, "attachments", None):
+            text.append(f" [{len(message.attachments)} attachment", style="dim")
+            if len(message.attachments) != 1:
+                text.append("s", style="dim")
+            text.append("]", style="dim")
     return text
+
+
+def _message_body(message) -> str:
+    body = message.content
+    attachments = getattr(message, "attachments", None) or []
+    if not attachments:
+        return body
+    lines = [body, "", "Attachments:"]
+    for attachment in attachments:
+        label = attachment.label or attachment.path.rsplit("/", 1)[-1]
+        lines.append(f"- {attachment.kind.value}: {label}")
+    return "\n".join(lines).strip()
 
 
 def _render_shell_header(session) -> None:
@@ -228,7 +251,7 @@ def _render_shell_header(session) -> None:
         f"[bold]Mode[/bold]: {mode_label}\n"
         f"[bold]Participants[/bold]: {participants}\n"
         f"[bold]Session ID[/bold]: {session.session_id}\n"
-        "[dim]Type a message to continue. Use /help to see shell commands.[/dim]"
+        "[dim]Type a message to continue. Ctrl-V pastes one clipboard image. Use /help to see shell commands.[/dim]"
     )
     console.print(Panel(body, title=f"[bold green]LABIT Chat · {session.title}[/bold green]", border_style="green"))
 
@@ -266,7 +289,7 @@ def _box_bottom(width: int) -> str:
     return f"╰{'─' * (width - 2)}╯"
 
 
-def _prompt_in_box(session) -> str:
+def _prompt_in_box(session) -> ComposerResult:
     width = _box_width()
     inner_width = width - 2
     project = session.project or "no-project"
@@ -274,18 +297,34 @@ def _prompt_in_box(session) -> str:
     participants = ", ".join(f"{item.name}:{item.provider.value}" for item in session.participants)
     prompt_prefix = " › "
     meta_line = f"{project} · {mode} · {participants}"
-    command_line = "Commands: /help /list /new /switch /show /mode /memory /think /long-term-memory /think-long-term /idea /note /todo /synthesize /investigate /hypothesis /launch-exp /debrief /review-results /exit"
+    shortcut_lines = [
+        "Shortcuts: Ctrl-V image · /help · /think · /ltm · /image · /exit",
+        "Research: /memory · /idea · /todo · /investigate · /hypothesis",
+    ]
 
     if not console.is_terminal:
         console.print(f"[dim]{meta_line}[/dim]")
-        console.print(f"[dim]{command_line}[/dim]")
+        for line in shortcut_lines:
+            console.print(f"[dim]{line}[/dim]")
         console.print(f"[yellow]{_box_top('Input', width)}[/yellow]")
         console.print(f"[yellow]{_box_line('', width)}[/yellow]")
         console.print(f"[yellow]│[/yellow]{prompt_prefix}", end="")
         raw = console.input("")
         console.print(f"[yellow]{_box_line('', width)}[/yellow]")
         console.print(f"[yellow]{_box_bottom(width)}[/yellow]")
-        return raw
+        return ComposerResult(text=raw)
+
+    if prompt_toolkit_available():
+        console.print(f"[dim]{meta_line}[/dim]")
+        for line in shortcut_lines:
+            console.print(f"[dim]{line}[/dim]")
+        return prompt_with_clipboard_image(
+            console=console,
+            paths=RepoPaths.discover(),
+            session_id=session.session_id,
+            prompt_prefix="› ",
+            show_frame=True,
+        )
 
     top = _box_top("Input", width)
     empty = _box_line("", width)
@@ -298,7 +337,8 @@ def _prompt_in_box(session) -> str:
     reset = "\x1b[0m"
 
     console.print(f"[dim]{meta_line}[/dim]")
-    console.print(f"[dim]{command_line}[/dim]")
+    for line in shortcut_lines:
+        console.print(f"[dim]{line}[/dim]")
     stream.write(f"{yellow}{top}{reset}\n")
     stream.write(f"{yellow}{empty}{reset}\n")
     stream.write(f"{yellow}{prompt_line}{reset}\n")
@@ -308,11 +348,16 @@ def _prompt_in_box(session) -> str:
     stream.write(f"\x1b[4A\r\x1b[{len(prompt_prefix) + 1}C")
     stream.flush()
 
-    raw = input()
+    raw_result = prompt_with_clipboard_image(
+        console=console,
+        paths=RepoPaths.discover(),
+        session_id=session.session_id,
+        prompt_prefix="",
+    )
 
     stream.write("\x1b[2B\r")
     stream.flush()
-    return raw
+    return raw_result
 
 
 def _open_default_session(
@@ -350,6 +395,8 @@ def _shell_help() -> None:
     table.add_row("/think <question>", "Ask the next turn with the highest reasoning effort, while keeping the normal chat context shape.")
     table.add_row("/long-term-memory <question>", "Run a deep long-term memory search for this turn, then answer from the richer retrieved context.")
     table.add_row("/think-long-term <question>", "Run the next turn with both deep long-term memory search and the highest reasoning effort.")
+    table.add_row("Ctrl-V", "Attach one image from the clipboard to the current turn.")
+    table.add_row("/paste-image [question]", "Read one image from the system clipboard, save it under .labit/, and send it as this turn's image input.")
     table.add_row("/idea [text]", "Save a lightweight project idea. With no text, show saved ideas.")
     table.add_row("/note [text]", "Save a lightweight project note. With no text, show saved notes.")
     table.add_row("/todo [text]", "Save an actionable project todo. With no text, show saved todos.")
@@ -696,7 +743,13 @@ def _transcript_excerpt(messages, *, limit: int = 16, max_chars: int = 6000) -> 
         speaker = message.speaker
         if message.provider:
             speaker = f"{speaker} ({message.provider.value})"
-        lines.append(f"{speaker}: {message.content.strip()}")
+        line = f"{speaker}: {message.content.strip()}"
+        if getattr(message, "attachments", None):
+            attachment_labels = ", ".join(
+                attachment.label or attachment.path.rsplit("/", 1)[-1] for attachment in message.attachments
+            )
+            line = f"{line} [attachments: {attachment_labels}]"
+        lines.append(line)
     text = "\n".join(lines).strip()
     return text[:max_chars].strip()
 
@@ -729,10 +782,11 @@ def _run_streaming_turn(
     service: ChatService,
     session,
     query: str,
+    attachments: list | None = None,
     force_deep_context: bool = False,
     reasoning_effort: str | None = None,
 ) -> object | None:
-    _render_user_shell_message(query)
+    _render_user_shell_message(query, attachments=attachments)
     participant_panels: dict[str, str] = {}
 
     def _render_live() -> list[Panel]:
@@ -759,6 +813,7 @@ def _run_streaming_turn(
             return service.ask_stream(
                 session_id=session.session_id,
                 content=query,
+                attachments=attachments,
                 force_deep_context=force_deep_context,
                 reasoning_effort=reasoning_effort,
                 on_reply_start=_on_reply_start,
@@ -783,7 +838,9 @@ def run_chat_shell(
 
     current_session = session
     while True:
-        raw = _prompt_in_box(current_session).strip()
+        composer_result = _prompt_in_box(current_session)
+        raw = composer_result.text.strip()
+        attachments = composer_result.attachments
         if not raw:
             continue
         if raw.startswith("/"):
@@ -833,6 +890,32 @@ def run_chat_shell(
                     continue
                 _render_memory_detail(record)
                 continue
+            if command in {"/paste-image", "/image"}:
+                query = argument.strip() or "Please inspect the attached image and describe anything important."
+                try:
+                    attachment = capture_clipboard_image(
+                        paths=RepoPaths.discover(),
+                        session_id=current_session.session_id,
+                    )
+                except ClipboardImageError as exc:
+                    console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+                console.print(
+                    Panel(
+                        f"[bold]Saved[/bold]: {attachment.label or attachment.path}\n[bold]Path[/bold]: {attachment.path}",
+                        title="[bold green]Clipboard image attached[/bold green]",
+                        border_style="green",
+                    )
+                )
+                result = _run_streaming_turn(
+                    service=service,
+                    session=current_session,
+                    query=query,
+                    attachments=[attachment],
+                )
+                if result is not None:
+                    current_session = result.session
+                continue
             if command == "/think":
                 query = argument.strip()
                 if not query:
@@ -842,6 +925,7 @@ def run_chat_shell(
                     service=service,
                     session=current_session,
                     query=query,
+                    attachments=attachments,
                     reasoning_effort=ChatService.THINK_REASONING_EFFORT,
                 )
                 if result is not None:
@@ -856,6 +940,7 @@ def run_chat_shell(
                     service=service,
                     session=current_session,
                     query=query,
+                    attachments=attachments,
                     force_deep_context=True,
                     reasoning_effort=ChatService.THINK_REASONING_EFFORT,
                 )
@@ -871,6 +956,7 @@ def run_chat_shell(
                     service=service,
                     session=current_session,
                     query=query,
+                    attachments=attachments,
                     force_deep_context=True,
                 )
                 if result is not None:
@@ -1650,11 +1736,12 @@ def run_chat_shell(
             console.print("")
 
         console.print("")
-        _render_user_shell_message(raw)
+        _render_user_shell_message(raw, attachments=attachments)
         try:
             result = service.ask_stream(
                 session_id=current_session.session_id,
                 content=raw,
+                attachments=attachments,
                 on_reply_start=_on_reply_start,
                 on_reply_delta=_on_reply_delta,
                 on_reply_complete=_on_reply_complete,
