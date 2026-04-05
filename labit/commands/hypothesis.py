@@ -4,7 +4,7 @@ import json
 
 import typer
 from rich.console import Console
-from rich.markdown import Markdown
+from labit.rendering import LaTeXMarkdown as Markdown
 from rich.panel import Panel
 
 from labit.hypotheses.service import HypothesisService

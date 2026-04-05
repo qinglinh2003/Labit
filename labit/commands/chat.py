@@ -7,7 +7,7 @@ import time
 import typer
 from rich.console import Console, RenderableType
 from rich.live import Live
-from rich.markdown import Markdown
+from labit.rendering import LaTeXMarkdown as Markdown
 from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.table import Table
