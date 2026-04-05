@@ -1,142 +1,34 @@
-"""Convert LaTeX math notation to Unicode approximations for terminal display."""
+"""Convert LaTeX math notation to Unicode approximations for terminal display.
+
+Architecture:
+- **Symbol conversion** is delegated to ``unicodeit`` (covers hundreds of
+  LaTeX commands: Greek, operators, arrows, accents, mathbb, mathcal, …).
+- **Structural commands** (frac, sqrt, matrices, cases, aligned, delimiters,
+  xrightarrow, stackrel, etc.) are handled here because they require
+  argument parsing that unicodeit does not do.
+- **Math block detection** (``$$...$$`` and ``$...$``) and formatting
+  (blockquote vs code-fence) is handled here.
+"""
 
 from __future__ import annotations
 
 import re
 
-# ---------------------------------------------------------------------------
-# Symbol tables
-# ---------------------------------------------------------------------------
-
-_GREEK: dict[str, str] = {
-    "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ", "epsilon": "ε",
-    "varepsilon": "ε", "zeta": "ζ", "eta": "η", "theta": "θ", "vartheta": "ϑ",
-    "iota": "ι", "kappa": "κ", "lambda": "λ", "mu": "μ", "nu": "ν",
-    "xi": "ξ", "pi": "π", "varpi": "ϖ", "rho": "ρ", "varrho": "ϱ",
-    "sigma": "σ", "varsigma": "ς", "tau": "τ", "upsilon": "υ", "phi": "φ",
-    "varphi": "ϕ", "chi": "χ", "psi": "ψ", "omega": "ω",
-    # Uppercase
-    "Gamma": "Γ", "Delta": "Δ", "Theta": "Θ", "Lambda": "Λ", "Xi": "Ξ",
-    "Pi": "Π", "Sigma": "Σ", "Upsilon": "Υ", "Phi": "Φ", "Psi": "Ψ",
-    "Omega": "Ω",
-}
-
-_OPERATORS: dict[str, str] = {
-    "sum": "∑", "prod": "∏", "int": "∫", "iint": "∬", "iiint": "∭",
-    "oint": "∮", "partial": "∂", "nabla": "∇", "infty": "∞",
-    "forall": "∀", "exists": "∃", "nexists": "∄", "emptyset": "∅",
-    "varnothing": "∅",
-}
-
-_RELATIONS: dict[str, str] = {
-    "in": "∈", "notin": "∉", "ni": "∋", "subset": "⊂", "supset": "⊃",
-    "subseteq": "⊆", "supseteq": "⊇", "leq": "≤", "le": "≤",
-    "geq": "≥", "ge": "≥", "neq": "≠", "ne": "≠", "approx": "≈",
-    "sim": "∼", "simeq": "≃", "cong": "≅", "equiv": "≡",
-    "propto": "∝", "ll": "≪", "gg": "≫", "prec": "≺", "succ": "≻",
-    "preceq": "⪯", "succeq": "⪰",
-}
-
-_ARROWS: dict[str, str] = {
-    "to": "→", "rightarrow": "→", "leftarrow": "←", "leftrightarrow": "↔",
-    "Rightarrow": "⇒", "Leftarrow": "⇐", "Leftrightarrow": "⇔",
-    "mapsto": "↦", "uparrow": "↑", "downarrow": "↓",
-    "longrightarrow": "⟶", "longleftarrow": "⟵",
-}
-
-_MISC: dict[str, str] = {
-    "cdot": "·", "cdots": "⋯", "ldots": "…", "dots": "…", "vdots": "⋮",
-    "ddots": "⋱", "times": "×", "div": "÷", "circ": "∘", "bullet": "•",
-    "star": "⋆", "dagger": "†", "pm": "±", "mp": "∓",
-    "mid": "|", "nmid": "∤", "parallel": "∥",
-    "perp": "⊥", "angle": "∠", "triangle": "△",
-    "neg": "¬", "land": "∧", "lor": "∨", "wedge": "∧", "vee": "∨",
-    "cap": "∩", "cup": "∪", "setminus": "∖",
-    "ell": "ℓ", "hbar": "ℏ", "Re": "ℜ", "Im": "ℑ", "wp": "℘",
-    "aleph": "ℵ",
-}
-
-_SPACING: dict[str, str] = {
-    "quad": "  ", "qquad": "    ", ",": " ", ";": " ", "!": "", " ": " ",
-}
-
-# Merge all simple command tables.
-_SIMPLE_COMMANDS: dict[str, str] = {}
-for _tbl in (_GREEK, _OPERATORS, _RELATIONS, _ARROWS, _MISC, _SPACING):
-    _SIMPLE_COMMANDS.update(_tbl)
-
-# Blackboard bold  \mathbb{X}
-_MATHBB: dict[str, str] = {
-    "A": "𝔸", "B": "𝔹", "C": "ℂ", "D": "𝔻", "E": "𝔼", "F": "𝔽",
-    "G": "𝔾", "H": "ℍ", "I": "𝕀", "J": "𝕁", "K": "𝕂", "L": "𝕃",
-    "M": "𝕄", "N": "ℕ", "O": "𝕆", "P": "ℙ", "Q": "ℚ", "R": "ℝ",
-    "S": "𝕊", "T": "𝕋", "U": "𝕌", "V": "𝕍", "W": "𝕎", "X": "𝕏",
-    "Y": "𝕐", "Z": "ℤ",
-}
-
-# Calligraphic  \mathcal{X}
-_MATHCAL: dict[str, str] = {
-    "A": "𝒜", "B": "ℬ", "C": "𝒞", "D": "𝒟", "E": "ℰ", "F": "ℱ",
-    "G": "𝒢", "H": "ℋ", "I": "ℐ", "J": "𝒥", "K": "𝒦", "L": "ℒ",
-    "M": "ℳ", "N": "𝒩", "O": "𝒪", "P": "𝒫", "Q": "𝒬", "R": "ℛ",
-    "S": "𝒮", "T": "𝒯", "U": "𝒰", "V": "𝒱", "W": "𝒲", "X": "𝒳",
-    "Y": "𝒴", "Z": "𝒵",
-}
-
-# Unicode superscripts / subscripts (limited charset).
-_SUPERSCRIPTS: dict[str, str] = {
-    "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵",
-    "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹",
-    "+": "⁺", "-": "⁻", "=": "⁼", "(": "⁽", ")": "⁾",
-    "i": "ⁱ", "n": "ⁿ", "t": "ᵗ", "T": "ᵀ",
-    "*": "∗",
-}
-
-_SUBSCRIPTS: dict[str, str] = {
-    "0": "₀", "1": "₁", "2": "₂", "3": "₃", "4": "₄", "5": "₅",
-    "6": "₆", "7": "₇", "8": "₈", "9": "₉",
-    "+": "₊", "-": "₋", "=": "₌", "(": "₍", ")": "₎",
-    "a": "ₐ", "e": "ₑ", "h": "ₕ", "i": "ᵢ", "j": "ⱼ", "k": "ₖ",
-    "l": "ₗ", "m": "ₘ", "n": "ₙ", "o": "ₒ", "p": "ₚ", "r": "ᵣ",
-    "s": "ₛ", "t": "ₜ", "u": "ᵤ", "v": "ᵥ", "x": "ₓ",
-}
-
-# Combining diacritics for \hat, \bar, \tilde, etc.
-_ACCENTS: dict[str, str] = {
-    "hat": "\u0302",    # combining circumflex
-    "bar": "\u0304",    # combining macron
-    "tilde": "\u0303",  # combining tilde
-    "dot": "\u0307",    # combining dot above
-    "ddot": "\u0308",   # combining diaeresis
-    "vec": "\u20d7",    # combining right arrow above
-    "check": "\u030c",  # combining caron
-}
-
-# Big delimiters — just strip the \left / \right prefix.
-_DELIMITERS: dict[str, str] = {
-    "langle": "⟨", "rangle": "⟩",
-    "lfloor": "⌊", "rfloor": "⌋",
-    "lceil": "⌈", "rceil": "⌉",
-    "lvert": "|", "rvert": "|",
-    "lVert": "‖", "rVert": "‖",
-    "{": "{", "}": "}",
-}
+import unicodeit
 
 # ---------------------------------------------------------------------------
-# Regex helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _brace_arg(tex: str, pos: int) -> tuple[str, int]:
     r"""Extract a brace-delimited argument ``{...}`` starting at *pos*.
 
-    Returns ``(inner_text, end_pos)`` where *end_pos* is just past the
-    closing ``}``.  If *pos* doesn't point at ``{``, return the single
-    next token as the argument — either a ``\command`` or a single char.
+    If *pos* doesn't point at ``{``, return the next single token
+    (a ``\command`` or one character).
     """
     if pos >= len(tex):
         return ("", pos)
     if tex[pos] != "{":
-        # Handle \command as a single token (e.g. ^*  or  ^\infty  or  _\theta)
         if tex[pos] == "\\" and pos + 1 < len(tex):
             j = pos + 1
             if tex[j].isalpha():
@@ -154,213 +46,442 @@ def _brace_arg(tex: str, pos: int) -> tuple[str, int]:
             depth -= 1
             if depth == 0:
                 return (tex[start:i], i + 1)
-    # Unmatched brace — return rest of string.
     return (tex[start:], len(tex))
 
 
-def _try_superscript(text: str) -> str:
-    """Convert *text* to Unicode superscript if all chars are mappable."""
-    converted = [_SUPERSCRIPTS.get(ch) for ch in text]
-    if all(c is not None for c in converted):
-        return "".join(converted)  # type: ignore[arg-type]
-    return "^(" + text + ")"
+def _opt_arg(tex: str, pos: int) -> tuple[str | None, int]:
+    """Extract an optional ``[...]`` argument. Returns (None, pos) if absent."""
+    if pos < len(tex) and tex[pos] == "[":
+        close = tex.find("]", pos)
+        if close != -1:
+            return (tex[pos + 1 : close], close + 1)
+    return (None, pos)
 
 
-def _try_subscript(text: str) -> str:
-    converted = [_SUBSCRIPTS.get(ch) for ch in text]
-    if all(c is not None for c in converted):
-        return "".join(converted)  # type: ignore[arg-type]
-    return "_(" + text + ")"
+def _ucit(tex: str) -> str:
+    """Run unicodeit on a small LaTeX fragment (single command / symbol)."""
+    return unicodeit.replace(tex)
+
+
+# ---------------------------------------------------------------------------
+# Matrix / environment rendering
+# ---------------------------------------------------------------------------
+
+_MATRIX_DELIMS: dict[str, tuple[str, str, str, str, str, str]] = {
+    "pmatrix":  ("⎛", "⎜", "⎝", "⎞", "⎟", "⎠"),
+    "bmatrix":  ("⎡", "⎢", "⎣", "⎤", "⎥", "⎦"),
+    "vmatrix":  ("│", "│", "│", "│", "│", "│"),
+    "Vmatrix":  ("‖", "‖", "‖", "‖", "‖", "‖"),
+    "Bmatrix":  ("⎧", "⎪", "⎩", "⎫", "⎪", "⎭"),
+    "matrix":   (" ", " ", " ", " ", " ", " "),
+    "smallmatrix": (" ", " ", " ", " ", " ", " "),
+}
+
+
+def _render_matrix(env_name: str, body: str) -> str:
+    raw_rows = re.split(r"\\\\(?:\s*\[[^\]]*\])?", body)
+    rows: list[list[str]] = []
+    for raw in raw_rows:
+        raw = raw.strip()
+        if not raw:
+            continue
+        rows.append([_convert(c.strip()) for c in raw.split("&")])
+    if not rows:
+        return ""
+    n_cols = max(len(r) for r in rows)
+    for r in rows:
+        while len(r) < n_cols:
+            r.append("")
+    widths = [max(len(r[c]) for r in rows) for c in range(n_cols)]
+    delims = _MATRIX_DELIMS.get(env_name, _MATRIX_DELIMS["pmatrix"])
+    tl, ml, bl, tr, mr, br = delims
+    n = len(rows)
+    lines: list[str] = []
+    for idx, row in enumerate(rows):
+        padded = "  ".join(cell.ljust(widths[c]) for c, cell in enumerate(row))
+        if n == 1:
+            l, r = tl, tr
+        elif idx == 0:
+            l, r = tl, tr
+        elif idx == n - 1:
+            l, r = bl, br
+        else:
+            l, r = ml, mr
+        lines.append(f"{l} {padded} {r}")
+    return "\n".join(lines)
+
+
+def _render_environment(env_name: str, body: str) -> str:
+    if env_name in _MATRIX_DELIMS:
+        return _render_matrix(env_name, body)
+    if env_name in ("cases", "rcases"):
+        raw_rows = re.split(r"\\\\(?:\s*\[[^\]]*\])?", body)
+        lines: list[str] = []
+        for raw in raw_rows:
+            raw = raw.strip()
+            if not raw:
+                continue
+            parts = raw.split("&", 1)
+            expr = _convert(parts[0].strip())
+            cond = _convert(parts[1].strip()) if len(parts) > 1 else ""
+            lines.append(f"{expr}  {cond}" if cond else expr)
+        if not lines:
+            return ""
+        brackets = {"cases": ("⎧", "⎨", "⎩"), "rcases": (" ", " ", " ")}
+        top, mid, bot = brackets[env_name]
+        result: list[str] = []
+        for idx, line in enumerate(lines):
+            if idx == 0:
+                b = top
+            elif idx == len(lines) - 1:
+                b = bot
+            else:
+                b = mid
+            result.append(f"{b} {line}")
+        return "\n".join(result)
+    if env_name in ("aligned", "align", "align*", "gathered", "split"):
+        raw_rows = re.split(r"\\\\(?:\s*\[[^\]]*\])?", body)
+        return "\n".join(
+            _convert(raw.replace("&", " ").strip())
+            for raw in raw_rows
+            if raw.strip()
+        )
+    return _convert(body)
+
+
+# ---------------------------------------------------------------------------
+# Structural commands — things unicodeit can't handle
+# ---------------------------------------------------------------------------
+
+# Commands that take {arg} and produce an arrow with annotation.
+_ARROW_COMMANDS: dict[str, str] = {
+    "xrightarrow": "→", "xleftarrow": "←", "xmapsto": "↦",
+    "xhookrightarrow": "↪", "xhookleftarrow": "↩",
+    "xlongrightarrow": "⟶", "xlongleftarrow": "⟵",
+}
+
+# Delimiter sizing commands — just pass through to the delimiter itself.
+_SIZING_CMDS = frozenset({
+    "left", "right",
+    "big", "Big", "bigg", "Bigg",
+    "bigl", "bigr", "Bigl", "Bigr",
+    "biggl", "biggr", "Biggl", "Biggr",
+    "bigm", "Bigm", "biggm", "Biggm",
+    "middle",
+})
+
+# Standard math operator names — render as plain text, never pass to unicodeit
+# (unicodeit mangles some of these, e.g. \log → łog because \l → ł).
+_OPERATOR_NAMES = frozenset({
+    # Trig / hyperbolic
+    "sin", "cos", "tan", "cot", "sec", "csc",
+    "sinh", "cosh", "tanh", "coth",
+    "arcsin", "arccos", "arctan", "arccot",
+    # Logarithms / exponential
+    "log", "ln", "lg", "exp",
+    # Limits / extrema
+    "lim", "limsup", "liminf",
+    "min", "max", "sup", "inf",
+    "arg", "argmin", "argmax",
+    # Linear algebra / misc
+    "det", "dim", "ker", "im", "rank", "tr", "diag",
+    "deg", "gcd", "lcm", "mod", "hom",
+    "Pr", "sgn", "sign",
+    # Projections
+    "proj", "span",
+    # Custom but common
+    "softmax", "relu", "ReLU",
+    "sg",  # stop-gradient
+})
+
+_DELIMITERS: dict[str, str] = {
+    "langle": "⟨", "rangle": "⟩", "lfloor": "⌊", "rfloor": "⌋",
+    "lceil": "⌈", "rceil": "⌉", "lvert": "|", "rvert": "|",
+    "lVert": "‖", "rVert": "‖", "vert": "|", "Vert": "‖",
+    "{": "{", "}": "}",
+}
+
+# Text-mode commands — render their argument as plain text.
+_TEXT_CMDS = frozenset({
+    "text", "textrm", "textbf", "textit", "texttt", "textsf",
+    "mathrm", "mathbf", "mathit", "mathsf", "mathtt",
+    "operatorname", "operatorname*",
+})
+
+# Commands to silently skip (consume but produce nothing).
+_SKIP_CMDS = frozenset({
+    "displaystyle", "textstyle", "scriptstyle", "scriptscriptstyle",
+    "phantom", "hphantom", "vphantom",
+    "mathstrut", "strut", "rule",
+    "label", "tag", "notag", "nonumber",
+    "hspace", "vspace", "kern", "mkern", "mskip",
+    "color", "textcolor", "colorbox",
+})
+
+# Spacing commands.
+_SPACING: dict[str, str] = {
+    "quad": "  ", "qquad": "    ", ",": " ", ";": " ", ":": " ",
+    "!": "", " ": " ", "thinspace": " ", "enspace": " ",
+    "medspace": " ", "thickspace": " ", "negthinspace": "",
+}
 
 
 # ---------------------------------------------------------------------------
 # Core converter
 # ---------------------------------------------------------------------------
 
-def _convert_latex_fragment(tex: str) -> str:
-    """Convert a single LaTeX math fragment to Unicode, best-effort."""
+def _convert(tex: str) -> str:
+    """Convert a LaTeX math fragment to Unicode, best-effort.
+
+    Structural commands are parsed here; everything else is delegated
+    to ``unicodeit.replace()``.
+    """
     out: list[str] = []
     i = 0
     n = len(tex)
+
     while i < n:
         ch = tex[i]
 
-        # --- backslash commands ---
+        # ── backslash commands ──────────────────────────────────────
         if ch == "\\":
-            # Grab command name (letters only, or single non-letter).
             j = i + 1
-            if j < n and tex[j].isalpha():
+            if j >= n:
+                break
+            # Parse command name.
+            if tex[j].isalpha():
                 while j < n and tex[j].isalpha():
                     j += 1
                 cmd = tex[i + 1 : j]
-            elif j < n:
+            else:
                 cmd = tex[j]
                 j += 1
-            else:
-                i = j
-                continue
 
-            # Skip optional whitespace after command name.
+            # Skip whitespace after command.
             while j < n and tex[j] == " ":
                 j += 1
 
-            # -- font commands: \mathbb, \mathcal, \mathrm, \mathbf, \text, \operatorname --
-            if cmd == "mathbb":
-                arg, j = _brace_arg(tex, j)
-                out.append("".join(_MATHBB.get(c, c) for c in arg))
-            elif cmd == "mathcal":
-                arg, j = _brace_arg(tex, j)
-                out.append("".join(_MATHCAL.get(c, c) for c in arg))
-            elif cmd in ("mathrm", "text", "textrm", "operatorname", "mathbf", "textbf", "mathit"):
-                arg, j = _brace_arg(tex, j)
-                out.append(arg)
-            elif cmd in ("boldsymbol", "bm"):
-                arg, j = _brace_arg(tex, j)
-                out.append(_convert_latex_fragment(arg))
+            # ── line break \\  ──
+            if cmd == "\\":
+                _, j = _opt_arg(tex, j)  # skip optional [length]
+                out.append("\n")
 
-            # -- accents: \hat{x}, \bar{x}, etc. --
-            elif cmd in _ACCENTS:
-                arg, j = _brace_arg(tex, j)
-                inner = _convert_latex_fragment(arg)
-                # Apply combining character to first char.
-                if inner:
-                    out.append(inner[0] + _ACCENTS[cmd] + inner[1:])
+            # ── environments ──
+            elif cmd == "begin":
+                env_name, j = _brace_arg(tex, j)
+                end_tag = "\\end{" + env_name + "}"
+                end_pos = tex.find(end_tag, j)
+                if end_pos == -1:
+                    env_body, j = tex[j:], n
                 else:
-                    out.append(_ACCENTS[cmd])
+                    env_body = tex[j:end_pos]
+                    j = end_pos + len(end_tag)
+                out.append(_render_environment(env_name, env_body))
+            elif cmd == "end":
+                # Orphan \end — skip it.
+                _, j = _brace_arg(tex, j)
 
-            # -- fractions --
-            elif cmd == "frac":
+            # ── fractions ──
+            elif cmd in ("frac", "dfrac", "tfrac", "cfrac"):
                 num, j = _brace_arg(tex, j)
                 den, j = _brace_arg(tex, j)
-                num_u = _convert_latex_fragment(num)
-                den_u = _convert_latex_fragment(den)
-                # Try Unicode super/sub for simple single-char fracs.
-                if len(num_u) == 1 and len(den_u) == 1:
-                    sup = _SUPERSCRIPTS.get(num_u)
-                    sub = _SUBSCRIPTS.get(den_u)
-                    if sup and sub:
-                        out.append(f"{sup}⁄{sub}")
+                sn, sd = _convert(num), _convert(den)
+                if len(sn) == 1 and len(sd) == 1:
+                    # Try compact Unicode fraction.
+                    compact = _ucit(f"^{{{num}}}/_{{" + den + "}")
+                    if "\\" not in compact:
+                        out.append(compact)
                         i = j
                         continue
-                out.append(f"({num_u})/({den_u})")
+                out.append(f"({sn})/({sd})")
 
-            # -- sqrt --
+            # ── roots ──
             elif cmd == "sqrt":
+                opt, j = _opt_arg(tex, j)
                 arg, j = _brace_arg(tex, j)
-                out.append("√(" + _convert_latex_fragment(arg) + ")")
+                inner = _convert(arg)
+                if opt:
+                    out.append(f"{_convert(opt)}√({inner})")
+                else:
+                    out.append(f"√({inner})")
 
-            # -- delimiters --
-            elif cmd in ("left", "right", "bigl", "bigr", "Bigl", "Bigr", "biggl", "biggr", "Biggl", "Biggr", "big", "Big"):
-                # Next char is the delimiter.
+            # ── arrow commands with annotation ──
+            elif cmd in _ARROW_COMMANDS:
+                opt, j = _opt_arg(tex, j)          # optional [below]
+                arg, j = _brace_arg(tex, j)         # {above}
+                arrow = _ARROW_COMMANDS[cmd]
+                above = _convert(arg) if arg else ""
+                below = _convert(opt) if opt else ""
+                if above and below:
+                    out.append(f"—{above}/{below}{arrow}")
+                elif above:
+                    out.append(f"—{above}→" if cmd.endswith("rightarrow") else f"←{above}—" if cmd.endswith("leftarrow") else f"—{above}{arrow}")
+                else:
+                    out.append(arrow)
+
+            # ── stackrel / overset / underset ──
+            elif cmd == "stackrel":
+                top, j = _brace_arg(tex, j)
+                bot, j = _brace_arg(tex, j)
+                st, sb = _convert(top), _convert(bot)
+                out.append(f"{sb}[{st}]" if len(st) <= 3 else f"{sb}")
+            elif cmd == "overset":
+                top, j = _brace_arg(tex, j)
+                bot, j = _brace_arg(tex, j)
+                st, sb = _convert(top), _convert(bot)
+                out.append(f"{sb}[{st}]" if len(st) <= 3 else sb)
+            elif cmd == "underset":
+                bot, j = _brace_arg(tex, j)
+                top, j = _brace_arg(tex, j)
+                st, sb = _convert(top), _convert(bot)
+                out.append(f"{st}[{sb}]" if len(sb) <= 3 else st)
+
+            # ── underbrace / overbrace — render content, attach label ──
+            elif cmd in ("underbrace", "overbrace"):
+                arg, j = _brace_arg(tex, j)
+                inner = _convert(arg)
+                # Peek for _/^ label.
+                if j < n and tex[j] in ("_", "^"):
+                    _, j2 = _brace_arg(tex, j + 1)
+                    label_raw = tex[j + 1 : j2] if tex[j + 1] == "{" else tex[j + 1 : j2]
+                    label_raw, j = _brace_arg(tex, j + 1)
+                    label = _convert(label_raw)
+                    out.append(f"{inner} [{label}]")
+                else:
+                    out.append(inner)
+
+            # ── delimiter sizing ──
+            elif cmd in _SIZING_CMDS:
                 if j < n:
-                    delim = tex[j]
-                    if delim == "\\":
-                        # e.g. \left\langle
+                    if tex[j] == "\\":
                         k = j + 1
                         while k < n and tex[k].isalpha():
                             k += 1
-                        delim_cmd = tex[j + 1 : k]
-                        out.append(_DELIMITERS.get(delim_cmd, delim_cmd))
+                        dcmd = tex[j + 1 : k]
+                        out.append(_DELIMITERS.get(dcmd, _ucit("\\" + dcmd)))
                         j = k
+                    elif tex[j] == ".":
+                        j += 1  # \left. or \right. — invisible delimiter
                     else:
-                        out.append(_DELIMITERS.get(delim, delim))
+                        out.append(_DELIMITERS.get(tex[j], tex[j]))
                         j += 1
 
-            # -- overline / underline --
+            # ── overline / underline ──
             elif cmd == "overline":
                 arg, j = _brace_arg(tex, j)
-                inner = _convert_latex_fragment(arg)
+                inner = _convert(arg)
                 out.append("".join(c + "\u0305" for c in inner))
             elif cmd == "underline":
                 arg, j = _brace_arg(tex, j)
-                out.append(_convert_latex_fragment(arg))
+                out.append(_convert(arg))
 
-            # -- \underbrace / \overbrace --
-            elif cmd in ("underbrace", "overbrace"):
+            # ── text-mode commands ──
+            elif cmd in _TEXT_CMDS:
                 arg, j = _brace_arg(tex, j)
-                out.append(_convert_latex_fragment(arg))
+                out.append(arg)
 
-            # -- spacing: \, \; \! \  \quad \qquad --
+            # ── skip commands ──
+            elif cmd in _SKIP_CMDS:
+                if j < n and tex[j] == "{":
+                    _, j = _brace_arg(tex, j)
+
+            # ── spacing ──
             elif cmd in _SPACING:
                 out.append(_SPACING[cmd])
 
-            # -- stop-gradient and common operator names --
-            elif cmd == "sg":
+            # ── bm / boldsymbol — just convert content ──
+            elif cmd in ("bm", "boldsymbol", "pmb"):
                 arg, j = _brace_arg(tex, j)
-                out.append("sg(" + _convert_latex_fragment(arg) + ")")
-            elif cmd == "max":
-                out.append("max")
-            elif cmd == "min":
-                out.append("min")
-            elif cmd == "arg":
-                out.append("arg")
-            elif cmd in ("log", "ln", "exp", "sin", "cos", "tan", "det", "dim", "sup", "inf", "lim", "argmax", "argmin"):
+                out.append(_convert(arg))
+
+            # ── operator names (must come before unicodeit fallback) ──
+            elif cmd in _OPERATOR_NAMES:
                 out.append(cmd)
 
-            # -- simple symbol lookup --
-            elif cmd in _SIMPLE_COMMANDS:
-                out.append(_SIMPLE_COMMANDS[cmd])
-
-            # -- delimiter names --
-            elif cmd in _DELIMITERS:
-                out.append(_DELIMITERS[cmd])
-
-            # -- unknown command: keep name as-is --
+            # ── everything else → unicodeit ──
             else:
-                # Check if it has a brace argument — consume it.
+                full_cmd = "\\" + cmd
                 if j < n and tex[j] == "{":
                     arg, j = _brace_arg(tex, j)
-                    out.append(cmd + "(" + _convert_latex_fragment(arg) + ")")
+                    # Try unicodeit on the full command+arg.
+                    attempt = _ucit(full_cmd + "{" + arg + "}")
+                    if "\\" not in attempt:
+                        out.append(attempt)
+                    else:
+                        # unicodeit didn't fully resolve — convert arg ourselves.
+                        sym = _ucit(full_cmd)
+                        if "\\" in sym:
+                            sym = cmd  # strip backslash, show plain name
+                        out.append(sym + "(" + _convert(arg) + ")")
                 else:
-                    out.append(cmd)
+                    result = _ucit(full_cmd)
+                    if "\\" in result:
+                        result = cmd  # unknown command — just show name
+                    out.append(result)
 
             i = j
             continue
 
-        # --- superscript ---
+        # ── superscript ──
         if ch == "^":
             arg, i = _brace_arg(tex, i + 1)
-            inner = _convert_latex_fragment(arg)
-            out.append(_try_superscript(inner))
+            # Let unicodeit handle the super/subscript mapping.
+            inner = _convert(arg)
+            attempt = _ucit("^{" + inner + "}")
+            if attempt.startswith("^{"):
+                # unicodeit couldn't map it — use fallback.
+                out.append("^(" + inner + ")")
+            else:
+                out.append(attempt)
             continue
 
-        # --- subscript ---
+        # ── subscript ──
         if ch == "_":
             arg, i = _brace_arg(tex, i + 1)
-            inner = _convert_latex_fragment(arg)
-            out.append(_try_subscript(inner))
+            inner = _convert(arg)
+            attempt = _ucit("_{" + inner + "}")
+            if attempt.startswith("_{"):
+                out.append("_(" + inner + ")")
+            else:
+                out.append(attempt)
             continue
 
-        # --- everything else: pass through ---
+        # ── ampersand (outside matrix context) ──
+        if ch == "&":
+            out.append("  ")
+            i += 1
+            continue
+
+        # ── everything else ──
         out.append(ch)
         i += 1
 
     return "".join(out)
 
 
+# Alias used by environment rendering.
+_convert_latex_fragment = _convert
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-# Match display math ($$...$$) and inline math ($...$).
-# Use non-greedy matching; handle multi-line display math.
 _DISPLAY_MATH_RE = re.compile(r"\$\$(.+?)\$\$", re.DOTALL)
 _INLINE_MATH_RE = re.compile(r"(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)")
 
 
 def latex_to_unicode(text: str) -> str:
-    """Replace LaTeX math spans in *text* with Unicode approximations.
-
-    Display math (``$$...$$``) is converted and placed on its own indented
-    line.  Inline math (``$...$``) is converted in-place.
-    """
+    """Replace LaTeX math spans in *text* with Unicode approximations."""
 
     def _replace_display(m: re.Match) -> str:
-        converted = _convert_latex_fragment(m.group(1).strip())
-        return "\n    " + converted + "\n"
+        converted = _convert(m.group(1).strip())
+        if "\n" in converted:
+            return "\n```\n" + converted + "\n```\n"
+        return "\n> " + converted + "\n"
 
     def _replace_inline(m: re.Match) -> str:
-        return _convert_latex_fragment(m.group(1))
+        return _convert(m.group(1))
 
     text = _DISPLAY_MATH_RE.sub(_replace_display, text)
     text = _INLINE_MATH_RE.sub(_replace_inline, text)
