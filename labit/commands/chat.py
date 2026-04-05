@@ -187,7 +187,7 @@ def _agent_panel(speaker: str, provider_name: str, content: str, *, turn_index: 
     title = f"{label} · {speaker}"
     if turn_index is not None:
         title = f"{title} · turn {turn_index}"
-    body = content if content.strip() else "[dim]Generating…[/dim]"
+    body: Markdown | str = Markdown(content) if content.strip() else "[dim]Generating…[/dim]"
     return Panel(body, title=title, border_style=color)
 
 
@@ -1912,7 +1912,7 @@ def ask_chat(
     console.print("")
     for reply in result.replies:
         console.print(f"[cyan][turn {reply.message.turn_index}] {reply.participant.name}[/cyan]")
-        console.print(reply.message.content)
+        console.print(Markdown(reply.message.content))
         console.print("")
 
 
@@ -1956,5 +1956,5 @@ def resume_chat(
     console.print("")
     for reply in result.replies:
         console.print(f"[cyan][turn {reply.message.turn_index}] {reply.participant.name}[/cyan]")
-        console.print(reply.message.content)
+        console.print(Markdown(reply.message.content))
         console.print("")
