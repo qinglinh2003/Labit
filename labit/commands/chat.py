@@ -5,7 +5,7 @@ import re
 import time
 
 import typer
-from rich.console import Console, RenderableType
+from rich.console import Console, Group, RenderableType
 from rich.live import Live
 from labit.rendering import LaTeXMarkdown as Markdown
 from rich.panel import Panel
@@ -950,13 +950,13 @@ def _run_streaming_turn(
     _render_user_shell_message(query, attachments=attachments)
     participant_panels: dict[str, str] = {}
 
-    def _render_live() -> list[Panel]:
+    def _render_live() -> Group:
         panels: list[Panel] = []
         for participant in session.participants:
             provider_name = participant.provider.value
             content = participant_panels.get(participant.name, "")
             panels.append(_agent_panel(participant.name, provider_name, content))
-        return panels
+        return Group(*panels)
 
     def _on_reply_start(participant) -> None:
         participant_panels[participant.name] = ""
