@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from collections.abc import Callable
 
 from labit.agents.adapters.base import AgentAdapter, AgentAdapterError, stream_subprocess_lines
@@ -58,9 +59,10 @@ class ClaudeAdapter(AgentAdapter):
         request: AgentRequest,
         *,
         on_text: Callable[[str], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> AgentResponse:
         if request.output_schema:
-            return super().run_stream(request, on_text=on_text)
+            return super().run_stream(request, on_text=on_text, cancel_event=cancel_event)
 
         request = request.model_copy(update={"prompt": self._augment_prompt(request)})
         cmd = self._build_command(request, stream=True)
@@ -111,6 +113,7 @@ class ClaudeAdapter(AgentAdapter):
                 cwd=request.cwd,
                 timeout_seconds=request.timeout_seconds,
                 on_stdout_line=_handle_stdout,
+                cancel_event=cancel_event,
             )
         except subprocess.TimeoutExpired as exc:
             raise AgentAdapterError(

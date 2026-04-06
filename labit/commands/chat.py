@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 
 import typer
@@ -953,6 +954,8 @@ def _run_streaming_turn(
 ) -> object | None:
     _render_user_shell_message(query, attachments=attachments)
     participant_panels: dict[str, str] = {}
+    cancel_event = threading.Event()
+    live: Live | None = None
 
     def _render_live() -> Group:
         panels: list[Panel] = []
@@ -973,9 +976,11 @@ def _run_streaming_turn(
         participant_panels[participant.name] = content
         live.update(_render_live(), refresh=True)
 
-    with Live(_render_live(), console=console, refresh_per_second=8, transient=False) as live:
+    cancelled = False
+    result = None
+    with Live(_render_live(), console=console, refresh_per_second=8, transient=True) as live:
         try:
-            return service.ask_stream(
+            result = service.ask_stream(
                 session_id=session.session_id,
                 content=query,
                 attachments=attachments,
@@ -984,10 +989,30 @@ def _run_streaming_turn(
                 on_reply_start=_on_reply_start,
                 on_reply_delta=_on_reply_delta,
                 on_reply_complete=_on_reply_complete,
+                cancel_event=cancel_event,
             )
+        except KeyboardInterrupt:
+            cancel_event.set()
+            cancelled = True
         except Exception as exc:
             console.print(f"[bold red]Error:[/bold red] {exc}")
             return None
+
+    if result is not None and result.replies:
+        for reply in result.replies:
+            console.print(
+                _agent_panel(
+                    reply.participant.name,
+                    reply.participant.provider.value,
+                    reply.message.content,
+                    turn_index=reply.message.turn_index,
+                )
+            )
+            console.print("")
+
+    if cancelled:
+        console.print("[dim italic]Interrupted.[/dim italic]")
+    return result
 
 
 def run_chat_shell(
@@ -1907,6 +1932,8 @@ def run_chat_shell(
         current_live: Live | None = None
         current_stream_participant: str | None = None
         current_thinking: _ThinkingIndicator | None = None
+        cancel_event = threading.Event()
+        interrupted = False
 
         def _on_reply_start(participant) -> None:
             nonlocal current_live, current_stream_participant, current_thinking
@@ -1917,7 +1944,7 @@ def run_chat_shell(
                 _agent_panel(participant.name, participant.provider.value, "", thinking=current_thinking),
                 console=console,
                 refresh_per_second=12,
-                transient=False,
+                transient=True,
             )
             current_live.start()
 
@@ -1940,10 +1967,10 @@ def run_chat_shell(
                 console.print(_agent_panel(participant.name, participant.provider.value, content))
                 console.print("")
                 return
-            current_live.update(_agent_panel(participant.name, participant.provider.value, content))
             current_live.stop()
             current_live = None
             current_stream_participant = None
+            console.print(_agent_panel(participant.name, participant.provider.value, content))
             console.print("")
 
         console.print("")
@@ -1956,11 +1983,28 @@ def run_chat_shell(
                 on_reply_start=_on_reply_start,
                 on_reply_delta=_on_reply_delta,
                 on_reply_complete=_on_reply_complete,
+                cancel_event=cancel_event,
             )
+        except KeyboardInterrupt:
+            cancel_event.set()
+            interrupted = True
         except Exception as exc:
             if current_live is not None:
                 current_live.stop()
+                current_live = None
             console.print(f"[bold red]Error:[/bold red] {exc}")
+            continue
+
+        if current_live is not None:
+            current_live.stop()
+            current_live = None
+            current_stream_participant = None
+            current_thinking = None
+            interrupted = True
+
+        if interrupted:
+            console.print("[dim italic]Interrupted.[/dim italic]")
+            console.print("")
             continue
         current_session = result.session
 

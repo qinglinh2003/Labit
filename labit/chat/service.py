@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from collections.abc import Callable
 
+from labit.agents.adapters.base import StreamCancelled
 from labit.agents.models import AgentRequest, ProviderKind
 from labit.agents.orchestrator import ProviderRegistry
 from labit.agents.providers import discussion_provider_kinds, provider_available, resolve_provider_kind
@@ -156,6 +158,7 @@ class ChatService:
         on_reply_start: Callable[[ChatParticipant], None] | None = None,
         on_reply_delta: Callable[[ChatParticipant, str], None] | None = None,
         on_reply_complete: Callable[[ChatParticipant, str], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> ChatTurnResult:
         return self._ask_impl(
             session_id=session_id,
@@ -166,6 +169,7 @@ class ChatService:
             on_reply_start=on_reply_start,
             on_reply_delta=on_reply_delta,
             on_reply_complete=on_reply_complete,
+            cancel_event=cancel_event,
         )
 
     def _ask_impl(
@@ -179,6 +183,7 @@ class ChatService:
         on_reply_start: Callable[[ChatParticipant], None] | None = None,
         on_reply_delta: Callable[[ChatParticipant, str], None] | None = None,
         on_reply_complete: Callable[[ChatParticipant, str], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> ChatTurnResult:
         session = self.load_session(session_id)
         if session.status != ChatStatus.ACTIVE:
@@ -207,13 +212,33 @@ class ChatService:
         self.store.write_context_snapshot(session_id, snapshot)
 
         replies: list[ChatReply] = []
-        if session.mode == ChatMode.PARALLEL:
-            for participant in session.participants:
-                replies.append(
-                    self._generate_reply(
+        try:
+            if session.mode == ChatMode.PARALLEL:
+                for participant in session.participants:
+                    replies.append(
+                        self._generate_reply(
+                            session=session,
+                            participant=participant,
+                            transcript=base_transcript,
+                            snapshot=snapshot,
+                            turn_index=turn_index,
+                            reply_to=user_message.message_id,
+                            force_deep_context=force_deep_context,
+                            reasoning_effort=reasoning_effort,
+                            on_reply_start=on_reply_start,
+                            on_reply_delta=on_reply_delta,
+                            on_reply_complete=on_reply_complete,
+                            cancel_event=cancel_event,
+                        )
+                    )
+            else:
+                working_transcript = list(base_transcript)
+                participants = session.participants[:1] if session.mode == ChatMode.SINGLE else session.participants
+                for participant in participants:
+                    reply = self._generate_reply(
                         session=session,
                         participant=participant,
-                        transcript=base_transcript,
+                        transcript=working_transcript,
                         snapshot=snapshot,
                         turn_index=turn_index,
                         reply_to=user_message.message_id,
@@ -222,27 +247,12 @@ class ChatService:
                         on_reply_start=on_reply_start,
                         on_reply_delta=on_reply_delta,
                         on_reply_complete=on_reply_complete,
+                        cancel_event=cancel_event,
                     )
-                )
-        else:
-            working_transcript = list(base_transcript)
-            participants = session.participants[:1] if session.mode == ChatMode.SINGLE else session.participants
-            for participant in participants:
-                reply = self._generate_reply(
-                    session=session,
-                    participant=participant,
-                    transcript=working_transcript,
-                    snapshot=snapshot,
-                    turn_index=turn_index,
-                    reply_to=user_message.message_id,
-                    force_deep_context=force_deep_context,
-                    reasoning_effort=reasoning_effort,
-                    on_reply_start=on_reply_start,
-                    on_reply_delta=on_reply_delta,
-                    on_reply_complete=on_reply_complete,
-                )
-                replies.append(reply)
-                working_transcript.append(reply.message)
+                    replies.append(reply)
+                    working_transcript.append(reply.message)
+        except (StreamCancelled, KeyboardInterrupt):
+            pass  # stop generating, keep any replies already collected
 
         updated_session = session.model_copy(update={"updated_at": utc_now_iso()})
         self.store.write_session(updated_session)
@@ -355,6 +365,7 @@ class ChatService:
         on_reply_start: Callable[[ChatParticipant], None] | None = None,
         on_reply_delta: Callable[[ChatParticipant, str], None] | None = None,
         on_reply_complete: Callable[[ChatParticipant, str], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> ChatReply:
         adapter = self.registry.get(participant.provider)
         request = AgentRequest(
@@ -385,7 +396,7 @@ class ChatService:
             on_reply_start(participant)
 
         if on_reply_delta is not None or on_reply_start is not None or on_reply_complete is not None:
-            response = adapter.run_stream(request, on_text=_handle_delta)
+            response = adapter.run_stream(request, on_text=_handle_delta, cancel_event=cancel_event)
         else:
             response = adapter.run(request)
 
