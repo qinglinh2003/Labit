@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from labit.agents.models import AgentRequest, AgentRole, ProviderKind
 from labit.agents.orchestrator import ProviderRegistry
@@ -8,6 +9,72 @@ from labit.agents.providers import resolve_provider_kind
 from labit.chat.models import ChatMessage, ChatSession, ContextSnapshot
 from labit.documents.models import DocUpdate, ReviewAction
 from labit.paths import RepoPaths
+
+
+def _excerpt(text: str, max_chars: int = 200) -> str:
+    """Return the first meaningful lines of text, trimmed to max_chars."""
+    text = text.strip()
+    if not text:
+        return "(empty)"
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars - 1] + "…"
+
+
+def compute_changed_sections(old_md: str, new_md: str) -> list[dict[str, str]]:
+    """Compare two markdown docs section-by-section, return list of changed sections.
+
+    Each entry includes:
+    - heading: the section heading
+    - change: added|modified|removed
+    - before_excerpt: first ~200 chars of the old section body (for modified/removed)
+    - after_excerpt: first ~200 chars of the new section body (for added/modified)
+    """
+
+    def _split_sections(md: str) -> dict[str, str]:
+        """Split markdown into {heading: body} pairs. Top-level content uses '' key."""
+        sections: dict[str, str] = {}
+        current_heading = ""
+        current_lines: list[str] = []
+        for line in md.splitlines():
+            if re.match(r"^#{1,6}\s", line):
+                sections[current_heading] = "\n".join(current_lines).strip()
+                current_heading = line.strip()
+                current_lines = []
+            else:
+                current_lines.append(line)
+        sections[current_heading] = "\n".join(current_lines).strip()
+        return sections
+
+    old_sections = _split_sections(old_md)
+    new_sections = _split_sections(new_md)
+    changes: list[dict[str, str]] = []
+
+    for heading in new_sections:
+        if heading not in old_sections:
+            if heading:  # skip unnamed top-level
+                changes.append({
+                    "heading": heading,
+                    "change": "added",
+                    "after_excerpt": _excerpt(new_sections[heading]),
+                })
+        elif new_sections[heading] != old_sections[heading]:
+            changes.append({
+                "heading": heading or "(top-level)",
+                "change": "modified",
+                "before_excerpt": _excerpt(old_sections[heading]),
+                "after_excerpt": _excerpt(new_sections[heading]),
+            })
+
+    for heading in old_sections:
+        if heading not in new_sections and heading:
+            changes.append({
+                "heading": heading,
+                "change": "removed",
+                "before_excerpt": _excerpt(old_sections[heading]),
+            })
+
+    return changes
 
 
 class DocDrafter:
@@ -78,6 +145,7 @@ class DocDrafter:
         revision_summary: str,
         user_instruction: str,
         reviewer_name: str,
+        changed_sections: list[dict[str, str]] | None = None,
         provider: str | ProviderKind | None = None,
     ) -> DocUpdate:
         """Reviewer reads the updated document and inserts inline review blocks."""
@@ -91,6 +159,7 @@ class DocDrafter:
                 user_instruction=user_instruction,
                 reviewer_name=reviewer_name,
                 actions=actions,
+                changed_sections=changed_sections or [],
             ),
             cwd=str(self.paths.root),
             output_schema=self._schema(),
@@ -106,7 +175,24 @@ class DocDrafter:
         user_instruction: str,
         reviewer_name: str,
         actions: str,
+        changed_sections: list[dict[str, str]],
     ) -> str:
+        # Build structured changeset block with excerpts
+        if changed_sections:
+            changeset_lines = ["## Structured changeset (from diff)"]
+            changeset_lines.append("The following sections were changed in this round. Review ONLY these sections (plus any still-open reviews from earlier rounds).\n")
+            for cs in changed_sections:
+                changeset_lines.append(f"### {cs['heading']} — {cs['change']}")
+                if cs.get("before_excerpt"):
+                    changeset_lines.append(f"**Before**: {cs['before_excerpt']}")
+                if cs.get("after_excerpt"):
+                    changeset_lines.append(f"**After**: {cs['after_excerpt']}")
+                changeset_lines.append("")
+            changeset_lines.append("Focus your review on the **After** content in each changed section. Do NOT review unchanged sections unless they have unresolved `:open` reviews from previous rounds.")
+            changeset_block = "\n".join(changeset_lines)
+        else:
+            changeset_block = "No structured changeset available. Use the author's revision summary to identify what changed."
+
         return f"""You are a peer reviewer for a LABIT research design document.
 
 Return JSON only. Do not add markdown fences or commentary outside JSON.
@@ -131,14 +217,16 @@ Change `:open` to `:closed` on the existing block. Do not duplicate the block.
 
 Available review actions: {actions}
 
+{changeset_block}
+
 ## Delta-based review rules
 
 This document may already contain review blocks from previous rounds. Follow these rules strictly:
 
 1. **Your own `:open` reviews**: Check if the author addressed them (look at nearby text changes and `<!-- response:... -->` blocks). If adequately addressed, change the status to `:closed`. If NOT addressed or insufficiently addressed, keep `:open` and optionally add a follow-up comment.
 2. **Your own `:closed` reviews**: Leave them alone. Do not re-open unless the author's changes broke something.
-3. **New content from this round** (identified by the author's revision summary below): Review it and add new `:open` review blocks as needed.
-4. **Unchanged content with no existing review**: Do NOT review it. Only review content that was changed in this round or that has unresolved open reviews.
+3. **New content from this round**: Review ONLY the sections listed in the structured changeset above. Add new `:open` review blocks as needed.
+4. **Unchanged content with no existing review**: Do NOT review it. Do not add `agree` blocks to unchanged sections.
 5. **`<!-- response:... -->` blocks**: These are the author's responses to your reviews. Read them to decide whether to close or keep open.
 
 ## Guidelines

@@ -2208,6 +2208,9 @@ def run_chat_shell(
                 else None
             )
             try:
+                # Capture pre-revision markdown for diff
+                old_markdown = doc_service.read_document(active_doc)
+
                 # Step 1: Author revises
                 with console.status(f"[bold blue]{author.name} updating document...[/bold blue]"):
                     update = drafter.revise_document(
@@ -2215,7 +2218,7 @@ def run_chat_shell(
                         transcript=service.transcript(current_session.session_id),
                         context_snapshot=service.context_snapshot(current_session.session_id),
                         doc_title=active_doc.title,
-                        current_markdown=doc_service.read_document(active_doc),
+                        current_markdown=old_markdown,
                         user_instruction=raw,
                         interaction_log=doc_service.interaction_excerpt(active_doc),
                         author_name=author.name,
@@ -2242,12 +2245,18 @@ def run_chat_shell(
 
                 # Step 2: Reviewer adds inline review blocks (round-robin only)
                 if reviewer is not None:
+                    from labit.documents.drafter import compute_changed_sections
+
+                    new_markdown = doc_service.read_document(active_doc)
+                    changed_sections = compute_changed_sections(old_markdown, new_markdown)
+
                     with console.status(f"[bold cyan]{reviewer.name} reviewing document...[/bold cyan]"):
                         review_update = drafter.review_document(
-                            current_markdown=doc_service.read_document(active_doc),
+                            current_markdown=new_markdown,
                             revision_summary=update.summary,
                             user_instruction=raw,
                             reviewer_name=reviewer.name,
+                            changed_sections=changed_sections,
                             provider=reviewer.provider,
                         )
                         active_doc = doc_service.record_review(
