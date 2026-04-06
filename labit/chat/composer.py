@@ -27,6 +27,20 @@ def prompt_toolkit_available() -> bool:
     return True
 
 
+_prompt_session_instance: object | None = None
+
+
+def _get_prompt_session():
+    """Return a module-level PromptSession so input history persists across calls."""
+    global _prompt_session_instance
+    if _prompt_session_instance is None:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.history import InMemoryHistory
+
+        _prompt_session_instance = PromptSession(history=InMemoryHistory())
+    return _prompt_session_instance
+
+
 def prompt_with_clipboard_image(
     *,
     console: Console,
@@ -38,7 +52,6 @@ def prompt_with_clipboard_image(
     try:
         from prompt_toolkit.enums import EditingMode
         from prompt_toolkit.formatted_text import HTML
-        from prompt_toolkit import PromptSession
         from prompt_toolkit.key_binding import KeyBindings
         from prompt_toolkit.styles import Style
     except Exception:
@@ -47,7 +60,7 @@ def prompt_with_clipboard_image(
 
     attachments: list[ChatAttachment] = []
     commands = tuple(sorted(set(slash_commands or ())))
-    prompt_session = PromptSession()
+    prompt_session = _get_prompt_session()
     bindings = KeyBindings()
     style = Style.from_dict(
         {
@@ -58,9 +71,9 @@ def prompt_with_clipboard_image(
         }
     )
 
-    @bindings.add("enter")
-    def _submit(event) -> None:
-        event.app.exit(result=event.app.current_buffer.text)
+    # NOTE: Do NOT bind enter/up/down here — Emacs mode defaults handle them
+    # correctly (enter: accept + store history, up/down: navigate history).
+    # Adding duplicate bindings causes double-execution.
 
     @bindings.add("tab")
     def _complete_if_unique(event) -> None:
