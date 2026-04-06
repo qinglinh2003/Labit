@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from collections.abc import Callable
+from queue import Queue
 
 from labit.agents.adapters.base import StreamCancelled
 from labit.agents.models import AgentRequest, ProviderKind
@@ -214,9 +215,12 @@ class ChatService:
         replies: list[ChatReply] = []
         try:
             if session.mode == ChatMode.PARALLEL:
-                for participant in session.participants:
-                    replies.append(
-                        self._generate_reply(
+                reply_queue: Queue[tuple[int, ChatReply | Exception | None]] = Queue()
+                threads: list[threading.Thread] = []
+
+                def _parallel_worker(index: int, participant: ChatParticipant) -> None:
+                    try:
+                        reply = self._generate_reply(
                             session=session,
                             participant=participant,
                             transcript=base_transcript,
@@ -229,8 +233,43 @@ class ChatService:
                             on_reply_delta=on_reply_delta,
                             on_reply_complete=on_reply_complete,
                             cancel_event=cancel_event,
+                            persist=False,
                         )
+                    except (StreamCancelled, KeyboardInterrupt):
+                        reply_queue.put((index, None))
+                    except Exception as exc:  # noqa: BLE001
+                        reply_queue.put((index, exc))
+                    else:
+                        reply_queue.put((index, reply))
+
+                for index, participant in enumerate(session.participants):
+                    thread = threading.Thread(
+                        target=_parallel_worker,
+                        args=(index, participant),
+                        daemon=True,
                     )
+                    thread.start()
+                    threads.append(thread)
+
+                ordered_replies: dict[int, ChatReply] = {}
+                parallel_errors: list[Exception] = []
+                for _ in session.participants:
+                    index, payload = reply_queue.get()
+                    if isinstance(payload, ChatReply):
+                        ordered_replies[index] = payload
+                    elif isinstance(payload, Exception):
+                        parallel_errors.append(payload)
+
+                for thread in threads:
+                    thread.join()
+
+                replies.extend(ordered_replies[idx] for idx in sorted(ordered_replies))
+                for reply in replies:
+                    self.store.append_message(reply.message)
+                    self._append_message_event(session=session, message=reply.message)
+
+                if parallel_errors and not replies:
+                    raise parallel_errors[0]
             else:
                 working_transcript = list(base_transcript)
                 participants = session.participants[:1] if session.mode == ChatMode.SINGLE else session.participants
@@ -366,6 +405,7 @@ class ChatService:
         on_reply_delta: Callable[[ChatParticipant, str], None] | None = None,
         on_reply_complete: Callable[[ChatParticipant, str], None] | None = None,
         cancel_event: threading.Event | None = None,
+        persist: bool = True,
     ) -> ChatReply:
         adapter = self.registry.get(participant.provider)
         request = AgentRequest(
@@ -413,8 +453,9 @@ class ChatService:
             reply_to=reply_to,
             metadata={"command": response.command},
         )
-        self.store.append_message(message)
-        self._append_message_event(session=session, message=message)
+        if persist:
+            self.store.append_message(message)
+            self._append_message_event(session=session, message=message)
         return ChatReply(participant=participant, message=message)
 
     def _default_participants(

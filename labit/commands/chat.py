@@ -324,11 +324,14 @@ def _agent_panel(
     *,
     turn_index: int | None = None,
     thinking: _ThinkingIndicator | None = None,
+    status_text: str | None = None,
 ) -> Panel:
     color, label = _PROVIDER_STYLES.get(provider_name, ("cyan", provider_name.upper()))
     title = f"{label} · {speaker}"
     if turn_index is not None:
         title = f"{title} · turn {turn_index}"
+    if status_text:
+        title = f"{title} · {status_text}"
     body: RenderableType = _md(content) if content.strip() else (thinking or _ThinkingIndicator())
     return Panel(body, title=title, border_style=color)
 
@@ -953,28 +956,69 @@ def _run_streaming_turn(
     reasoning_effort: str | None = None,
 ) -> object | None:
     _render_user_shell_message(query, attachments=attachments)
-    participant_panels: dict[str, str] = {}
+    participant_state = {
+        participant.name: {
+            "provider": participant.provider.value,
+            "content": "",
+            "status": "queued",
+            "started_at": None,
+            "thinking": None,
+        }
+        for participant in session.participants
+    }
+    state_lock = threading.Lock()
+    live_lock = threading.Lock()
     cancel_event = threading.Event()
-    live: Live | None = None
 
     def _render_live() -> Group:
         panels: list[Panel] = []
+        with state_lock:
+            snapshot = {
+                name: dict(values)
+                for name, values in participant_state.items()
+            }
         for participant in session.participants:
-            provider_name = participant.provider.value
-            content = participant_panels.get(participant.name, "")
-            panels.append(_agent_panel(participant.name, provider_name, content))
+            state = snapshot[participant.name]
+            status = state["status"]
+            started_at = state["started_at"]
+            status_text = status
+            if started_at is not None and status in {"thinking", "streaming"}:
+                status_text = f"{status} · {time.monotonic() - started_at:.1f}s"
+            panels.append(
+                _agent_panel(
+                    participant.name,
+                    state["provider"],
+                    state["content"],
+                    thinking=state["thinking"],
+                    status_text=status_text,
+                )
+            )
         return Group(*panels)
 
+    def _refresh_live() -> None:
+        with live_lock:
+            live.update(_render_live(), refresh=True)
+
     def _on_reply_start(participant) -> None:
-        participant_panels[participant.name] = ""
+        with state_lock:
+            participant_state[participant.name]["content"] = ""
+            participant_state[participant.name]["status"] = "thinking"
+            participant_state[participant.name]["started_at"] = time.monotonic()
+            participant_state[participant.name]["thinking"] = _ThinkingIndicator()
+        _refresh_live()
 
     def _on_reply_delta(participant, content: str) -> None:
-        participant_panels[participant.name] = content
-        live.update(_render_live(), refresh=True)
+        with state_lock:
+            participant_state[participant.name]["content"] = content
+            participant_state[participant.name]["status"] = "streaming" if content.strip() else "thinking"
+        _refresh_live()
 
     def _on_reply_complete(participant, content: str) -> None:
-        participant_panels[participant.name] = content
-        live.update(_render_live(), refresh=True)
+        with state_lock:
+            participant_state[participant.name]["content"] = content
+            participant_state[participant.name]["status"] = "done"
+            participant_state[participant.name]["thinking"] = None
+        _refresh_live()
 
     cancelled = False
     result = None
@@ -1011,6 +1055,11 @@ def _run_streaming_turn(
             console.print("")
 
     if cancelled:
+        with state_lock:
+            for state in participant_state.values():
+                if state["status"] in {"thinking", "streaming"}:
+                    state["status"] = "interrupted"
+                    state["thinking"] = None
         console.print("[dim italic]Interrupted.[/dim italic]")
     return result
 
@@ -1929,84 +1978,14 @@ def run_chat_shell(
             console.print(f"[bold red]Unknown command:[/bold red] {command}")
             continue
 
-        current_live: Live | None = None
-        current_stream_participant: str | None = None
-        current_thinking: _ThinkingIndicator | None = None
-        cancel_event = threading.Event()
-        interrupted = False
-
-        def _on_reply_start(participant) -> None:
-            nonlocal current_live, current_stream_participant, current_thinking
-            current_stream_participant = participant.name
-            current_thinking = _ThinkingIndicator()
-            console.print("")
-            current_live = Live(
-                _agent_panel(participant.name, participant.provider.value, "", thinking=current_thinking),
-                console=console,
-                refresh_per_second=12,
-                transient=True,
-            )
-            current_live.start()
-
-        def _on_reply_delta(participant, content: str) -> None:
-            nonlocal current_thinking
-            if current_live is None or current_stream_participant != participant.name:
-                _on_reply_start(participant)
-            assert current_live is not None
-            if content.strip():
-                current_thinking = None
-            current_live.update(
-                _agent_panel(participant.name, participant.provider.value, content, thinking=current_thinking)
-            )
-
-        def _on_reply_complete(participant, content: str) -> None:
-            nonlocal current_live, current_stream_participant, current_thinking
-            current_thinking = None
-            if current_live is None:
-                console.print("")
-                console.print(_agent_panel(participant.name, participant.provider.value, content))
-                console.print("")
-                return
-            current_live.stop()
-            current_live = None
-            current_stream_participant = None
-            console.print(_agent_panel(participant.name, participant.provider.value, content))
-            console.print("")
-
-        console.print("")
-        _render_user_shell_message(raw, attachments=attachments)
-        try:
-            result = service.ask_stream(
-                session_id=current_session.session_id,
-                content=raw,
-                attachments=attachments,
-                on_reply_start=_on_reply_start,
-                on_reply_delta=_on_reply_delta,
-                on_reply_complete=_on_reply_complete,
-                cancel_event=cancel_event,
-            )
-        except KeyboardInterrupt:
-            cancel_event.set()
-            interrupted = True
-        except Exception as exc:
-            if current_live is not None:
-                current_live.stop()
-                current_live = None
-            console.print(f"[bold red]Error:[/bold red] {exc}")
-            continue
-
-        if current_live is not None:
-            current_live.stop()
-            current_live = None
-            current_stream_participant = None
-            current_thinking = None
-            interrupted = True
-
-        if interrupted:
-            console.print("[dim italic]Interrupted.[/dim italic]")
-            console.print("")
-            continue
-        current_session = result.session
+        result = _run_streaming_turn(
+            service=service,
+            session=current_session,
+            query=raw,
+            attachments=attachments,
+        )
+        if result is not None:
+            current_session = result.session
 
 
 @chat_app.callback()
