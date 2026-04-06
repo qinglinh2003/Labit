@@ -54,6 +54,93 @@ class HypothesisDrafter:
             draft = draft.model_copy(update={"source_paper_ids": merged})
         return draft
 
+    def refine_draft(
+        self,
+        *,
+        draft: HypothesisDraft,
+        session: ChatSession,
+        transcript: list[ChatMessage],
+        context_snapshot: ContextSnapshot,
+        user_intent: str = "",
+        provider: str | ProviderKind | None = None,
+    ) -> HypothesisDraft:
+        """Ask a second agent to review and refine an existing draft."""
+        provider_kind = resolve_provider_kind(provider)
+        request = AgentRequest(
+            role=AgentRole.WRITER,
+            prompt=self._build_refine_prompt(
+                draft=draft,
+                session=session,
+                transcript=transcript,
+                context_snapshot=context_snapshot,
+                user_intent=user_intent,
+            ),
+            cwd=str(self.paths.root),
+            output_schema=self._draft_schema(),
+            extra_args=self._extra_args(provider_kind),
+        )
+        response = self.registry.get(provider_kind).run(request)
+        payload = response.structured_output
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        if not isinstance(payload, dict):
+            raise ValueError("Hypothesis refiner returned an invalid payload.")
+
+        refined = HypothesisDraft.model_validate(payload)
+        # Preserve source_paper_ids from original draft
+        merged = list(refined.source_paper_ids)
+        for paper_id in draft.source_paper_ids:
+            if paper_id not in merged:
+                merged.append(paper_id)
+        if merged != list(refined.source_paper_ids):
+            refined = refined.model_copy(update={"source_paper_ids": merged})
+        return refined
+
+    def _build_refine_prompt(
+        self,
+        *,
+        draft: HypothesisDraft,
+        session: ChatSession,
+        transcript: list[ChatMessage],
+        context_snapshot: ContextSnapshot,
+        user_intent: str = "",
+    ) -> str:
+        context_blocks = self._format_context_blocks(context_snapshot)
+        transcript_text = self._format_transcript(transcript)
+        intent_text = user_intent.strip() or "(none)"
+
+        draft_json = draft.model_dump_json(indent=2)
+
+        return f"""You are reviewing and refining a research hypothesis draft for LABIT.
+
+Another agent drafted the hypothesis below from a shared conversation. Your job is to critically review it and return an improved version. Be faithful to the conversation context — do not invent claims or evidence not present in the transcript.
+
+Return JSON only. Do not add markdown fences or commentary.
+
+Focus your review on:
+- Is the `claim` actually testable and specific enough?
+- Are `success_criteria` and `failure_criteria` concrete and measurable?
+- Are `independent_variable` and `dependent_variable` correctly identified?
+- Is the `experiment_plan_markdown` actionable — could someone execute it?
+- Is the `rationale_markdown` well-reasoned and grounded in the discussion?
+
+If the draft is already good, make only minor improvements. Do not change things just to change them.
+
+Session:
+- Title: {session.title}
+- Project: {session.project or "(none)"}
+- Explicit user intent: {intent_text}
+
+Context:
+{context_blocks}
+
+Transcript:
+{transcript_text}
+
+Current draft to review and refine:
+{draft_json}
+"""
+
     def _build_prompt(
         self,
         *,

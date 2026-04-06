@@ -1387,14 +1387,32 @@ def run_chat_shell(
                     console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
                     continue
                 try:
-                    with console.status("[bold blue]Drafting hypothesis from current session...[/bold blue]"):
-                        draft = _hypothesis_drafter().draft_from_session(
+                    drafter = _hypothesis_drafter()
+                    transcript = service.transcript(current_session.session_id)
+                    ctx_snap = service.context_snapshot(current_session.session_id)
+                    with console.status(f"[bold blue]{current_session.participants[0].name} drafting hypothesis...[/bold blue]"):
+                        draft = drafter.draft_from_session(
                             session=current_session,
-                            transcript=service.transcript(current_session.session_id),
-                            context_snapshot=service.context_snapshot(current_session.session_id),
+                            transcript=transcript,
+                            context_snapshot=ctx_snap,
                             user_intent=user_intent,
                             provider=current_session.participants[0].provider,
                         )
+                    use_round_robin = (
+                        current_session.mode == ChatMode.ROUND_ROBIN
+                        and len(current_session.participants) >= 2
+                    )
+                    if use_round_robin:
+                        reviewer = current_session.participants[1]
+                        with console.status(f"[bold blue]{reviewer.name} reviewing and refining...[/bold blue]"):
+                            draft = drafter.refine_draft(
+                                draft=draft,
+                                session=current_session,
+                                transcript=transcript,
+                                context_snapshot=ctx_snap,
+                                user_intent=user_intent,
+                                provider=reviewer.provider,
+                            )
                 except Exception as exc:
                     console.print(f"[bold red]Error:[/bold red] {exc}")
                     continue
