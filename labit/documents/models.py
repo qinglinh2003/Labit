@@ -13,6 +13,14 @@ class DocStatus(str, Enum):
     ARCHIVED = "archived"
 
 
+class ReviewAction(str, Enum):
+    AGREE = "agree"
+    QUESTION = "question"
+    SUPPLEMENT = "supplement"
+    DISCUSS = "discuss"
+    OPPOSE = "oppose"
+
+
 class DocUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

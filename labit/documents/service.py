@@ -186,6 +186,51 @@ class DocumentService:
             iteration=next_iteration,
         )
 
+    # ── Record review ──────────────────────────────────────
+
+    def record_review(
+        self,
+        *,
+        doc_session: DocSession,
+        update: DocUpdate,
+        reviewer_name: str,
+    ) -> DocSession:
+        """Save a reviewed version of the document (with inline review blocks) to disk."""
+        path = self.paths.root / doc_session.document_path
+        log_path = self.paths.root / doc_session.log_path
+        if not path.exists():
+            raise FileNotFoundError(f"Document not found: {doc_session.document_path}")
+
+        now = datetime.now(UTC).replace(microsecond=0)
+        previous_content = path.read_text(encoding="utf-8")
+        previous_hash = self._sha256(previous_content)
+
+        markdown = self._inject_frontmatter(
+            update.markdown,
+            doc_id=doc_session.doc_id,
+            title=doc_session.title,
+            status=doc_session.status,
+            created_at=doc_session.created_at,
+            updated_at=doc_session.updated_at,  # review doesn't change updated_at
+            source_session_id=None,
+        )
+        final_hash = self._sha256(markdown)
+        self._atomic_write(path, markdown)
+
+        self._append_log(
+            log_path,
+            {
+                "type": "agent_review",
+                "iteration": doc_session.iteration,
+                "timestamp": now.isoformat(),
+                "reviewer": reviewer_name,
+                "review_summary": update.summary,
+                "previous_sha256": previous_hash,
+                "markdown_sha256": final_hash,
+            },
+        )
+        return doc_session
+
     # ── End session ─────────────────────────────────────────
 
     def end_session(self, doc_session: DocSession) -> None:
@@ -287,6 +332,11 @@ class DocumentService:
                 rendered.append(
                     f"[{item.get('iteration')}] user: {item.get('user_instruction', '')}\n"
                     f"summary: {item.get('agent_summary', '')}"
+                )
+            elif entry_type == "agent_review":
+                rendered.append(
+                    f"[{item.get('iteration')}] review by {item.get('reviewer', '?')}: "
+                    f"{item.get('review_summary', '')}"
                 )
             elif entry_type == "session_ended":
                 rendered.append("[session ended]")

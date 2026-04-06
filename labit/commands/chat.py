@@ -2199,9 +2199,18 @@ def run_chat_shell(
                 console.print("[bold red]Error:[/bold red] Document mode does not support image attachments yet.")
                 continue
             doc_service = _document_service()
+            drafter = _doc_drafter()
+            author = current_session.participants[0]
+            # Round-robin: second participant is reviewer
+            reviewer = (
+                current_session.participants[1]
+                if current_session.mode == ChatMode.ROUND_ROBIN and len(current_session.participants) >= 2
+                else None
+            )
             try:
-                with console.status(f"[bold blue]{current_session.participants[0].name} updating document...[/bold blue]"):
-                    update = _doc_drafter().revise_document(
+                # Step 1: Author revises
+                with console.status(f"[bold blue]{author.name} updating document...[/bold blue]"):
+                    update = drafter.revise_document(
                         session=current_session,
                         transcript=service.transcript(current_session.session_id),
                         context_snapshot=service.context_snapshot(current_session.session_id),
@@ -2209,29 +2218,53 @@ def run_chat_shell(
                         current_markdown=doc_service.read_document(active_doc),
                         user_instruction=raw,
                         interaction_log=doc_service.interaction_excerpt(active_doc),
-                        provider=current_session.participants[0].provider,
+                        author_name=author.name,
+                        provider=author.provider,
                     )
                     active_doc = doc_service.revise_document(
                         doc_session=active_doc,
                         update=update,
                         user_instruction=raw,
                     )
+
+                console.print(
+                    Panel(
+                        (
+                            f"[bold]ID[/bold]: {active_doc.doc_id}\n"
+                            f"[bold]Document[/bold]: {active_doc.document_path}\n"
+                            f"[bold]Iteration[/bold]: {active_doc.iteration}\n"
+                            f"[bold]Summary[/bold]: {update.summary}"
+                        ),
+                        title=f"[bold green]{author.name} · Document updated[/bold green]",
+                        border_style="green",
+                    )
+                )
+
+                # Step 2: Reviewer adds inline review blocks (round-robin only)
+                if reviewer is not None:
+                    with console.status(f"[bold cyan]{reviewer.name} reviewing document...[/bold cyan]"):
+                        review_update = drafter.review_document(
+                            current_markdown=doc_service.read_document(active_doc),
+                            revision_summary=update.summary,
+                            user_instruction=raw,
+                            reviewer_name=reviewer.name,
+                            provider=reviewer.provider,
+                        )
+                        active_doc = doc_service.record_review(
+                            doc_session=active_doc,
+                            update=review_update,
+                            reviewer_name=reviewer.name,
+                        )
+                    console.print(
+                        Panel(
+                            f"[bold]Review[/bold]: {review_update.summary}",
+                            title=f"[bold cyan]{reviewer.name} · Review[/bold cyan]",
+                            border_style="cyan",
+                        )
+                    )
             except Exception as exc:
                 console.print(f"[bold red]Error:[/bold red] {exc}")
                 continue
-
-            console.print(
-                Panel(
-                    (
-                        f"[bold]ID[/bold]: {active_doc.doc_id}\n"
-                        f"[bold]Document[/bold]: {active_doc.document_path}\n"
-                        f"[bold]Iteration[/bold]: {active_doc.iteration}\n"
-                        f"[bold]Summary[/bold]: {update.summary}"
-                    ),
-                    title="[bold green]Document updated[/bold green]",
-                    border_style="green",
-                )
-            )
             try:
                 service.record_session_event(
                     session_id=current_session.session_id,

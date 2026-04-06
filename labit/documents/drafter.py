@@ -6,7 +6,7 @@ from labit.agents.models import AgentRequest, AgentRole, ProviderKind
 from labit.agents.orchestrator import ProviderRegistry
 from labit.agents.providers import resolve_provider_kind
 from labit.chat.models import ChatMessage, ChatSession, ContextSnapshot
-from labit.documents.models import DocUpdate
+from labit.documents.models import DocUpdate, ReviewAction
 from labit.paths import RepoPaths
 
 
@@ -49,6 +49,7 @@ class DocDrafter:
         current_markdown: str,
         user_instruction: str,
         interaction_log: str,
+        author_name: str = "author",
         provider: str | ProviderKind | None = None,
     ) -> DocUpdate:
         provider_kind = resolve_provider_kind(provider)
@@ -62,12 +63,104 @@ class DocDrafter:
                 current_markdown=current_markdown,
                 user_instruction=user_instruction,
                 interaction_log=interaction_log,
+                author_name=author_name,
             ),
             cwd=str(self.paths.root),
             output_schema=self._schema(),
             extra_args=self._extra_args(provider_kind),
         )
         return self._run(provider_kind, request)
+
+    def review_document(
+        self,
+        *,
+        current_markdown: str,
+        revision_summary: str,
+        user_instruction: str,
+        reviewer_name: str,
+        provider: str | ProviderKind | None = None,
+    ) -> DocUpdate:
+        """Reviewer reads the updated document and inserts inline review blocks."""
+        provider_kind = resolve_provider_kind(provider)
+        actions = ", ".join(a.value for a in ReviewAction)
+        request = AgentRequest(
+            role=AgentRole.WRITER,
+            prompt=self._build_review_prompt(
+                current_markdown=current_markdown,
+                revision_summary=revision_summary,
+                user_instruction=user_instruction,
+                reviewer_name=reviewer_name,
+                actions=actions,
+            ),
+            cwd=str(self.paths.root),
+            output_schema=self._schema(),
+            extra_args=self._extra_args(provider_kind),
+        )
+        return self._run(provider_kind, request)
+
+    def _build_review_prompt(
+        self,
+        *,
+        current_markdown: str,
+        revision_summary: str,
+        user_instruction: str,
+        reviewer_name: str,
+        actions: str,
+    ) -> str:
+        return f"""You are a peer reviewer for a LABIT research design document.
+
+Return JSON only. Do not add markdown fences or commentary outside JSON.
+
+Your job is to review the document and insert inline review comments using HTML comment blocks. You must NOT change the original text — only add review blocks after relevant sections/paragraphs.
+
+## Review block format
+
+All review blocks use HTML comments so they don't break markdown rendering.
+
+New review (always starts as `open`):
+<!-- review:{reviewer_name}:<action>:open -->
+Your comment here.
+<!-- /review -->
+
+For agreement (body optional):
+<!-- review:{reviewer_name}:agree:open -->
+<!-- /review -->
+
+Closing a previously open review you left (only when the author has adequately addressed it):
+Change `:open` to `:closed` on the existing block. Do not duplicate the block.
+
+Available review actions: {actions}
+
+## Delta-based review rules
+
+This document may already contain review blocks from previous rounds. Follow these rules strictly:
+
+1. **Your own `:open` reviews**: Check if the author addressed them (look at nearby text changes and `<!-- response:... -->` blocks). If adequately addressed, change the status to `:closed`. If NOT addressed or insufficiently addressed, keep `:open` and optionally add a follow-up comment.
+2. **Your own `:closed` reviews**: Leave them alone. Do not re-open unless the author's changes broke something.
+3. **New content from this round** (identified by the author's revision summary below): Review it and add new `:open` review blocks as needed.
+4. **Unchanged content with no existing review**: Do NOT review it. Only review content that was changed in this round or that has unresolved open reviews.
+5. **`<!-- response:... -->` blocks**: These are the author's responses to your reviews. Read them to decide whether to close or keep open.
+
+## Guidelines
+- Be specific and constructive. Reference the exact content you're commenting on.
+- Use `question` when something is unclear or needs justification.
+- Use `supplement` to add missing context, caveats, or related information.
+- Use `discuss` for design choices that have valid alternatives worth considering.
+- Use `oppose` only when something is factually wrong or will cause problems.
+- Do NOT rewrite the document text. Only add/update review blocks.
+- Place each new review block immediately after the paragraph or section it refers to.
+
+Return:
+- `title`: the document title (unchanged).
+- `summary`: one sentence summarizing your review (e.g. "closed 2, kept 1 open, added 1 new question on reward loss").
+- `markdown`: the complete document with review blocks updated/inserted.
+
+Author's revision summary: {revision_summary}
+User's original instruction: {user_instruction}
+
+Current document:
+{self._clip(current_markdown, 20000)}
+"""
 
     def _run(self, provider: ProviderKind, request: AgentRequest) -> DocUpdate:
         response = self.registry.get(provider).run(request)
@@ -137,6 +230,7 @@ Recent transcript:
         current_markdown: str,
         user_instruction: str,
         interaction_log: str,
+        author_name: str = "author",
     ) -> str:
         return f"""You are revising an existing LABIT research design document.
 
@@ -145,6 +239,22 @@ Return JSON only. Do not add markdown fences or commentary outside JSON.
 This is a document editing session. The `markdown` field will replace the current on-disk document, so return the complete updated markdown, not a patch and not only the changed section.
 
 Follow the user's latest instruction while preserving useful existing content. Do not invent implementation details. If the instruction exposes uncertainty, update Open Questions or Next Steps instead of pretending it is settled.
+
+## Handling review blocks
+
+The document may contain reviewer comments in this format:
+<!-- review:<reviewer>:<action>:<status> -->
+comment text
+<!-- /review -->
+
+Rules:
+- Do NOT change the status of any review block (`:open` or `:closed`). Only the reviewer can close their own reviews.
+- Do NOT delete review blocks. They are permanent decision rationale.
+- When you address a reviewer's concern, add a response block immediately after the review:
+<!-- response:{author_name} -->
+Your response explaining how you addressed the concern.
+<!-- /response -->
+- If the user explicitly says to ignore a review comment, you may skip adding a response, but still do NOT delete the review block.
 
 Return:
 - `title`: the document title.
