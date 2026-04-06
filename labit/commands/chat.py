@@ -23,6 +23,9 @@ from labit.chat.models import ChatMode
 from labit.chat.service import ChatService
 from labit.chat.synthesizer import DiscussionSynthesizer
 from labit.context.events import SessionEventKind
+from labit.documents.drafter import DocDrafter
+from labit.documents.models import DocSession, DocStatus
+from labit.documents.service import DocumentService
 from labit.experiments.executors.ssh import SSHExecutor
 from labit.experiments.models import (
     ExperimentDraft,
@@ -106,6 +109,7 @@ _CHAT_SHELL_COMMANDS = (
     "/idea",
     "/note",
     "/todo",
+    "/doc",
     "/hypothesis",
     "/launch-exp",
     "/debrief",
@@ -142,6 +146,14 @@ def _experiment_service() -> ExperimentService:
 
 def _idea_drafter() -> IdeaDrafter:
     return IdeaDrafter(RepoPaths.discover())
+
+
+def _doc_drafter() -> DocDrafter:
+    return DocDrafter(RepoPaths.discover())
+
+
+def _document_service() -> DocumentService:
+    return DocumentService(RepoPaths.discover())
 
 
 def _investigation_service() -> InvestigationService:
@@ -565,6 +577,11 @@ def _shell_help() -> None:
     table.add_row("/idea [text]", "Save a lightweight project idea. With no text, show saved ideas.")
     table.add_row("/note [text]", "Save a lightweight project note. With no text, show saved notes.")
     table.add_row("/todo [text]", "Save an actionable project todo. With no text, show saved todos.")
+    table.add_row("/doc start <title>", "Enter document mode and write a design doc to docs/designs/.")
+    table.add_row("/doc open <doc_id>", "Re-open an existing document for editing.")
+    table.add_row("/doc status|done", "Show or leave the active document editing session.")
+    table.add_row("/doc publish <doc_id>", "Promote a document from draft to active.")
+    table.add_row("/doc list", "List all documents in the current project.")
     table.add_row("/synthesize [hint]", "Distill the current discussion into consensus, disagreements, and follow-ups.")
     table.add_row("/investigate <topic>", "Investigate a topic from the current session and write a report.")
     table.add_row("/hypothesis [idea]", "Draft and create a structured hypothesis from the current session.")
@@ -610,6 +627,25 @@ def _render_idea_preview(draft) -> None:
                 f"[bold]Key question[/bold]: {draft.key_question}"
             ),
             title=f"[bold green]Idea Draft · {draft.title}[/bold green]",
+            border_style="green",
+        )
+    )
+
+
+def _render_doc_status(doc_session: DocSession) -> None:
+    console.print(
+        Panel(
+            (
+                f"[bold]ID[/bold]: {doc_session.doc_id}\n"
+                f"[bold]Title[/bold]: {doc_session.title}\n"
+                f"[bold]Status[/bold]: {doc_session.status.value}\n"
+                f"[bold]Project[/bold]: {doc_session.project}\n"
+                f"[bold]Document[/bold]: {doc_session.document_path}\n"
+                f"[bold]Interaction log[/bold]: {doc_session.log_path}\n"
+                f"[bold]Iterations[/bold]: {doc_session.iteration}\n"
+                f"[bold]Updated[/bold]: {doc_session.updated_at}"
+            ),
+            title="[bold green]Active Document Session[/bold green]",
             border_style="green",
         )
     )
@@ -1078,6 +1114,7 @@ def run_chat_shell(
     console.print("")
 
     current_session = session
+    active_doc: DocSession | None = None
     while True:
         try:
             composer_result = _prompt_in_box(current_session)
@@ -1150,6 +1187,181 @@ def run_chat_shell(
                     console.print(f"[bold red]Error:[/bold red] {exc}")
                     continue
                 _render_memory_detail(record)
+                continue
+            if command == "/doc":
+                doc_parts = argument.split(maxsplit=1)
+                doc_action = doc_parts[0].strip().lower() if doc_parts else "status"
+                doc_argument = doc_parts[1].strip() if len(doc_parts) > 1 else ""
+                if doc_action in {"status", ""}:
+                    if active_doc is None:
+                        console.print("[dim]No active document session. Use /doc start <title> or /doc open <id>.[/dim]")
+                    else:
+                        _render_doc_status(active_doc)
+                    continue
+                if doc_action == "done":
+                    if active_doc is None:
+                        console.print("[dim]No active document session.[/dim]")
+                    else:
+                        try:
+                            _document_service().end_session(active_doc)
+                        except Exception:
+                            pass
+                        console.print(
+                            f"[green]Document session closed.[/green] "
+                            f"[dim]{active_doc.doc_id} · {active_doc.document_path} ({active_doc.status.value})[/dim]"
+                        )
+                        active_doc = None
+                    continue
+                if doc_action == "publish":
+                    publish_target = doc_argument.strip()
+                    if not publish_target:
+                        if active_doc is None:
+                            console.print("[bold red]Usage:[/bold red] /doc publish <doc_id>")
+                            continue
+                        publish_target = active_doc.doc_id
+                    if not current_session.project:
+                        console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
+                        continue
+                    try:
+                        published_doc = _document_service().publish_document(
+                            project=current_session.project,
+                            doc_id=publish_target,
+                            source_session=current_session,
+                        )
+                        if active_doc is not None and active_doc.doc_id == published_doc.doc_id:
+                            active_doc = published_doc
+                        console.print(f"[green]Document published.[/green] [dim]{published_doc.doc_id} → active[/dim]")
+                    except Exception as exc:
+                        console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+                if doc_action == "list":
+                    if not current_session.project:
+                        console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
+                        continue
+                    try:
+                        docs = _document_service().list_documents(current_session.project)
+                    except Exception as exc:
+                        console.print(f"[bold red]Error:[/bold red] {exc}")
+                        continue
+                    if not docs:
+                        console.print("[dim]No documents found.[/dim]")
+                    else:
+                        from rich.table import Table as RichTable
+
+                        t = RichTable(title="Documents", border_style="dim")
+                        t.add_column("ID", style="bold")
+                        t.add_column("Title")
+                        t.add_column("Status")
+                        t.add_column("Updated")
+                        for d in docs:
+                            t.add_row(
+                                d.get("doc_id", "?"),
+                                d.get("title", "?"),
+                                d.get("status", "?"),
+                                d.get("updated_at", "?"),
+                            )
+                        console.print(t)
+                    continue
+                if doc_action == "open":
+                    doc_id = doc_argument.strip()
+                    if not doc_id:
+                        console.print("[bold red]Usage:[/bold red] /doc open <doc_id>")
+                        continue
+                    if not current_session.project:
+                        console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
+                        continue
+                    if active_doc is not None:
+                        console.print("[bold red]Error:[/bold red] A document session is already active. Use /doc done first.")
+                        continue
+                    try:
+                        active_doc = _document_service().open_document(
+                            project=current_session.project,
+                            doc_id=doc_id,
+                            session=current_session,
+                        )
+                    except Exception as exc:
+                        console.print(f"[bold red]Error:[/bold red] {exc}")
+                        continue
+                    status_note = ""
+                    if active_doc.status == DocStatus.DRAFT:
+                        status_note = " (demoted to draft for editing)"
+                    console.print(
+                        Panel(
+                            (
+                                f"[bold]ID[/bold]: {active_doc.doc_id}\n"
+                                f"[bold]Title[/bold]: {active_doc.title}\n"
+                                f"[bold]Status[/bold]: {active_doc.status.value}{status_note}\n"
+                                f"[bold]Document[/bold]: {active_doc.document_path}\n\n"
+                                "Type feedback to revise. Use /doc done to leave document mode."
+                            ),
+                            title="[bold green]Document opened[/bold green]",
+                            border_style="green",
+                        )
+                    )
+                    continue
+                if doc_action != "start":
+                    console.print("[bold red]Usage:[/bold red] /doc start <title> | /doc open <id> | /doc status | /doc done | /doc publish <id> | /doc list")
+                    continue
+                title = doc_argument
+                if not title:
+                    console.print("[bold red]Usage:[/bold red] /doc start <title>")
+                    continue
+                if not current_session.project:
+                    console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
+                    continue
+                if active_doc is not None:
+                    console.print("[bold red]Error:[/bold red] A document session is already active. Use /doc done first.")
+                    continue
+
+                doc_service = _document_service()
+                try:
+                    with console.status(f"[bold blue]{current_session.participants[0].name} writing document draft...[/bold blue]"):
+                        update = _doc_drafter().draft_from_session(
+                            session=current_session,
+                            transcript=service.transcript(current_session.session_id),
+                            context_snapshot=service.context_snapshot(current_session.session_id),
+                            title=title,
+                            provider=current_session.participants[0].provider,
+                        )
+                        active_doc = doc_service.start_document(
+                            project=current_session.project,
+                            title=title,
+                            update=update,
+                            session=current_session,
+                        )
+                except Exception as exc:
+                    console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                console.print(
+                    Panel(
+                        (
+                            f"[bold]ID[/bold]: {active_doc.doc_id}\n"
+                            f"[bold]Document[/bold]: {active_doc.document_path}\n"
+                            f"[bold]Interaction log[/bold]: {active_doc.log_path}\n"
+                            f"[bold]Summary[/bold]: {update.summary}\n\n"
+                            "Continue typing feedback to revise the document. Use /doc done to leave document mode."
+                        ),
+                        title="[bold green]Document draft saved[/bold green]",
+                        border_style="green",
+                    )
+                )
+                try:
+                    service.record_session_event(
+                        session_id=current_session.session_id,
+                        kind=SessionEventKind.ARTIFACT_DOCUMENT_CREATED,
+                        actor="labit",
+                        summary=f"Document draft created: {update.title}",
+                        payload={
+                            "doc_id": active_doc.doc_id,
+                            "title": update.title,
+                            "document_path": active_doc.document_path,
+                            "log_path": active_doc.log_path,
+                        },
+                        evidence_refs=_session_evidence_refs(current_session) + [f"document:{active_doc.document_path}"],
+                    )
+                except Exception:
+                    pass
                 continue
             if command in {"/paste-image", "/image"}:
                 query = argument.strip() or "Please inspect the attached image and describe anything important."
@@ -1956,6 +2168,7 @@ def run_chat_shell(
                         second_provider=second_provider,
                         project=_project_service().active_project_name(),
                     )
+                    active_doc = None
                 except Exception as exc:
                     console.print(f"[bold red]Error:[/bold red] {exc}")
                     continue
@@ -1968,6 +2181,7 @@ def run_chat_shell(
                     continue
                 try:
                     current_session = service.load_session(argument)
+                    active_doc = None
                 except Exception as exc:
                     console.print(f"[bold red]Error:[/bold red] {exc}")
                     continue
@@ -1978,6 +2192,64 @@ def run_chat_shell(
                 continue
 
             console.print(f"[bold red]Unknown command:[/bold red] {command}")
+            continue
+
+        if active_doc is not None:
+            if attachments:
+                console.print("[bold red]Error:[/bold red] Document mode does not support image attachments yet.")
+                continue
+            doc_service = _document_service()
+            try:
+                with console.status(f"[bold blue]{current_session.participants[0].name} updating document...[/bold blue]"):
+                    update = _doc_drafter().revise_document(
+                        session=current_session,
+                        transcript=service.transcript(current_session.session_id),
+                        context_snapshot=service.context_snapshot(current_session.session_id),
+                        doc_title=active_doc.title,
+                        current_markdown=doc_service.read_document(active_doc),
+                        user_instruction=raw,
+                        interaction_log=doc_service.interaction_excerpt(active_doc),
+                        provider=current_session.participants[0].provider,
+                    )
+                    active_doc = doc_service.revise_document(
+                        doc_session=active_doc,
+                        update=update,
+                        user_instruction=raw,
+                    )
+            except Exception as exc:
+                console.print(f"[bold red]Error:[/bold red] {exc}")
+                continue
+
+            console.print(
+                Panel(
+                    (
+                        f"[bold]ID[/bold]: {active_doc.doc_id}\n"
+                        f"[bold]Document[/bold]: {active_doc.document_path}\n"
+                        f"[bold]Iteration[/bold]: {active_doc.iteration}\n"
+                        f"[bold]Summary[/bold]: {update.summary}"
+                    ),
+                    title="[bold green]Document updated[/bold green]",
+                    border_style="green",
+                )
+            )
+            try:
+                service.record_session_event(
+                    session_id=current_session.session_id,
+                    kind=SessionEventKind.ARTIFACT_DOCUMENT_UPDATED,
+                    actor="labit",
+                    summary=f"Document updated: {active_doc.title}",
+                    payload={
+                        "doc_id": active_doc.doc_id,
+                        "title": active_doc.title,
+                        "document_path": active_doc.document_path,
+                        "log_path": active_doc.log_path,
+                        "iteration": active_doc.iteration,
+                        "agent_summary": update.summary,
+                    },
+                    evidence_refs=_session_evidence_refs(current_session) + [f"document:{active_doc.document_path}"],
+                )
+            except Exception:
+                pass
             continue
 
         result = _run_streaming_turn(

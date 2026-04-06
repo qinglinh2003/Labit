@@ -15,6 +15,8 @@ class SessionEventKind(str, Enum):
     ARTIFACT_IDEA_CREATED = "artifact.idea_created"
     ARTIFACT_NOTE_CREATED = "artifact.note_created"
     ARTIFACT_TODO_CREATED = "artifact.todo_created"
+    ARTIFACT_DOCUMENT_CREATED = "artifact.document_created"
+    ARTIFACT_DOCUMENT_UPDATED = "artifact.document_updated"
     ARTIFACT_HYPOTHESIS_CREATED = "artifact.hypothesis_created"
     ARTIFACT_EXPERIMENT_CREATED = "artifact.experiment_created"
     ARTIFACT_TASK_LAUNCHED = "artifact.task_launched"

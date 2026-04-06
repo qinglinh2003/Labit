@@ -74,6 +74,8 @@ class ResearchRollingCondenser(SessionCondenser):
             if event.kind in {
                 SessionEventKind.ARTIFACT_HYPOTHESIS_CREATED,
                 SessionEventKind.ARTIFACT_REPORT_CREATED,
+                SessionEventKind.ARTIFACT_DOCUMENT_CREATED,
+                SessionEventKind.ARTIFACT_DOCUMENT_UPDATED,
                 SessionEventKind.DISCUSSION_SYNTHESIS,
             }:
                 decisions.append(event.summary)
@@ -92,6 +94,15 @@ class ResearchRollingCondenser(SessionCondenser):
                 report_path = str(event.payload.get("report_path", "")).strip()
                 if report_path:
                     active_artifacts.append(f"report:{report_path}")
+            if event.kind in {
+                SessionEventKind.ARTIFACT_DOCUMENT_CREATED,
+                SessionEventKind.ARTIFACT_DOCUMENT_UPDATED,
+            }:
+                doc_path = ""
+                if isinstance(event.payload, dict):
+                    doc_path = str(event.payload.get("document_path", "")).strip()
+                if doc_path:
+                    active_artifacts.append(f"document:{doc_path}")
             if event.kind in {
                 SessionEventKind.ARTIFACT_TODO_CREATED,
                 SessionEventKind.ARTIFACT_NOTE_CREATED,
