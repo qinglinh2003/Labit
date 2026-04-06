@@ -472,6 +472,7 @@ def _render_console_header(*, project: str, mode: str, participants: str) -> Non
                 _command_chip("/memory"),
                 _command_chip("/idea"),
                 _command_chip("/todo"),
+                _command_chip("/doc"),
                 _command_chip("/investigate"),
                 _command_chip("/hypothesis"),
             ]
@@ -630,6 +631,24 @@ def _render_idea_preview(draft) -> None:
             border_style="green",
         )
     )
+
+
+def _print_doc_mode_hints(console: Console, session) -> None:
+    """Print helpful hints when entering document editing mode."""
+    lines = [
+        "[dim]──── Document Mode ────[/dim]",
+        "[dim]  Type feedback to revise the document (agent writes to file, not chat).[/dim]",
+        "[dim]  /doc status   — show current document info[/dim]",
+        "[dim]  /doc done     — leave document mode (status unchanged)[/dim]",
+        "[dim]  /doc publish   — mark document as active (usable after /doc done)[/dim]",
+        "[dim]  Ctrl+C        — interrupt current revision[/dim]",
+    ]
+    if session.mode == ChatMode.ROUND_ROBIN and len(session.participants) >= 2:
+        author = session.participants[0].name
+        reviewer = session.participants[1].name
+        lines.append(f"[dim]  Round-robin: {author} revises → {reviewer} reviews (review blocks in doc)[/dim]")
+    console.print("\n".join(lines))
+    console.print("")
 
 
 def _render_doc_status(doc_session: DocSession) -> None:
@@ -1292,12 +1311,12 @@ def run_chat_shell(
                                 f"[bold]Title[/bold]: {active_doc.title}\n"
                                 f"[bold]Status[/bold]: {active_doc.status.value}{status_note}\n"
                                 f"[bold]Document[/bold]: {active_doc.document_path}\n\n"
-                                "Type feedback to revise. Use /doc done to leave document mode."
-                            ),
+                                    ),
                             title="[bold green]Document opened[/bold green]",
                             border_style="green",
                         )
                     )
+                    _print_doc_mode_hints(console, current_session)
                     continue
                 if doc_action != "start":
                     console.print("[bold red]Usage:[/bold red] /doc start <title> | /doc open <id> | /doc status | /doc done | /doc publish <id> | /doc list")
@@ -1340,12 +1359,12 @@ def run_chat_shell(
                             f"[bold]Document[/bold]: {active_doc.document_path}\n"
                             f"[bold]Interaction log[/bold]: {active_doc.log_path}\n"
                             f"[bold]Summary[/bold]: {update.summary}\n\n"
-                            "Continue typing feedback to revise the document. Use /doc done to leave document mode."
-                        ),
+                            ),
                         title="[bold green]Document draft saved[/bold green]",
                         border_style="green",
                     )
                 )
+                _print_doc_mode_hints(console, current_session)
                 try:
                     service.record_session_event(
                         session_id=current_session.session_id,
