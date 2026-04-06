@@ -19,6 +19,7 @@ class ClaudeAdapter(AgentAdapter):
         try:
             result = subprocess.run(
                 cmd,
+                input=request.prompt,
                 capture_output=True,
                 text=True,
                 cwd=request.cwd,
@@ -112,6 +113,7 @@ class ClaudeAdapter(AgentAdapter):
                 cmd,
                 cwd=request.cwd,
                 timeout_seconds=request.timeout_seconds,
+                input_text=request.prompt,
                 on_stdout_line=_handle_stdout,
                 cancel_event=cancel_event,
             )
@@ -134,7 +136,7 @@ class ClaudeAdapter(AgentAdapter):
         )
 
     def _build_command(self, request: AgentRequest, *, stream: bool) -> list[str]:
-        cmd = ["claude", "-p", request.prompt]
+        cmd = ["claude", "-p", "--input-format", "text"]
 
         if request.system_prompt:
             cmd.extend(["--system-prompt", request.system_prompt])
