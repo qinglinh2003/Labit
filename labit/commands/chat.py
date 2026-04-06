@@ -980,6 +980,8 @@ def _run_streaming_turn(
         for participant in session.participants:
             state = snapshot[participant.name]
             status = state["status"]
+            if status == "queued":
+                continue
             started_at = state["started_at"]
             status_text = status
             if started_at is not None and status in {"thinking", "streaming"}:
