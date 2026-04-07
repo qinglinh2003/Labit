@@ -97,6 +97,7 @@ def prompt_with_clipboard_image(
         placeholder=HTML("<placeholder>Ask a question or paste an image...</placeholder>"),
         show_frame=True,
         editing_mode=EditingMode.EMACS,
+        mouse_support=True,
     )
     if attachments and not raw.strip():
         raw = "Please inspect the attached image and describe anything important."
