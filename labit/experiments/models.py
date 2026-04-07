@@ -630,6 +630,67 @@ class ExperimentDetail(BaseModel):
     review_markdown: str = ""
 
 
+class LaunchExpPhase(str, Enum):
+    TASK_BREAKDOWN = "task_breakdown"
+    TASK_PLANNING = "task_planning"
+    SCRIPT_GENERATION = "script_generation"
+
+
+class ExperimentTaskPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    name: str
+    goal: str = ""
+    depends_on: list[str] = Field(default_factory=list)
+    entry_hint: str = ""
+    inputs: str = ""
+    outputs: str = ""
+    checkpoint: str = ""
+    failure_modes: str = ""
+    approved: bool = False
+
+    @field_validator("id", "name", "goal", "entry_hint", "inputs", "outputs", "checkpoint", "failure_modes", mode="before")
+    @classmethod
+    def strip_text(cls, value: object) -> object:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+
+class LaunchExpSession(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    hypothesis_id: str
+    project: str
+    phase: LaunchExpPhase = LaunchExpPhase.TASK_BREAKDOWN
+    experiment_id: str | None = None
+    task_plans: list[ExperimentTaskPlan] = Field(default_factory=list)
+    current_task_index: int = 0
+    run_sh_content: str = ""
+    config_yaml_content: str = ""
+    log_path: str = ""
+    created_at: str = Field(default_factory=utc_now_iso)
+
+    @property
+    def all_tasks_approved(self) -> bool:
+        return bool(self.task_plans) and all(t.approved for t in self.task_plans)
+
+    @property
+    def current_task(self) -> ExperimentTaskPlan | None:
+        if 0 <= self.current_task_index < len(self.task_plans):
+            return self.task_plans[self.current_task_index]
+        return None
+
+    def next_unapproved_task_index(self) -> int | None:
+        for i, t in enumerate(self.task_plans):
+            if not t.approved:
+                return i
+        return None
+
+
 class HypothesisReviewSuggestion(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

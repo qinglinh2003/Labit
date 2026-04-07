@@ -54,6 +54,50 @@ class HypothesisDrafter:
             draft = draft.model_copy(update={"source_paper_ids": merged})
         return draft
 
+    def revise_hypothesis(
+        self,
+        *,
+        current_draft: HypothesisDraft,
+        session: ChatSession,
+        transcript: list[ChatMessage],
+        context_snapshot: ContextSnapshot,
+        user_instruction: str,
+        interaction_log: str = "",
+        provider: str | ProviderKind | None = None,
+    ) -> HypothesisDraft:
+        """Revise an existing hypothesis based on user feedback."""
+        provider_kind = resolve_provider_kind(provider)
+        request = AgentRequest(
+            role=AgentRole.WRITER,
+            prompt=self._build_revise_prompt(
+                current_draft=current_draft,
+                session=session,
+                transcript=transcript,
+                context_snapshot=context_snapshot,
+                user_instruction=user_instruction,
+                interaction_log=interaction_log,
+            ),
+            cwd=str(self.paths.root),
+            output_schema=self._draft_schema(),
+            extra_args=self._extra_args(provider_kind),
+        )
+        response = self.registry.get(provider_kind).run(request)
+        payload = response.structured_output
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        if not isinstance(payload, dict):
+            raise ValueError("Hypothesis reviser returned an invalid payload.")
+
+        revised = HypothesisDraft.model_validate(payload)
+        # Preserve source_paper_ids from original
+        merged = list(revised.source_paper_ids)
+        for paper_id in current_draft.source_paper_ids:
+            if paper_id not in merged:
+                merged.append(paper_id)
+        if merged != list(revised.source_paper_ids):
+            revised = revised.model_copy(update={"source_paper_ids": merged})
+        return revised
+
     def refine_draft(
         self,
         *,
@@ -139,6 +183,57 @@ Transcript:
 
 Current draft to review and refine:
 {draft_json}
+"""
+
+    def _build_revise_prompt(
+        self,
+        *,
+        current_draft: HypothesisDraft,
+        session: ChatSession,
+        transcript: list[ChatMessage],
+        context_snapshot: ContextSnapshot,
+        user_instruction: str,
+        interaction_log: str = "",
+    ) -> str:
+        context_blocks = self._format_context_blocks(context_snapshot)
+        transcript_text = self._format_transcript(transcript)
+        draft_json = current_draft.model_dump_json(indent=2)
+        log_text = interaction_log.strip() or "(none)"
+
+        return f"""You are revising an existing research hypothesis for LABIT based on user feedback.
+
+Return JSON only. Do not add markdown fences or commentary.
+
+The user has reviewed the current hypothesis and wants changes. Apply their feedback precisely. Do not change fields the user did not mention unless the change logically follows from their feedback.
+
+Rules:
+- `title`: keep short and specific.
+- `claim`: must remain a testable research statement. If the user asks to change the claim, make sure the new claim is still testable.
+- `motivation`: update if the user's feedback changes the reasoning.
+- `independent_variable` / `dependent_variable`: update if the user redefines what changes or what is measured.
+- `success_criteria` / `failure_criteria`: update if the user specifies new thresholds or conditions.
+- `rationale_markdown`: update to reflect the revised reasoning. Include the user's feedback rationale.
+- `experiment_plan_markdown`: update if the user changes the experimental approach.
+- `source_paper_ids`: preserve existing paper ids unless the user explicitly removes one.
+
+Session:
+- Title: {session.title}
+- Project: {session.project or "(none)"}
+
+Context:
+{context_blocks}
+
+Transcript (recent):
+{transcript_text}
+
+Prior iteration log:
+{log_text}
+
+Current hypothesis to revise:
+{draft_json}
+
+User's revision instruction:
+{user_instruction}
 """
 
     def _build_prompt(

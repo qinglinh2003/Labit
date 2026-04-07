@@ -21,10 +21,13 @@ from labit.experiments.models import (
     ExperimentParentType,
     ExperimentRecord,
     ExperimentSummary,
+    ExperimentTaskPlan,
     FrozenLaunchSpec,
     HypothesisReviewSuggestion,
     HypothesisSnapshot,
     LaunchArtifact,
+    LaunchExpPhase,
+    LaunchExpSession,
     LaunchStatus,
     ResearchRole,
     SubmissionReceipt,
@@ -540,6 +543,300 @@ class ExperimentService:
             dirty = bool(self._git_output(code_dir, ["status", "--porcelain"]))
 
         return CodeSnapshot(repo=repo, branch=branch, commit=commit, dirty=dirty)
+
+    # ── Launch-exp planning session ──
+
+    def start_launch_exp_session(
+        self,
+        *,
+        project: str,
+        hypothesis_id: str,
+    ) -> LaunchExpSession:
+        resolved = self._require_project(project)
+        # Verify hypothesis exists
+        self.hypothesis_service.load_hypothesis(resolved, hypothesis_id)
+
+        experiment_id = self.next_experiment_id(resolved)
+        experiment_dir = self.experiment_dir(resolved, experiment_id)
+        experiment_dir.mkdir(parents=True, exist_ok=True)
+
+        log_dir = experiment_dir / ".sessions"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = str((log_dir / "planning.jsonl").relative_to(self.paths.root))
+
+        session = LaunchExpSession(
+            hypothesis_id=hypothesis_id,
+            project=resolved,
+            experiment_id=experiment_id,
+            log_path=log_path,
+        )
+        self._log_planning_event(session, "session_started", {
+            "hypothesis_id": hypothesis_id,
+            "experiment_id": experiment_id,
+        })
+        return session
+
+    def save_task_plans(self, session: LaunchExpSession, tasks: list[ExperimentTaskPlan]) -> LaunchExpSession:
+        session = session.model_copy(update={"task_plans": tasks})
+        self._log_planning_event(session, "task_breakdown_updated", {
+            "task_count": len(tasks),
+            "tasks": [{"id": t.id, "name": t.name} for t in tasks],
+        })
+        return session
+
+    def approve_task_list(self, session: LaunchExpSession) -> LaunchExpSession:
+        """Move from task_breakdown to task_planning phase."""
+        first_idx = session.next_unapproved_task_index()
+        session = session.model_copy(update={
+            "phase": LaunchExpPhase.TASK_PLANNING,
+            "current_task_index": first_idx if first_idx is not None else 0,
+        })
+        self._log_planning_event(session, "task_list_approved", {
+            "task_count": len(session.task_plans),
+        })
+        return session
+
+    def update_task_detail(self, session: LaunchExpSession, task: ExperimentTaskPlan) -> LaunchExpSession:
+        tasks = list(session.task_plans)
+        for i, t in enumerate(tasks):
+            if t.id == task.id:
+                tasks[i] = task
+                break
+        return session.model_copy(update={"task_plans": tasks})
+
+    def approve_task(self, session: LaunchExpSession, task_id: str) -> LaunchExpSession:
+        tasks = list(session.task_plans)
+        for i, t in enumerate(tasks):
+            if t.id == task_id:
+                tasks[i] = t.model_copy(update={"approved": True})
+                break
+        session = session.model_copy(update={"task_plans": tasks})
+
+        self._log_planning_event(session, "task_approved", {"task_id": task_id})
+
+        # Advance to next unapproved task, or move to script generation
+        next_idx = session.next_unapproved_task_index()
+        if next_idx is not None:
+            session = session.model_copy(update={"current_task_index": next_idx})
+        elif session.all_tasks_approved:
+            session = session.model_copy(update={
+                "phase": LaunchExpPhase.SCRIPT_GENERATION,
+            })
+            self._log_planning_event(session, "all_tasks_approved", {})
+        return session
+
+    def reopen_task(self, session: LaunchExpSession, task_id: str) -> LaunchExpSession:
+        tasks = list(session.task_plans)
+        for i, t in enumerate(tasks):
+            if t.id == task_id:
+                tasks[i] = t.model_copy(update={"approved": False})
+                session = session.model_copy(update={
+                    "task_plans": tasks,
+                    "phase": LaunchExpPhase.TASK_PLANNING,
+                    "current_task_index": i,
+                })
+                self._log_planning_event(session, "task_reopened", {"task_id": task_id})
+                return session
+        raise ValueError(f"Task '{task_id}' not found in session.")
+
+    def save_script(self, session: LaunchExpSession, run_sh: str, config_yaml: str) -> LaunchExpSession:
+        resolved = session.project
+        experiment_dir = self.experiment_dir(resolved, session.experiment_id)
+
+        # Write run.sh
+        run_sh_path = experiment_dir / "run.sh"
+        self._atomic_write_text(run_sh_path, run_sh)
+
+        # Write config.yaml if provided
+        if config_yaml.strip():
+            self._atomic_write_text(experiment_dir / "config.yaml", config_yaml)
+
+        session = session.model_copy(update={
+            "run_sh_content": run_sh,
+            "config_yaml_content": config_yaml,
+        })
+        self._log_planning_event(session, "script_generated", {
+            "run_sh_lines": len(run_sh.splitlines()),
+        })
+        return session
+
+    def finalize_experiment(self, session: LaunchExpSession) -> ExperimentDetail:
+        """Create the experiment record and task records from the planning session."""
+        resolved = session.project
+        hypothesis = self.hypothesis_service.load_hypothesis(resolved, session.hypothesis_id).record
+        experiment_id = session.experiment_id
+        experiment_dir = self.experiment_dir(resolved, experiment_id)
+        (experiment_dir / "tasks").mkdir(parents=True, exist_ok=True)
+
+        record = ExperimentRecord(
+            experiment_id=experiment_id,
+            project=resolved,
+            parent_type=ExperimentParentType.HYPOTHESIS,
+            parent_id=hypothesis.hypothesis_id,
+            title=hypothesis.title,
+            objective=hypothesis.claim,
+            hypothesis_snapshot=HypothesisSnapshot(
+                hypothesis_id=hypothesis.hypothesis_id,
+                title=hypothesis.title,
+                claim=hypothesis.claim,
+                success_criteria=hypothesis.success_criteria,
+                failure_criteria=hypothesis.failure_criteria,
+            ),
+            execution=self.build_default_execution_profile(resolved),
+        )
+
+        evidence_task_ids: list[str] = []
+        for task_plan in session.task_plans:
+            task_record = TaskRecord(
+                task_id=task_plan.id,
+                experiment_id=experiment_id,
+                project=resolved,
+                title=task_plan.name,
+                task_kind=TaskKind.CUSTOM,
+                research_role=ResearchRole.EVIDENCE,
+                depends_on=task_plan.depends_on,
+                spec=TaskSpec(
+                    command=f"# See run.sh — task {task_plan.id}: {task_plan.name}",
+                    entrypoint=task_plan.entry_hint,
+                ),
+            )
+            self._atomic_write_yaml(
+                self.task_path(resolved, experiment_id, task_plan.id),
+                task_record.model_dump(mode="json"),
+            )
+            evidence_task_ids.append(task_plan.id)
+
+        record = record.model_copy(update={
+            "evidence_task_ids": evidence_task_ids,
+            "updated_at": utc_now_iso(),
+        })
+        self._atomic_write_yaml(experiment_dir / "experiment.yaml", record.model_dump(mode="json"))
+
+        # Write experiment_plan.md from task plans
+        plan_lines = [f"# Experiment Plan: {hypothesis.title}\n"]
+        for t in session.task_plans:
+            plan_lines.append(f"## {t.id}: {t.name}")
+            plan_lines.append(f"**Goal**: {t.goal}")
+            if t.depends_on:
+                plan_lines.append(f"**Depends on**: {', '.join(t.depends_on)}")
+            if t.entry_hint:
+                plan_lines.append(f"**Entry**: {t.entry_hint}")
+            if t.inputs:
+                plan_lines.append(f"**Inputs**: {t.inputs}")
+            if t.outputs:
+                plan_lines.append(f"**Outputs**: {t.outputs}")
+            if t.checkpoint:
+                plan_lines.append(f"**Checkpoint**: {t.checkpoint}")
+            if t.failure_modes:
+                plan_lines.append(f"**Failure modes**: {t.failure_modes}")
+            plan_lines.append("")
+        self._atomic_write_text(experiment_dir / "experiment_plan.md", "\n".join(plan_lines))
+        self._atomic_write_text(experiment_dir / "launch.md", "")
+        self._atomic_write_text(experiment_dir / "debrief.md", "")
+        self._atomic_write_text(experiment_dir / "review.md", "")
+
+        self._log_planning_event(session, "experiment_finalized", {
+            "experiment_id": experiment_id,
+        })
+        self._refresh_index(resolved)
+        return self.load_experiment(resolved, experiment_id)
+
+    def validate_dependency_graph(self, tasks: list[ExperimentTaskPlan]) -> str | None:
+        """Check for circular dependencies. Returns error message or None."""
+        task_ids = {t.id for t in tasks}
+        # Check for unknown dependencies
+        for t in tasks:
+            for dep in t.depends_on:
+                if dep not in task_ids:
+                    return f"Task '{t.id}' depends on unknown task '{dep}'."
+        # Topological sort to detect cycles
+        visited: set[str] = set()
+        in_stack: set[str] = set()
+        deps_map = {t.id: t.depends_on for t in tasks}
+
+        def dfs(node: str) -> str | None:
+            if node in in_stack:
+                return f"Circular dependency detected involving task '{node}'."
+            if node in visited:
+                return None
+            in_stack.add(node)
+            for dep in deps_map.get(node, []):
+                err = dfs(dep)
+                if err:
+                    return err
+            in_stack.discard(node)
+            visited.add(node)
+            return None
+
+        for tid in task_ids:
+            err = dfs(tid)
+            if err:
+                return err
+        return None
+
+    def planning_interaction_excerpt(self, session: LaunchExpSession, last_n: int = 10) -> str:
+        log_path = self.paths.root / session.log_path
+        if not log_path.exists():
+            return "(no interaction log)"
+        lines: list[str] = []
+        for raw_line in log_path.read_text(encoding="utf-8").strip().splitlines():
+            try:
+                event = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            lines.append(f"[{event.get('type', '?')}] {event.get('summary', json.dumps(event.get('payload', {})))}")
+        return "\n".join(lines[-last_n:]) if lines else "(empty)"
+
+    def get_code_tree(self, project: str, max_depth: int = 3) -> str:
+        resolved = self._require_project(project)
+        code_dir = self.paths.vault_projects_dir / resolved / "code"
+        if not code_dir.exists():
+            return "(no code directory found)"
+        lines: list[str] = []
+        self._tree(code_dir, code_dir, lines, depth=0, max_depth=max_depth)
+        return "\n".join(lines) if lines else "(empty code directory)"
+
+    def _tree(self, base: Path, current: Path, lines: list[str], depth: int, max_depth: int) -> None:
+        if depth >= max_depth:
+            return
+        try:
+            entries = sorted(current.iterdir(), key=lambda p: (not p.is_dir(), p.name))
+        except PermissionError:
+            return
+        for entry in entries:
+            if entry.name.startswith(".") or entry.name == "__pycache__":
+                continue
+            rel = entry.relative_to(base)
+            indent = "  " * depth
+            if entry.is_dir():
+                lines.append(f"{indent}{rel}/")
+                self._tree(base, entry, lines, depth + 1, max_depth)
+            else:
+                lines.append(f"{indent}{rel}")
+
+    def _log_planning_event(self, session: LaunchExpSession, event_type: str, payload: dict) -> None:
+        log_path = self.paths.root / session.log_path
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "type": event_type,
+            "timestamp": utc_now_iso(),
+            "payload": payload,
+        }
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def log_user_instruction(self, session: LaunchExpSession, instruction: str) -> None:
+        self._log_planning_event(session, "user_instruction", {
+            "content": instruction,
+            "phase": session.phase.value,
+        })
+
+    def log_agent_revision(self, session: LaunchExpSession, summary: str, provider: str = "") -> None:
+        self._log_planning_event(session, "agent_revision", {
+            "summary": summary,
+            "provider": provider,
+            "phase": session.phase.value,
+        })
 
     def _load_detail(self, experiment_dir: Path) -> ExperimentDetail:
         record = ExperimentRecord.model_validate(

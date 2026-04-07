@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
@@ -157,6 +159,113 @@ class HypothesisService:
             )
 
         return self.load_hypothesis(resolved, hypothesis_id)
+
+    # ── Hypothesis editing session (JSONL logging) ──
+
+    def log_path(self, project: str, hypothesis_id: str) -> Path:
+        resolved = self._require_project(project)
+        sessions_dir = self.hypotheses_dir(resolved) / ".sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        return sessions_dir / f"{hypothesis_id}.jsonl"
+
+    def log_event(
+        self,
+        project: str,
+        hypothesis_id: str,
+        event_type: str,
+        **kwargs: Any,
+    ) -> None:
+        entry = {
+            "type": event_type,
+            "timestamp": datetime.now(UTC).replace(microsecond=0).isoformat(),
+            **kwargs,
+        }
+        path = self.log_path(project, hypothesis_id)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def revise_hypothesis_files(
+        self,
+        *,
+        project: str,
+        hypothesis_id: str,
+        draft: HypothesisDraft,
+        user_instruction: str,
+        agent_name: str = "",
+    ) -> HypothesisDetail:
+        """Overwrite hypothesis files with revised draft and log the revision."""
+        resolved = self._require_project(project)
+        detail = self.load_hypothesis(resolved, hypothesis_id)
+
+        # Check if content actually changed before updating timestamp
+        content_fields = {
+            "title": draft.title,
+            "claim": draft.claim,
+            "motivation": draft.motivation,
+            "independent_variable": draft.independent_variable,
+            "dependent_variable": draft.dependent_variable,
+            "success_criteria": draft.success_criteria,
+            "failure_criteria": draft.failure_criteria,
+            "source_paper_ids": draft.source_paper_ids,
+        }
+        old_vals = {k: getattr(detail.record, k, None) for k in content_fields}
+        markdown_changed = (
+            draft.rationale_markdown != (detail.rationale_markdown or "")
+            or draft.experiment_plan_markdown != (detail.experiment_plan_markdown or "")
+        )
+        fields_changed = old_vals != content_fields
+
+        update_dict = dict(content_fields)
+        if fields_changed or markdown_changed:
+            update_dict["updated_at"] = datetime.now(UTC).replace(microsecond=0).isoformat()
+
+        updated_record = detail.record.model_copy(update=update_dict)
+
+        result = self.update_hypothesis_record(
+            project=resolved,
+            hypothesis_id=hypothesis_id,
+            record=updated_record,
+            rationale_markdown=draft.rationale_markdown,
+            experiment_plan_markdown=draft.experiment_plan_markdown,
+        )
+
+        self.log_event(
+            project, hypothesis_id,
+            "agent_revision",
+            provider=agent_name,
+            summary=f"Revised: {draft.title}",
+            user_instruction=user_instruction,
+        )
+
+        return result
+
+    def interaction_excerpt(self, project: str, hypothesis_id: str, max_entries: int = 10) -> str:
+        """Return recent JSONL entries as a readable string for the agent."""
+        path = self.log_path(project, hypothesis_id)
+        if not path.exists():
+            return "(no prior iterations)"
+        lines = path.read_text(encoding="utf-8").strip().splitlines()
+        recent = lines[-max_entries:]
+        parts: list[str] = []
+        for line in recent:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            etype = entry.get("type", "?")
+            ts = entry.get("timestamp", "")
+            if etype == "session_started":
+                parts.append(f"[{ts}] Session started")
+            elif etype == "session_ended":
+                parts.append(f"[{ts}] Session ended")
+            elif etype == "user_instruction":
+                parts.append(f"[{ts}] User: {entry.get('content', '')}")
+            elif etype == "agent_revision":
+                provider = entry.get("provider", "agent")
+                parts.append(f"[{ts}] {provider}: {entry.get('summary', '')}")
+            else:
+                parts.append(f"[{ts}] {etype}")
+        return "\n".join(parts) if parts else "(no prior iterations)"
 
     def hypotheses_dir(self, project: str) -> Path:
         return self.paths.vault_projects_dir / project / "hypotheses"

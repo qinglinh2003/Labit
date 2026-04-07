@@ -73,6 +73,7 @@ class ResearchRollingCondenser(SessionCondenser):
             evidence_refs.extend(event.evidence_refs)
             if event.kind in {
                 SessionEventKind.ARTIFACT_HYPOTHESIS_CREATED,
+                SessionEventKind.ARTIFACT_HYPOTHESIS_UPDATED,
                 SessionEventKind.ARTIFACT_REPORT_CREATED,
                 SessionEventKind.ARTIFACT_DOCUMENT_CREATED,
                 SessionEventKind.ARTIFACT_DOCUMENT_UPDATED,
@@ -86,7 +87,10 @@ class ResearchRollingCondenser(SessionCondenser):
                     paper_id = str(config.get("paper_id", "")).strip()
                 if paper_id:
                     active_artifacts.append(f"paper:{paper_id}")
-            if event.kind == SessionEventKind.ARTIFACT_HYPOTHESIS_CREATED:
+            if event.kind in {
+                SessionEventKind.ARTIFACT_HYPOTHESIS_CREATED,
+                SessionEventKind.ARTIFACT_HYPOTHESIS_UPDATED,
+            }:
                 hypothesis_id = str(event.payload.get("hypothesis_id", "")).strip()
                 if hypothesis_id:
                     active_artifacts.append(f"hypothesis:{hypothesis_id}")

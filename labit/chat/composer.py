@@ -75,7 +75,7 @@ def prompt_with_clipboard_image(
     def _submit(event) -> None:
         event.current_buffer.validate_and_handle()
 
-    @bindings.add("s-enter")
+    @bindings.add("escape", "enter")
     def _newline(event) -> None:
         event.current_buffer.insert_text("\n")
 
@@ -102,7 +102,7 @@ def prompt_with_clipboard_image(
         show_frame=True,
         editing_mode=EditingMode.EMACS,
         multiline=True,
-        mouse_support=True,
+        mouse_support=False,
     )
     if attachments and not raw.strip():
         raw = "Please inspect the attached image and describe anything important."
