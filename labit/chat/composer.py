@@ -71,9 +71,13 @@ def prompt_with_clipboard_image(
         }
     )
 
-    # NOTE: Do NOT bind enter/up/down here — Emacs mode defaults handle them
-    # correctly (enter: accept + store history, up/down: navigate history).
-    # Adding duplicate bindings causes double-execution.
+    @bindings.add("enter")
+    def _submit(event) -> None:
+        event.current_buffer.validate_and_handle()
+
+    @bindings.add("s-enter")
+    def _newline(event) -> None:
+        event.current_buffer.insert_text("\n")
 
     @bindings.add("tab")
     def _complete_if_unique(event) -> None:
@@ -97,6 +101,7 @@ def prompt_with_clipboard_image(
         placeholder=HTML("<placeholder>Ask a question or paste an image...</placeholder>"),
         show_frame=True,
         editing_mode=EditingMode.EMACS,
+        multiline=True,
         mouse_support=True,
     )
     if attachments and not raw.strip():
