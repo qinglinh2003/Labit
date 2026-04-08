@@ -741,6 +741,92 @@ class ExperimentService:
         self._refresh_index(resolved)
         return self.load_experiment(resolved, experiment_id)
 
+    def submit_experiment(self, session: LaunchExpSession) -> SubmissionReceipt:
+        """Submit the experiment-level run.sh via SSH."""
+        from labit.experiments.executors.ssh import SSHExecutor
+
+        resolved = session.project
+        experiment_id = session.experiment_id
+        experiment_dir = self.experiment_dir(resolved, experiment_id)
+        run_sh_path = experiment_dir / "run.sh"
+
+        if not run_sh_path.exists():
+            return SubmissionReceipt(
+                accepted=False,
+                phase=SubmissionPhase.SUBMIT,
+                backend=ExecutionBackend.SSH,
+                stderr_tail="run.sh not found in experiment directory.",
+                error_kind=SubmissionErrorKind.TASK_SPEC_ERROR,
+            )
+
+        execution = self.build_default_execution_profile(resolved)
+        code_snapshot = self.build_code_snapshot(resolved)
+
+        # Create a launch directory for this submission
+        launch_id = self._next_launch_id(resolved, experiment_id)
+        launch_dir = self.launch_dir(resolved, experiment_id, launch_id)
+        launch_dir.mkdir(parents=True, exist_ok=True)
+
+        # Wrap the experiment's run.sh with the compute profile's setup
+        # script so that venv, git pull, and cd workdir happen first.
+        raw_command = run_sh_path.read_text(encoding="utf-8")
+        frozen_spec = FrozenLaunchSpec(
+            command=raw_command,
+            workdir=execution.workdir,
+            output_dir=f"outputs/experiments/{experiment_id}",
+            env={},
+        )
+        wrapped_run_sh = self._render_run_sh(frozen_spec, execution)
+        wrapped_path = launch_dir / "run.sh"
+        wrapped_path.write_text(wrapped_run_sh, encoding="utf-8")
+
+        artifact = LaunchArtifact(
+            launch_id=launch_id,
+            task_id="experiment",
+            experiment_id=experiment_id,
+            project=resolved,
+            executor=execution.backend,
+            remote_user=execution.user,
+            remote_host=execution.host,
+            remote_port=execution.port,
+            ssh_key=execution.ssh_key,
+            frozen_spec=frozen_spec,
+            code_snapshot=code_snapshot,
+            run_sh_path=str(wrapped_path.relative_to(self.paths.root)),
+        )
+
+        executor = SSHExecutor(self.paths)
+        receipt = executor.submit(artifact)
+
+        # Save launch artifact with receipt
+        artifact = artifact.model_copy(update={
+            "submission": receipt,
+            "status": LaunchStatus.SUBMITTED if receipt.accepted else LaunchStatus.REJECTED,
+        })
+        self._atomic_write_yaml(launch_dir / "launch.yaml", artifact.model_dump(mode="json"))
+        if receipt is not None:
+            self._atomic_write_yaml(launch_dir / "receipt.yaml", receipt.model_dump(mode="json"))
+
+        # Update experiment status
+        detail = self.load_experiment(resolved, experiment_id)
+        updated_record = detail.record.model_copy(update={
+            "status": ExperimentStatus.QUEUED if receipt.accepted else ExperimentStatus.PLANNED,
+            "updated_at": utc_now_iso(),
+        })
+        self._atomic_write_yaml(
+            self.experiment_dir(resolved, experiment_id) / "experiment.yaml",
+            updated_record.model_dump(mode="json"),
+        )
+
+        self._log_planning_event(session, "experiment_submitted", {
+            "experiment_id": experiment_id,
+            "launch_id": launch_id,
+            "accepted": receipt.accepted,
+            "remote_host": execution.host,
+            "pid": receipt.pid,
+        })
+        return receipt
+
     def validate_dependency_graph(self, tasks: list[ExperimentTaskPlan]) -> str | None:
         """Check for circular dependencies. Returns error message or None."""
         task_ids = {t.id for t in tasks}

@@ -117,6 +117,8 @@ _CHAT_SHELL_COMMANDS = (
     "/doc",
     "/hypothesis",
     "/launch-exp",
+    "/swap",
+    "/mute",
     "/launch-exp approve-tasks",
     "/launch-exp approve-task",
     "/launch-exp reopen-task",
@@ -489,6 +491,16 @@ def _render_console_header(*, project: str, mode: str, participants: str) -> Non
             ]
         )
     )
+    console.print(
+        "Multi-agent: "
+        + " · ".join(
+            [
+                _command_chip("/mode"),
+                _command_chip("/swap"),
+                _command_chip("/mute"),
+            ]
+        )
+    )
 
 
 def _prompt_in_box(session) -> ComposerResult:
@@ -581,6 +593,8 @@ def _shell_help() -> None:
     table.add_row("/switch <session_id>", "Switch to another session.")
     table.add_row("/show", "Show the full transcript for the current session.")
     table.add_row("/mode [mode]", "Show or switch mode (single, round_robin, parallel).")
+    table.add_row("/swap", "Swap the response order of participants (e.g. claude,codex → codex,claude).")
+    table.add_row("/mute <name>", "Mute an agent for the next turn only. Toggle: run again to unmute.")
     table.add_row("/memory [id|kind]", "Show recent project memory, one memory by id, or filter by memory kind.")
     table.add_row("/think <question>", "Ask the next turn with the highest reasoning effort, while keeping the normal chat context shape.")
     table.add_row("/long-term-memory <question>", "Run a deep long-term memory search for this turn, then answer from the richer retrieved context.")
@@ -1147,8 +1161,15 @@ def _run_streaming_turn(
     attachments: list | None = None,
     force_deep_context: bool = False,
     reasoning_effort: str | None = None,
+    skip_participants: set[str] | None = None,
 ) -> object | None:
     _render_user_shell_message(query, attachments=attachments)
+    # Temporarily filter out muted participants for this turn
+    effective_session = session
+    if skip_participants:
+        filtered = [p for p in session.participants if p.name not in skip_participants]
+        if filtered:
+            effective_session = session.model_copy(update={"participants": filtered})
     participant_state = {
         participant.name: {
             "provider": participant.provider.value,
@@ -1157,7 +1178,7 @@ def _run_streaming_turn(
             "started_at": None,
             "thinking": None,
         }
-        for participant in session.participants
+        for participant in effective_session.participants
     }
     state_lock = threading.Lock()
     live_lock = threading.Lock()
@@ -1170,7 +1191,7 @@ def _run_streaming_turn(
                 name: dict(values)
                 for name, values in participant_state.items()
             }
-        for participant in session.participants:
+        for participant in effective_session.participants:
             state = snapshot[participant.name]
             status = state["status"]
             if status == "queued":
@@ -1229,6 +1250,7 @@ def _run_streaming_turn(
                 on_reply_delta=_on_reply_delta,
                 on_reply_complete=_on_reply_complete,
                 cancel_event=cancel_event,
+                skip_participants=skip_participants,
             )
         except KeyboardInterrupt:
             cancel_event.set()
@@ -1275,6 +1297,7 @@ def run_chat_shell(
     # Hypothesis editing mode state: (hypothesis_id, project, current_draft)
     active_hypothesis: tuple[str, str, HypothesisDraft] | None = None
     active_launch_exp: LaunchExpSession | None = None
+    muted_next_turn: set[str] = set()  # agent names to skip on next turn only
     while True:
         try:
             composer_result = _prompt_in_box(current_session)
@@ -1322,6 +1345,42 @@ def run_chat_shell(
                 if new_mode != ChatMode.SINGLE:
                     names = ", ".join(p.name for p in current_session.participants)
                     console.print(f"[dim]Participants: {names}[/dim]")
+                continue
+            if command == "/swap":
+                if len(current_session.participants) < 2:
+                    console.print("[dim]Need at least 2 participants to swap.[/dim]")
+                    continue
+                old_order = ", ".join(p.name for p in current_session.participants)
+                current_session = service.swap_participants(current_session.session_id)
+                new_order = ", ".join(p.name for p in current_session.participants)
+                console.print(f"[bold #0080ff]Swapped participant order:[/bold #0080ff] {old_order} → {new_order}")
+                continue
+            if command == "/mute":
+                if not argument:
+                    if muted_next_turn:
+                        console.print(f"[dim]Muted for next turn: {', '.join(muted_next_turn)}[/dim]")
+                    else:
+                        names = ", ".join(p.name for p in current_session.participants)
+                        console.print(f"[dim]Usage: /mute <agent_name>  (participants: {names})[/dim]")
+                    continue
+                target = argument.strip().lower()
+                matched = [p for p in current_session.participants if p.name.lower() == target]
+                if not matched:
+                    names = ", ".join(p.name for p in current_session.participants)
+                    console.print(f"[bold red]Unknown agent:[/bold red] {target}. Participants: {names}")
+                    continue
+                agent_name = matched[0].name
+                if agent_name in muted_next_turn:
+                    muted_next_turn.discard(agent_name)
+                    console.print(f"[bold #0080ff]Unmuted {agent_name}.[/bold #0080ff]")
+                else:
+                    # Don't allow muting all participants
+                    active_count = len([p for p in current_session.participants if p.name not in muted_next_turn])
+                    if active_count <= 1:
+                        console.print("[bold red]Error:[/bold red] Cannot mute all participants.")
+                        continue
+                    muted_next_turn.add(agent_name)
+                    console.print(f"[bold #0080ff]{agent_name} muted for next turn.[/bold #0080ff] (auto-unmutes after one turn)")
                 continue
             if command == "/memory":
                 if not current_session.project:
@@ -2086,12 +2145,22 @@ def run_chat_shell(
                         planner = ExperimentPlanner(RepoPaths.discover())
                         first_participant = current_session.participants[0] if current_session.participants else None
                         provider = first_participant.provider if first_participant else None
+                        # Get runtime context for the script prompt
+                        try:
+                            exec_profile = experiment_service.build_default_execution_profile(current_session.project)
+                            workdir = exec_profile.workdir or ""
+                            setup_summary = exec_profile.setup_script or ""
+                        except Exception:
+                            workdir = ""
+                            setup_summary = ""
                         with console.status("[bold cyan]Generating run.sh...[/bold cyan]"):
                             result = planner.generate_run_sh(
                                 session=active_launch_exp,
                                 hypothesis_title=hyp_detail.record.title,
                                 hypothesis_claim=hyp_detail.record.claim,
                                 code_tree=code_tree,
+                                workdir=workdir,
+                                setup_script_summary=setup_summary,
                                 provider=provider,
                             )
                         active_launch_exp = experiment_service.save_script(
@@ -2133,12 +2202,37 @@ def run_chat_shell(
                                     border_style="green",
                                 )
                             )
+                            # Auto-submit via SSH
+                            console.print("[dim]Submitting experiment to remote...[/dim]")
+                            try:
+                                receipt = experiment_service.submit_experiment(active_launch_exp)
+                                if receipt.accepted:
+                                    console.print(
+                                        Panel(
+                                            f"[bold]PID[/bold]: {receipt.pid}\n"
+                                            f"[bold]Log[/bold]: {receipt.log_path}\n"
+                                            f"[bold]Host[/bold]: {receipt.remote_host}",
+                                            title="[bold green]Experiment Submitted[/bold green]",
+                                            border_style="green",
+                                        )
+                                    )
+                                else:
+                                    console.print(
+                                        Panel(
+                                            f"[bold]Error[/bold]: {receipt.stderr_tail}",
+                                            title="[bold red]Submission Failed[/bold red]",
+                                            border_style="red",
+                                        )
+                                    )
+                            except Exception as submit_exc:
+                                console.print(f"[bold red]Submission error:[/bold red] {submit_exc}")
+                                console.print("[dim]Experiment finalized but not submitted. You can submit manually later.[/dim]")
                             try:
                                 service.record_session_event(
                                     session_id=current_session.session_id,
                                     kind=SessionEventKind.ARTIFACT_EXPERIMENT_CREATED,
                                     actor="labit",
-                                    summary=f"Experiment planned: {detail.record.experiment_id} for {active_launch_exp.hypothesis_id}",
+                                    summary=f"Experiment planned and submitted: {detail.record.experiment_id} for {active_launch_exp.hypothesis_id}",
                                     payload={
                                         "experiment_id": detail.record.experiment_id,
                                         "hypothesis_id": active_launch_exp.hypothesis_id,
@@ -2529,6 +2623,14 @@ def run_chat_shell(
                     hyp_detail = _hypothesis_service().load_hypothesis(current_session.project, active_launch_exp.hypothesis_id)
                     code_tree = exp_service.get_code_tree(current_session.project)
                     tasks_json = json.dumps([t.model_dump() for t in active_launch_exp.task_plans], indent=2)
+                    # Get runtime context for revision prompt
+                    try:
+                        exec_profile = exp_service.build_default_execution_profile(current_session.project)
+                        workdir = exec_profile.workdir or ""
+                        setup_summary = exec_profile.setup_script or ""
+                    except Exception:
+                        workdir = ""
+                        setup_summary = ""
                     with console.status("[bold blue]Revising run.sh...[/bold blue]"):
                         result = planner.revise_run_sh(
                             current_run_sh=active_launch_exp.run_sh_content,
@@ -2536,6 +2638,8 @@ def run_chat_shell(
                             tasks_json=tasks_json,
                             user_instruction=raw,
                             code_tree=code_tree,
+                            workdir=workdir,
+                            setup_script_summary=setup_summary,
                             provider=provider,
                         )
                     active_launch_exp = exp_service.save_script(
@@ -2770,7 +2874,10 @@ def run_chat_shell(
             session=current_session,
             query=raw,
             attachments=attachments,
+            skip_participants=muted_next_turn if muted_next_turn else None,
         )
+        if muted_next_turn:
+            muted_next_turn.clear()
         if result is not None:
             current_session = result.session
 

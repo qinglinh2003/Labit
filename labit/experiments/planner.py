@@ -152,6 +152,8 @@ class ExperimentPlanner:
         hypothesis_title: str,
         hypothesis_claim: str,
         code_tree: str,
+        workdir: str = "",
+        setup_script_summary: str = "",
         user_instruction: str = "",
         provider: str | ProviderKind | None = None,
     ) -> dict[str, str]:
@@ -168,6 +170,8 @@ class ExperimentPlanner:
                 hypothesis_title=hypothesis_title,
                 hypothesis_claim=hypothesis_claim,
                 code_tree=code_tree,
+                workdir=workdir,
+                setup_script_summary=setup_script_summary,
                 user_instruction=user_instruction,
             ),
             cwd=str(self.paths.root),
@@ -195,6 +199,8 @@ class ExperimentPlanner:
         tasks_json: str,
         user_instruction: str,
         code_tree: str,
+        workdir: str = "",
+        setup_script_summary: str = "",
         provider: str | ProviderKind | None = None,
     ) -> dict[str, str]:
         provider_kind = resolve_provider_kind(provider)
@@ -206,6 +212,8 @@ class ExperimentPlanner:
                 tasks_json=tasks_json,
                 user_instruction=user_instruction,
                 code_tree=code_tree,
+                workdir=workdir,
+                setup_script_summary=setup_script_summary,
             ),
             cwd=str(self.paths.root),
             output_schema=self._script_schema(),
@@ -366,21 +374,38 @@ Current task to plan:
         hypothesis_title: str,
         hypothesis_claim: str,
         code_tree: str,
+        workdir: str = "",
+        setup_script_summary: str = "",
         user_instruction: str = "",
     ) -> str:
         user_text = user_instruction.strip() or "(generate based on the approved task plans)"
+
+        runtime_ctx = self._runtime_context_block(workdir, setup_script_summary)
 
         return f"""You are generating a run.sh script for a LABIT experiment.
 
 Return JSON only. Do not add markdown fences or commentary.
 
-Generate a complete bash script that executes all the experiment tasks in order. The script should:
-1. Use `set -euo pipefail` for safety
-2. Execute tasks in topological order
-3. Before each task, check that its dependency checkpoints exist
-4. Print clear status messages for each task (e.g., "[t001] Running data preprocessing...")
-5. Skip tasks whose checkpoint already exists (with a message)
-6. Call code from the project's code directory — do NOT inline large implementations in the script
+IMPORTANT — Runtime environment:
+{runtime_ctx}
+
+Generate the BODY of a bash script that executes all the experiment tasks in order.
+Your script will be embedded inside a wrapper that already handles the preamble above.
+Do NOT include:
+- `#!/usr/bin/env bash` or any shebang
+- `set -euo pipefail` (already in wrapper)
+- Virtual environment activation (already done by wrapper)
+- `cd` to the project directory (already done by wrapper — `$PWD` is the workdir)
+- `dirname "$0"` for path resolution (it will resolve to a temp launch dir, NOT your code dir)
+
+DO use `$PWD` if you need to reference the project working directory.
+
+The script should:
+1. Execute tasks in topological order
+2. Before each task, check that its dependency checkpoints exist
+3. Print clear status messages for each task (e.g., "[t001] Running data preprocessing...")
+4. Skip tasks whose checkpoint already exists (with a message)
+5. Call code from the project's code directory — do NOT inline large implementations in the script
 
 Also generate a config.yaml if the experiment needs one (leave empty string if not needed).
 
@@ -398,7 +423,7 @@ User instruction:
 {user_text}
 
 Return:
-- `run_sh`: complete bash script content
+- `run_sh`: bash script body (NO shebang, NO set -euo pipefail, NO venv activation, NO cd to workdir)
 - `config_yaml`: configuration file content (empty string if not needed)
 - `summary`: one sentence describing the script
 """
@@ -411,10 +436,20 @@ Return:
         tasks_json: str,
         user_instruction: str,
         code_tree: str,
+        workdir: str = "",
+        setup_script_summary: str = "",
     ) -> str:
+        runtime_ctx = self._runtime_context_block(workdir, setup_script_summary)
+
         return f"""You are revising a run.sh script for a LABIT experiment.
 
 Return JSON only. Do not add markdown fences or commentary.
+
+IMPORTANT — Runtime environment:
+{runtime_ctx}
+
+Remember: your script is ONLY the body. Do NOT add shebang, `set -euo pipefail`, venv activation,
+or `cd` to workdir. These are handled by the wrapper. Use `$PWD` for the project directory, never `dirname "$0"`.
 
 The user wants changes to the current script. Apply their feedback precisely.
 
@@ -424,7 +459,7 @@ Approved task plans:
 Project code structure:
 {self._clip(code_tree, 2000)}
 
-Current run.sh:
+Current run.sh body:
 {current_run_sh}
 
 Current config.yaml:
@@ -434,7 +469,7 @@ User's revision instruction:
 {user_instruction}
 
 Return:
-- `run_sh`: complete updated bash script
+- `run_sh`: updated bash script body (NO shebang, NO preamble)
 - `config_yaml`: updated config (empty string if not needed)
 - `summary`: one sentence describing the change
 """
@@ -528,6 +563,20 @@ Return:
         if len(text) <= max_chars:
             return text
         return text[: max_chars - 1] + "\u2026"
+
+    def _runtime_context_block(self, workdir: str, setup_script_summary: str) -> str:
+        lines = []
+        if workdir:
+            lines.append(f"- Working directory on remote: {workdir}")
+            lines.append(f"  At runtime, the wrapper will `cd` to this directory before your script runs.")
+            lines.append(f"  So `$PWD` == {workdir}. Use `$PWD` for paths, NEVER `dirname \"$0\"`.")
+        if setup_script_summary:
+            lines.append(f"- The wrapper already runs this setup BEFORE your script:")
+            for sline in setup_script_summary.strip().splitlines():
+                lines.append(f"    {sline}")
+        if not lines:
+            lines.append("- No runtime context available. Write a self-contained script body.")
+        return "\n".join(lines)
 
     def _extra_args(self, provider: ProviderKind) -> list[str]:
         if provider == ProviderKind.CLAUDE:

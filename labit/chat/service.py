@@ -160,6 +160,7 @@ class ChatService:
         on_reply_delta: Callable[[ChatParticipant, str], None] | None = None,
         on_reply_complete: Callable[[ChatParticipant, str], None] | None = None,
         cancel_event: threading.Event | None = None,
+        skip_participants: set[str] | None = None,
     ) -> ChatTurnResult:
         return self._ask_impl(
             session_id=session_id,
@@ -171,6 +172,7 @@ class ChatService:
             on_reply_delta=on_reply_delta,
             on_reply_complete=on_reply_complete,
             cancel_event=cancel_event,
+            skip_participants=skip_participants,
         )
 
     def _ask_impl(
@@ -185,6 +187,7 @@ class ChatService:
         on_reply_delta: Callable[[ChatParticipant, str], None] | None = None,
         on_reply_complete: Callable[[ChatParticipant, str], None] | None = None,
         cancel_event: threading.Event | None = None,
+        skip_participants: set[str] | None = None,
     ) -> ChatTurnResult:
         session = self.load_session(session_id)
         if session.status != ChatStatus.ACTIVE:
@@ -211,6 +214,14 @@ class ChatService:
             paths=self.paths,
         )
         self.store.write_context_snapshot(session_id, snapshot)
+
+        # Filter out skipped participants for this turn
+        effective_participants = [
+            p for p in session.participants
+            if not skip_participants or p.name not in skip_participants
+        ]
+        if not effective_participants:
+            effective_participants = session.participants
 
         replies: list[ChatReply] = []
         try:
@@ -242,7 +253,7 @@ class ChatService:
                     else:
                         reply_queue.put((index, reply))
 
-                for index, participant in enumerate(session.participants):
+                for index, participant in enumerate(effective_participants):
                     thread = threading.Thread(
                         target=_parallel_worker,
                         args=(index, participant),
@@ -253,7 +264,7 @@ class ChatService:
 
                 ordered_replies: dict[int, ChatReply] = {}
                 parallel_errors: list[Exception] = []
-                for _ in session.participants:
+                for _ in effective_participants:
                     index, payload = reply_queue.get()
                     if isinstance(payload, ChatReply):
                         ordered_replies[index] = payload
@@ -272,7 +283,7 @@ class ChatService:
                     raise parallel_errors[0]
             else:
                 working_transcript = list(base_transcript)
-                participants = session.participants[:1] if session.mode == ChatMode.SINGLE else session.participants
+                participants = effective_participants[:1] if session.mode == ChatMode.SINGLE else effective_participants
                 for participant in participants:
                     reply = self._generate_reply(
                         session=session,
@@ -321,6 +332,18 @@ class ChatService:
             second = ChatParticipant(name=second_kind.value, provider=second_kind)
             updates["participants"] = list(session.participants) + [second]
         updated = session.model_copy(update=updates)
+        self.store.write_session(updated)
+        return updated
+
+    def swap_participants(self, session_id: str) -> ChatSession:
+        """Reverse the order of participants."""
+        session = self.load_session(session_id)
+        if len(session.participants) < 2:
+            raise ValueError("Need at least 2 participants to swap.")
+        updated = session.model_copy(update={
+            "participants": list(reversed(session.participants)),
+            "updated_at": utc_now_iso(),
+        })
         self.store.write_session(updated)
         return updated
 

@@ -248,14 +248,22 @@ class ProjectSeed(BaseModel):
 
     name: str
     repo: str | None = None
-    compute_profile: str
-    storage_profile: str
+    compute_profile: str = ""
+    storage_profile: str = ""
     sync_dirs: list[str] = Field(default_factory=list)
 
-    @field_validator("name", "compute_profile", "storage_profile")
+    @field_validator("name")
     @classmethod
-    def validate_name_fields(cls, value: str) -> str:
+    def validate_name_field(cls, value: str) -> str:
         return _validate_name(value)
+
+    @field_validator("compute_profile", "storage_profile")
+    @classmethod
+    def validate_optional_profile(cls, value: str) -> str:
+        value = value.strip()
+        if value:
+            return _validate_name(value)
+        return value
 
     @field_validator("repo")
     @classmethod
@@ -350,14 +358,22 @@ class ProjectSpec(BaseModel):
     keywords: list[str] = Field(default_factory=list)
     arxiv_categories: list[str] = Field(default_factory=list)
     relevance_criteria: str = ""
-    compute_profile: str
-    storage_profile: str
+    compute_profile: str = ""
+    storage_profile: str = ""
     sync_dirs: list[str] = Field(default_factory=list)
 
-    @field_validator("name", "compute_profile", "storage_profile")
+    @field_validator("name")
     @classmethod
-    def validate_name_fields(cls, value: str) -> str:
+    def validate_name_field(cls, value: str) -> str:
         return _validate_name(value)
+
+    @field_validator("compute_profile", "storage_profile")
+    @classmethod
+    def validate_optional_profile(cls, value: str) -> str:
+        value = value.strip()
+        if value:
+            return _validate_name(value)
+        return value
 
     @field_validator("description", "relevance_criteria")
     @classmethod
