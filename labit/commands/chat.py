@@ -409,6 +409,34 @@ def _message_body(message) -> str:
     return "\n".join(lines).strip()
 
 
+def _try_palace_mine(project: str | None, paths) -> None:
+    """Run incremental palace mining in background. Skips unchanged files."""
+    if not project:
+        return
+    try:
+        import threading
+        from labit.memory.palace_miner import mine_project
+        project_dir = paths.vault_projects_dir / project
+        if not project_dir.is_dir():
+            return
+        # Only mine if palace already exists (initial mine must be explicit via CLI)
+        if not paths.palace_dir.is_dir():
+            return
+        def _mine():
+            try:
+                mine_project(
+                    project_name=project,
+                    project_dir=project_dir,
+                    palace_path=paths.palace_dir,
+                )
+            except Exception:
+                pass
+        t = threading.Thread(target=_mine, daemon=True)
+        t.start()
+    except Exception:
+        pass  # silently fail — palace is optional
+
+
 def _render_shell_header(session) -> None:
     mode_label = {
         ChatMode.SINGLE: "Single agent",
@@ -1287,6 +1315,8 @@ def run_chat_shell(
     service: ChatService,
 ) -> None:
     _render_shell_header(session)
+    # Incremental palace mining at chat start (skips unchanged files, fast)
+    _try_palace_mine(session.project, service.paths)
     transcript = service.transcript(session.session_id)
     console.print("")
     _render_recent_messages(transcript, count=8)

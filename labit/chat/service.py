@@ -31,7 +31,7 @@ from labit.context.condenser import ResearchRollingCondenser, SessionCondenser
 from labit.context.events import SessionEvent, SessionEventKind, WorkingMemorySnapshot
 from labit.context.maps import ContextMapBuilder
 from labit.context.store import SessionContextStore
-from labit.memory.retrievers import MemoryRetriever
+from labit.memory.retrievers import MemoryRetriever, MemPalaceRetriever
 from labit.memory.service import MemoryService
 from labit.memory.store import MemoryStore
 from labit.paths import RepoPaths
@@ -79,7 +79,12 @@ class ChatService:
         self.context_map_builder = context_map_builder or ContextMapBuilder(paths)
         self.memory_store = memory_store or MemoryStore(paths)
         self.memory_service = memory_service or MemoryService(paths, store=self.memory_store)
-        self.memory_retriever = memory_retriever or MemoryRetriever(self.memory_store)
+        if memory_retriever:
+            self.memory_retriever = memory_retriever
+        else:
+            legacy = MemoryRetriever(self.memory_store)
+            palace_path = paths.palace_dir
+            self.memory_retriever = MemPalaceRetriever(palace_path, fallback=legacy)
 
     def open_session(
         self,
@@ -627,13 +632,25 @@ Reply as `{participant.name}` only. Use plain text or markdown.
                 evidence_refs=evidence_refs,
                 limit=12 if deep_memory else 6,
             )
+        wake_up_section = None
+        if session.project and isinstance(self.memory_retriever, MemPalaceRetriever):
+            wake_up_text = self.memory_retriever.wake_up(wing=session.project)
+            if wake_up_text:
+                from labit.context.assembler import ContextSection
+                wake_up_section = ContextSection(
+                    title="Long-term Memory",
+                    source="mempalace",
+                    priority=55,
+                    content=wake_up_text,
+                )
+        extra_sections = [wake_up_section] if wake_up_section else []
         assembled = self.assembler.assemble(
             task_header=task_header,
             bound_sections=bound_sections,
             recent_sections=recent_sections,
             working_memory=working_memory,
             memories=retrieved_memories,
-            map_sections=map_sections,
+            map_sections=map_sections + extra_sections,
         )
         return assembled.render()
 

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
+from pathlib import Path
 import re
 from dataclasses import dataclass
 
-from labit.memory.models import MemoryKind, MemoryRecord
+from labit.memory.models import MemoryKind, MemoryNamespace, MemoryRecord, MemoryType
 from labit.memory.store import MemoryStore
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -138,3 +142,155 @@ class MemoryRetriever:
             if len(selected) >= limit:
                 break
         return selected
+
+
+class MemPalaceRetriever:
+    """Retriever backed by MemPalace's ChromaDB semantic search.
+
+    Falls back to the legacy MemoryRetriever if chromadb is not installed
+    or the palace directory does not exist.
+    """
+
+    def __init__(self, palace_path: str | Path, fallback: MemoryRetriever | None = None):
+        self.palace_path = str(palace_path)
+        self.fallback = fallback
+        self._collection = None
+        self._available: bool | None = None
+
+    def _ensure_collection(self) -> bool:
+        if self._available is not None:
+            return self._available
+        try:
+            import chromadb
+            palace = Path(self.palace_path)
+            if not palace.is_dir():
+                self._available = False
+                return False
+            client = chromadb.PersistentClient(path=self.palace_path)
+            self._collection = client.get_collection("mempalace_drawers")
+            self._available = True
+        except Exception:
+            logger.debug("MemPalace not available at %s, using fallback", self.palace_path)
+            self._available = False
+        return self._available
+
+    def retrieve(
+        self,
+        *,
+        project: str,
+        query: str,
+        evidence_refs: list[str] | None = None,
+        limit: int = 6,
+    ) -> list[MemoryRecord]:
+        if not self._ensure_collection():
+            if self.fallback:
+                return self.fallback.retrieve(
+                    project=project, query=query,
+                    evidence_refs=evidence_refs, limit=limit,
+                )
+            return []
+
+        where = {"wing": project} if project else {}
+        try:
+            kwargs = {
+                "query_texts": [query],
+                "n_results": limit,
+                "include": ["documents", "metadatas", "distances"],
+            }
+            if where:
+                kwargs["where"] = where
+            results = self._collection.query(**kwargs)
+        except Exception as exc:
+            logger.warning("MemPalace search failed: %s", exc)
+            if self.fallback:
+                return self.fallback.retrieve(
+                    project=project, query=query,
+                    evidence_refs=evidence_refs, limit=limit,
+                )
+            return []
+
+        docs = results["documents"][0]
+        metas = results["metadatas"][0]
+        dists = results["distances"][0]
+
+        records: list[MemoryRecord] = []
+        for doc, meta, dist in zip(docs, metas, dists):
+            similarity = max(0.0, 1 - dist)
+            room = meta.get("room", "general")
+            source_file = meta.get("source_file", "")
+            title = f"[{room}] {Path(source_file).stem}" if source_file else f"[{room}]"
+            records.append(MemoryRecord(
+                project=project or "unknown",
+                namespace=MemoryNamespace(parts=(project or "unknown", room)),
+                kind=MemoryKind.DISCUSSION_TAKEAWAY,
+                memory_type=MemoryType.SEMANTIC,
+                title=title,
+                summary=doc,
+                confidence="medium",
+                promotion_score=int(similarity * 10),
+            ))
+        return records
+
+    def wake_up(self, *, wing: str | None = None, max_chars: int = 2400) -> str:
+        """Generate L1 wake-up text (~600 tokens). Returns empty string if unavailable."""
+        if not self._ensure_collection():
+            return ""
+        try:
+            _BATCH = 500
+            docs, metas = [], []
+            offset = 0
+            while True:
+                kwargs = {"include": ["documents", "metadatas"], "limit": _BATCH, "offset": offset}
+                if wing:
+                    kwargs["where"] = {"wing": wing}
+                batch = self._collection.get(**kwargs)
+                batch_docs = batch.get("documents", [])
+                batch_metas = batch.get("metadatas", [])
+                if not batch_docs:
+                    break
+                docs.extend(batch_docs)
+                metas.extend(batch_metas)
+                offset += len(batch_docs)
+                if len(batch_docs) < _BATCH or len(docs) >= 2000:
+                    break
+            if not docs:
+                return ""
+            scored = []
+            for doc, meta in zip(docs, metas):
+                importance = 3.0
+                for key in ("importance", "emotional_weight", "weight"):
+                    val = meta.get(key)
+                    if val is not None:
+                        try:
+                            importance = float(val)
+                        except (ValueError, TypeError):
+                            pass
+                        break
+                scored.append((importance, meta, doc))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            top = scored[:15]
+
+            from collections import defaultdict
+            by_room: dict[str, list] = defaultdict(list)
+            for imp, meta, doc in top:
+                room = meta.get("room", "general")
+                by_room[room].append(doc)
+
+            lines = ["## Long-term Memory"]
+            total_len = 0
+            for room, entries in sorted(by_room.items()):
+                lines.append(f"\n[{room}]")
+                total_len += len(room) + 3
+                for doc in entries:
+                    snippet = doc.strip().replace("\n", " ")
+                    if len(snippet) > 200:
+                        snippet = snippet[:197] + "..."
+                    entry = f"  - {snippet}"
+                    if total_len + len(entry) > max_chars:
+                        return "\n".join(lines)
+                    lines.append(entry)
+                    total_len += len(entry)
+            return "\n".join(lines)
+        except Exception as exc:
+            logger.debug("wake_up failed: %s", exc)
+            return ""

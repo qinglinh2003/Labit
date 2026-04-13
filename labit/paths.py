@@ -22,6 +22,7 @@ class RepoPaths:
     papers_dir: Path
     papers_by_id_dir: Path
     papers_index_path: Path
+    palace_dir: Path
 
     @classmethod
     def discover(cls, start: Path | None = None) -> "RepoPaths":
@@ -42,6 +43,7 @@ class RepoPaths:
             papers_dir=root / "vault" / "papers",
             papers_by_id_dir=root / "vault" / "papers" / "by_id",
             papers_index_path=root / "vault" / "papers" / "index.yaml",
+            palace_dir=root / ".labit" / "palace",
         )
 
 
