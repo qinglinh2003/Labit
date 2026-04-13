@@ -218,14 +218,16 @@ class MemPalaceRetriever:
             similarity = max(0.0, 1 - dist)
             room = meta.get("room", "general")
             source_file = meta.get("source_file", "")
-            title = f"[{room}] {Path(source_file).stem}" if source_file else f"[{room}]"
+            title = f"[verbatim:{room}] {Path(source_file).stem}" if source_file else f"[verbatim:{room}]"
+            source_refs = [f"file:{source_file}"] if source_file else []
             records.append(MemoryRecord(
                 project=project or "unknown",
                 namespace=MemoryNamespace(parts=(project or "unknown", room)),
-                kind=MemoryKind.DISCUSSION_TAKEAWAY,
-                memory_type=MemoryType.SEMANTIC,
+                kind=MemoryKind.VERBATIM_RECALL,
+                memory_type=MemoryType.EPISODIC,
                 title=title,
                 summary=doc,
+                source_artifact_refs=source_refs,
                 confidence="medium",
                 promotion_score=int(similarity * 10),
             ))

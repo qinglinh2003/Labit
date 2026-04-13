@@ -22,6 +22,7 @@ class MemoryKind(str, Enum):
     INVESTIGATION_FINDING = "investigation_finding"
     EXPERIMENT_OUTCOME = "experiment_outcome"
     CODE_FACT = "code_fact"
+    VERBATIM_RECALL = "verbatim_recall"
 
 
 class MemoryStatus(str, Enum):

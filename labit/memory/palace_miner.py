@@ -19,7 +19,16 @@ CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
 MIN_CHUNK_SIZE = 50
 
-READABLE_EXTENSIONS = {".md", ".yaml", ".yml", ".txt", ".py", ".sh"}
+READABLE_EXTENSIONS = {".md", ".yaml", ".yml", ".txt"}
+ALLOWED_DIR_MARKERS = {
+    "docs",
+    "documents",
+    "designs",
+    "hypotheses",
+    "experiments",
+    "papers",
+    "memory",
+}
 
 
 def _chunk_text(content: str) -> list[dict]:
@@ -64,6 +73,17 @@ def _detect_room(filepath: Path, project_dir: Path) -> str:
     if "memory" in relative:
         return "memory"
     return "general"
+
+
+def _should_ingest(filepath: Path, project_dir: Path) -> bool:
+    try:
+        relative = filepath.relative_to(project_dir)
+    except ValueError:
+        return False
+    parts = {part.lower() for part in relative.parts}
+    if parts & ALLOWED_DIR_MARKERS:
+        return True
+    return False
 
 
 def _file_already_mined(collection, source_file: str) -> bool:
@@ -113,7 +133,7 @@ def mine_project(
         dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
         for fn in filenames:
             fp = root_path / fn
-            if fp.suffix.lower() in READABLE_EXTENSIONS:
+            if fp.suffix.lower() in READABLE_EXTENSIONS and _should_ingest(fp, project_dir):
                 try:
                     if fp.stat().st_size > 5 * 1024 * 1024:
                         continue

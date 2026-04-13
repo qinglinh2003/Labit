@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 from dataclasses import dataclass
 from collections.abc import Callable
@@ -83,8 +84,12 @@ class ChatService:
             self.memory_retriever = memory_retriever
         else:
             legacy = MemoryRetriever(self.memory_store)
-            palace_path = paths.palace_dir
-            self.memory_retriever = MemPalaceRetriever(palace_path, fallback=legacy)
+            backend = os.getenv("LABIT_MEMORY_BACKEND", "palace").strip().lower()
+            if backend in {"legacy", "yaml", "memorystore"}:
+                self.memory_retriever = legacy
+            else:
+                palace_path = paths.palace_dir
+                self.memory_retriever = MemPalaceRetriever(palace_path, fallback=legacy)
 
     def open_session(
         self,
