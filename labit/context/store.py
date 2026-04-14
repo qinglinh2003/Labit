@@ -34,7 +34,10 @@ class SessionContextStore:
         for line in path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
-            events.append(SessionEvent.model_validate(json.loads(line)))
+            try:
+                events.append(SessionEvent.model_validate(json.loads(line)))
+            except (json.JSONDecodeError, Exception):
+                continue  # skip truncated / corrupt lines
         return events
 
     def write_working_memory(self, snapshot: WorkingMemorySnapshot) -> Path:

@@ -39,7 +39,14 @@ class ChatStore:
         path = self.session_dir(session_id) / "session.json"
         if not path.exists():
             raise FileNotFoundError(f"Chat session '{session_id}' not found.")
-        return ChatSession.model_validate(json.loads(path.read_text()))
+        try:
+            return ChatSession.model_validate(json.loads(path.read_text()))
+        except (json.JSONDecodeError, Exception):
+            recovered = self._recover_session_from_events(session_id)
+            if recovered is None:
+                raise
+            self.write_session(recovered)
+            return recovered
 
     def write_context_snapshot(self, session_id: str, snapshot: ContextSnapshot) -> Path:
         path = self.session_dir(session_id) / "context.json"
@@ -68,7 +75,10 @@ class ChatStore:
         for line in path.read_text().splitlines():
             if not line.strip():
                 continue
-            messages.append(ChatMessage.model_validate(json.loads(line)))
+            try:
+                messages.append(ChatMessage.model_validate(json.loads(line)))
+            except (json.JSONDecodeError, Exception):
+                continue  # skip truncated / corrupt lines
         return messages
 
     def list_sessions(self) -> list[ChatSession]:
@@ -89,3 +99,58 @@ class ChatStore:
             handle.write(text)
             temp_path = Path(handle.name)
         temp_path.replace(path)
+
+    def _recover_session_from_events(self, session_id: str) -> ChatSession | None:
+        events_path = self.session_dir(session_id) / "events.jsonl"
+        if not events_path.exists():
+            return None
+        events: list[dict] = []
+        for line in events_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        if not events:
+            return None
+        project = None
+        participants: dict[str, str] = {}
+        first_summary = None
+        created_at = None
+        updated_at = None
+        for event in events:
+            project = project or event.get("project")
+            created_at = created_at or event.get("created_at")
+            updated_at = event.get("created_at") or updated_at
+            kind = event.get("kind")
+            if kind == "message.user" and not first_summary:
+                first_summary = event.get("summary")
+            if kind == "message.agent":
+                actor = event.get("actor")
+                provider = None
+                payload = event.get("payload") or {}
+                provider = payload.get("provider") or actor
+                if actor and provider:
+                    participants[actor] = provider
+        if not participants:
+            # Fallback to default participants if no agent events exist.
+            participants = {"claude": "claude"}
+        from labit.chat.models import ChatMode, ChatParticipant
+        title = (first_summary or f"Recovered session {session_id}").strip()
+        if not title:
+            title = f"Recovered session {session_id}"
+        mode = ChatMode.ROUND_ROBIN if len(participants) > 1 else ChatMode.SINGLE
+        chat_participants = [
+            ChatParticipant(name=name, provider=provider) for name, provider in participants.items()
+        ]
+        return ChatSession(
+            session_id=session_id,
+            title=title,
+            mode=mode,
+            status=ChatSession.model_fields["status"].default,
+            project=project,
+            participants=chat_participants,
+            created_at=created_at or ChatSession.model_fields["created_at"].default_factory(),
+            updated_at=updated_at or ChatSession.model_fields["updated_at"].default_factory(),
+        )
