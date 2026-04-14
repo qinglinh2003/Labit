@@ -126,6 +126,7 @@ _CHAT_SHELL_COMMANDS = (
     "/launch-exp",
     "/swap",
     "/mute",
+    "/launch-exp resume",
     "/launch-exp approve-tasks",
     "/launch-exp approve-task",
     "/launch-exp reopen-task",
@@ -622,6 +623,7 @@ def _shell_help() -> None:
     table.add_row("/hypothesis status", "Show current hypothesis being edited.")
     table.add_row("/hypothesis done", "Leave hypothesis editing mode.")
     table.add_row("/launch-exp <hypothesis_id>", "Start interactive experiment planning from a hypothesis.")
+    table.add_row("/launch-exp resume <experiment_id>", "Resume a failed/existing experiment for revision or resubmission.")
     table.add_row("/launch-exp approve-tasks", "Approve the current task breakdown and move to detailed planning.")
     table.add_row("/launch-exp approve-task <id>", "Approve a specific task's detailed plan.")
     table.add_row("/launch-exp reopen-task <id>", "Reopen a previously approved task for re-planning.")
@@ -2387,6 +2389,37 @@ def run_chat_shell(
                     else:
                         console.print("[dim]No script generated. Experiment not finalized.[/dim]")
                     active_launch_exp = None
+                    continue
+
+                # ── Resume existing experiment ──
+                if sub_arg.startswith("resume"):
+                    exp_id = sub_arg.replace("resume", "").strip()
+                    if not exp_id:
+                        console.print("[bold red]Usage:[/bold red] /launch-exp resume <experiment_id>")
+                        continue
+                    if active_launch_exp is not None:
+                        console.print(f"[bold red]Error:[/bold red] Already planning experiment for {active_launch_exp.hypothesis_id}. Use /launch-exp done first.")
+                        continue
+                    try:
+                        active_launch_exp = experiment_service.resume_launch_exp_session(
+                            project=current_session.project,
+                            experiment_id=exp_id,
+                        )
+                        phase_label = active_launch_exp.phase.value.replace("_", " ").title()
+                        console.print(
+                            Panel(
+                                f"[bold]Experiment[/bold]: {exp_id}\n"
+                                f"[bold]Hypothesis[/bold]: {active_launch_exp.hypothesis_id}\n"
+                                f"[bold]Tasks[/bold]: {len(active_launch_exp.task_plans)}\n"
+                                f"[bold]Phase[/bold]: {phase_label}\n"
+                                f"[bold]Has run.sh[/bold]: {'yes' if active_launch_exp.run_sh_content else 'no'}",
+                                title="[bold cyan]Experiment Resumed[/bold cyan]",
+                                border_style="cyan",
+                            )
+                        )
+                        _print_launch_exp_hints(console, active_launch_exp)
+                    except Exception as exc:
+                        console.print(f"[bold red]Error:[/bold red] {exc}")
                     continue
 
                 # ── Start new planning session ──

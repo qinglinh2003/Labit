@@ -545,6 +545,142 @@ class ExperimentService:
 
         return CodeSnapshot(repo=repo, branch=branch, commit=commit, dirty=dirty)
 
+    def resume_launch_exp_session(
+        self,
+        *,
+        project: str,
+        experiment_id: str,
+    ) -> LaunchExpSession:
+        """Reconstruct a LaunchExpSession from an existing experiment's saved artifacts.
+
+        This allows resubmitting a failed experiment or revising its run.sh
+        without redoing the entire planning process.
+        """
+        resolved = self._require_project(project)
+        detail = self.load_experiment(resolved, experiment_id)
+        record = detail.record
+
+        plan_path = self.experiment_dir(resolved, experiment_id) / "experiment_plan.md"
+        plan_tasks = self._parse_experiment_plan(plan_path) if plan_path.exists() else {}
+
+        # Reconstruct task plans from experiment_plan.md (fallback to task records)
+        task_plans: list[ExperimentTaskPlan] = []
+        for task_summary in detail.tasks:
+            task_record = self.load_task(resolved, experiment_id, task_summary.task_id)
+            if task_record.task_id in plan_tasks:
+                plan = plan_tasks[task_record.task_id]
+                task_plans.append(plan.model_copy(update={
+                    "approved": True,
+                }))
+            else:
+                task_plans.append(ExperimentTaskPlan(
+                    id=task_record.task_id,
+                    name=task_record.title,
+                    goal="",
+                    depends_on=task_record.depends_on,
+                    entry_hint=task_record.spec.entrypoint,
+                    approved=True,
+                ))
+
+        # Read existing run.sh if present
+        run_sh_path = self.experiment_dir(resolved, experiment_id) / "run.sh"
+        run_sh_content = run_sh_path.read_text(encoding="utf-8") if run_sh_path.exists() else ""
+
+        # Read existing config.yaml if present
+        config_yaml_path = self.experiment_dir(resolved, experiment_id) / "config.yaml"
+        config_yaml_content = config_yaml_path.read_text(encoding="utf-8") if config_yaml_path.exists() else ""
+
+        # Determine the phase based on what already exists
+        if run_sh_content:
+            phase = LaunchExpPhase.SCRIPT_GENERATION
+        elif task_plans:
+            phase = LaunchExpPhase.SCRIPT_GENERATION if all(t.approved for t in task_plans) else LaunchExpPhase.TASK_PLANNING
+        else:
+            phase = LaunchExpPhase.TASK_BREAKDOWN
+
+        log_dir = self.experiment_dir(resolved, experiment_id) / ".sessions"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = str((log_dir / "planning.jsonl").relative_to(self.paths.root))
+
+        session = LaunchExpSession(
+            hypothesis_id=record.parent_id,
+            project=resolved,
+            experiment_id=experiment_id,
+            phase=phase,
+            task_plans=task_plans,
+            current_task_index=0,
+            run_sh_content=run_sh_content,
+            config_yaml_content=config_yaml_content,
+            log_path=log_path,
+        )
+        self._log_planning_event(session, "session_resumed", {
+            "experiment_id": experiment_id,
+            "phase": phase.value,
+            "task_count": len(task_plans),
+            "has_run_sh": bool(run_sh_content),
+        })
+        return session
+
+    def _parse_experiment_plan(self, path: Path) -> dict[str, ExperimentTaskPlan]:
+        """Parse experiment_plan.md into task plans."""
+        content = path.read_text(encoding="utf-8")
+        tasks: dict[str, ExperimentTaskPlan] = {}
+        current: dict[str, str] = {}
+
+        def _flush_current() -> None:
+            if not current.get("id"):
+                return
+            task_id = current["id"]
+            tasks[task_id] = ExperimentTaskPlan(
+                id=task_id,
+                name=current.get("name", ""),
+                goal=current.get("goal", ""),
+                depends_on=[t.strip() for t in current.get("depends_on", "").split(",") if t.strip()],
+                entry_hint=current.get("entry", ""),
+                inputs=current.get("inputs", ""),
+                outputs=current.get("outputs", ""),
+                checkpoint=current.get("checkpoint", ""),
+                failure_modes=current.get("failure_modes", ""),
+                approved=True,
+            )
+
+        header_re = re.compile(r"^##\s+(?P<id>\w+):\s+(?P<name>.+)\s*$")
+        field_re = re.compile(r"^\*\*(?P<field>[^*]+)\*\*:\s*(?P<value>.*)\s*$")
+
+        for raw in content.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            header = header_re.match(line)
+            if header:
+                _flush_current()
+                current = {
+                    "id": header.group("id"),
+                    "name": header.group("name"),
+                }
+                continue
+            field = field_re.match(line)
+            if field and current.get("id"):
+                key = field.group("field").strip().lower()
+                value = field.group("value").strip()
+                if key == "goal":
+                    current["goal"] = value
+                elif key == "depends on":
+                    current["depends_on"] = value
+                elif key == "entry":
+                    current["entry"] = value
+                elif key == "inputs":
+                    current["inputs"] = value
+                elif key == "outputs":
+                    current["outputs"] = value
+                elif key == "checkpoint":
+                    current["checkpoint"] = value
+                elif key == "failure modes":
+                    current["failure_modes"] = value
+
+        _flush_current()
+        return tasks
+
     # ── Launch-exp planning session ──
 
     def start_launch_exp_session(
