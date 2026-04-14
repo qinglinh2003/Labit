@@ -128,7 +128,8 @@ class ComputeService:
         if setup_script:
             if on_step:
                 on_step("Running setup script")
-            setup_probe = self._ssh_run(ssh_command, f"set -e\n{setup_script}\nprintf 'LABIT_SETUP_OK'", timeout=40)
+            workdir_cd = self._resolve_workdir_script(profile.workspace.workdir)
+            setup_probe = self._ssh_run(ssh_command, f"set -e\n{workdir_cd}\n{setup_script}\nprintf 'LABIT_SETUP_OK'", timeout=40)
             setup_ok = setup_probe.returncode == 0 and (setup_probe.stdout or "").strip().endswith("LABIT_SETUP_OK")
             if not setup_ok:
                 return ComputeCheckResult(
@@ -141,6 +142,7 @@ class ComputeService:
                 )
 
         python_probe_script = "set -e\n"
+        python_probe_script += f"{self._resolve_workdir_script(profile.workspace.workdir)}\n"
         if setup_script:
             python_probe_script += f"{setup_script}\n"
         python_probe_script += (
@@ -166,6 +168,7 @@ class ComputeService:
             if on_step:
                 on_step("Checking GPUs")
             gpu_script = "set -e\n"
+            gpu_script += f"{self._resolve_workdir_script(profile.workspace.workdir)}\n"
             if setup_script:
                 gpu_script += f"{setup_script}\n"
             gpu_script += "nvidia-smi --query-gpu=name --format=csv,noheader"
@@ -218,12 +221,24 @@ class ComputeService:
 
     def _ssh_run(self, ssh_command: list[str], script: str, *, timeout: int) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [*ssh_command, "bash", "-s"],
+            [*ssh_command, "bash", "--norc", "--noprofile", "-s"],
             input=script,
             capture_output=True,
             text=True,
             check=False,
             timeout=timeout,
+        )
+
+    def _resolve_workdir_script(self, workdir: str) -> str:
+        """Return shell snippet that cd's into the resolved workdir."""
+        quoted = self._shell_quote(workdir)
+        return (
+            f"WORKDIR={quoted}\n"
+            'if [ "$WORKDIR" = "~" ]; then WORKDIR="$HOME"; fi\n'
+            'case "$WORKDIR" in\n'
+            '  "~/"*) WORKDIR="$HOME/${WORKDIR#"~/"}" ;;\n'
+            "esac\n"
+            'cd "$WORKDIR"\n'
         )
 
     def _shell_quote(self, value: str) -> str:
