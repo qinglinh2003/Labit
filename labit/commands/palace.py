@@ -1,10 +1,12 @@
-"""CLI commands for MemPalace integration."""
+"""CLI commands for MemPalace integration.
+
+Delegates to the upstream mempalace package for mining, search, and status.
+"""
 
 from __future__ import annotations
 
 import typer
 from rich.console import Console
-from rich.table import Table
 
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
@@ -19,6 +21,53 @@ def _paths() -> RepoPaths:
 
 def _project_service() -> ProjectService:
     return ProjectService(_paths())
+
+
+def _ensure_mempalace_yaml(project_dir, project_name: str) -> None:
+    """Write a mempalace.yaml in the project directory if one doesn't exist."""
+    from pathlib import Path
+    import yaml
+
+    config_path = Path(project_dir) / "mempalace.yaml"
+    if config_path.exists():
+        return
+
+    config = {
+        "wing": project_name,
+        "rooms": [
+            {
+                "name": "hypotheses",
+                "description": "Research hypotheses and experiment plans",
+                "keywords": ["hypothesis", "rationale", "experiment_plan", "prediction"],
+            },
+            {
+                "name": "documents",
+                "description": "Design documents, notes, and ideas",
+                "keywords": ["design", "document", "note", "idea", "overview"],
+            },
+            {
+                "name": "experiments",
+                "description": "Experiment configs, tasks, and results",
+                "keywords": ["experiment", "task", "config", "launch", "result", "metric"],
+            },
+            {
+                "name": "papers",
+                "description": "Paper summaries and references",
+                "keywords": ["paper", "arxiv", "summary", "citation", "abstract"],
+            },
+            {
+                "name": "memory",
+                "description": "Long-term memory entries",
+                "keywords": ["memory", "decision", "takeaway", "finding"],
+            },
+            {
+                "name": "general",
+                "description": "Everything else",
+            },
+        ],
+    }
+    config_path.write_text(yaml.dump(config, default_flow_style=False, allow_unicode=True))
+    console.print(f"[dim]Created {config_path}[/dim]")
 
 
 @palace_app.command("mine")
@@ -40,140 +89,114 @@ def mine(
         console.print(f"[red]Project directory not found: {project_dir}[/red]")
         raise typer.Exit(1)
 
-    from labit.memory.palace_miner import mine_project
-
-    console.print(f"Mining [bold]{project_name}[/bold] into MemPalace...")
-    if dry_run:
-        console.print("[dim](dry run — nothing will be written)[/dim]")
-
     try:
-        stats = mine_project(
-            project_name=project_name,
-            project_dir=project_dir,
-            palace_path=paths.palace_dir,
-            dry_run=dry_run,
-        )
-    except RuntimeError as e:
-        console.print(f"[red]{e}[/red]")
+        from labit.memory.palace.miner import mine as mp_mine
+    except ImportError:
+        console.print("[red]MemPalace dependencies not available. Install chromadb: pip install chromadb[/red]")
         raise typer.Exit(1)
 
-    table = Table(title=f"Mining results — {project_name}")
-    table.add_column("Metric")
-    table.add_column("Value", justify="right")
-    table.add_row("Total files scanned", str(stats["total_files"]))
-    table.add_row("Files processed", str(stats["files_processed"]))
-    table.add_row("Files skipped (unchanged)", str(stats["files_skipped"]))
-    table.add_row("Drawers filed", str(stats["drawers_filed"]))
-    console.print(table)
+    # Ensure mempalace.yaml exists in project dir
+    _ensure_mempalace_yaml(project_dir, project_name)
 
-    if stats["rooms"]:
-        room_table = Table(title="By room")
-        room_table.add_column("Room")
-        room_table.add_column("Files", justify="right")
-        for room, count in sorted(stats["rooms"].items(), key=lambda x: x[1], reverse=True):
-            room_table.add_row(room, str(count))
-        console.print(room_table)
+    palace_path = str(paths.palace_dir)
+    console.print(f"Mining [bold]{project_name}[/bold] into MemPalace...")
+
+    mp_mine(
+        project_dir=str(project_dir),
+        palace_path=palace_path,
+        wing_override=project_name,
+        dry_run=dry_run,
+    )
 
 
 @palace_app.command("status")
 def status():
     """Show MemPalace status and drawer counts."""
     paths = _paths()
-    palace_path = paths.palace_dir
-
-    if not palace_path.is_dir():
-        console.print("[yellow]No palace found. Run: labit palace mine[/yellow]")
-        raise typer.Exit(0)
+    palace_path = str(paths.palace_dir)
 
     try:
-        import chromadb
+        from labit.memory.palace.miner import status as mp_status
     except ImportError:
-        console.print("[red]chromadb not installed. Install with: pip install 'labit[mempalace]'[/red]")
+        console.print("[red]MemPalace dependencies not available.[/red]")
         raise typer.Exit(1)
 
-    client = chromadb.PersistentClient(path=str(palace_path))
-    try:
-        col = client.get_collection("mempalace_drawers")
-    except Exception:
-        console.print("[yellow]Palace exists but no drawers collection found.[/yellow]")
-        raise typer.Exit(0)
-
-    count = col.count()
-    console.print(f"Palace: [bold]{palace_path}[/bold]")
-    console.print(f"Total drawers: [bold]{count}[/bold]")
-
-    if count > 0:
-        r = col.get(limit=min(count, 10000), include=["metadatas"])
-        metas = r["metadatas"]
-        wing_rooms: dict[str, dict[str, int]] = {}
-        for m in metas:
-            w = m.get("wing", "?")
-            rm = m.get("room", "?")
-            wing_rooms.setdefault(w, {})
-            wing_rooms[w][rm] = wing_rooms[w].get(rm, 0) + 1
-
-        for wing, rooms in sorted(wing_rooms.items()):
-            table = Table(title=f"Wing: {wing}")
-            table.add_column("Room")
-            table.add_column("Drawers", justify="right")
-            for room, cnt in sorted(rooms.items(), key=lambda x: x[1], reverse=True):
-                table.add_row(room, str(cnt))
-            console.print(table)
+    mp_status(palace_path)
 
 
 @palace_app.command("search")
 def search_cmd(
     query: str = typer.Argument(..., help="Search query"),
     project: str = typer.Option("", help="Filter by project (wing)"),
+    room: str = typer.Option("", help="Filter by room"),
     n: int = typer.Option(5, help="Number of results"),
 ):
     """Semantic search against the MemPalace."""
-    paths = _paths()
-    palace_path = paths.palace_dir
+    from rich.panel import Panel
+    from rich.text import Text
 
-    if not palace_path.is_dir():
-        console.print("[yellow]No palace found. Run: labit palace mine[/yellow]")
-        raise typer.Exit(0)
+    paths = _paths()
+    palace_path = str(paths.palace_dir)
 
     try:
-        import chromadb
+        from labit.memory.palace.searcher import search_memories
     except ImportError:
-        console.print("[red]chromadb not installed.[/red]")
+        console.print("[red]MemPalace dependencies not available.[/red]")
         raise typer.Exit(1)
 
-    client = chromadb.PersistentClient(path=str(palace_path))
-    try:
-        col = client.get_collection("mempalace_drawers")
-    except Exception:
-        console.print("[yellow]No drawers collection found.[/yellow]")
-        raise typer.Exit(0)
-
     wing = project or None
-    kwargs = {
-        "query_texts": [query],
-        "n_results": n,
-        "include": ["documents", "metadatas", "distances"],
-    }
-    if wing:
-        kwargs["where"] = {"wing": wing}
+    room_filter = room or None
 
-    results = col.query(**kwargs)
-    docs = results["documents"][0]
-    metas = results["metadatas"][0]
-    dists = results["distances"][0]
+    try:
+        result = search_memories(query, palace_path, wing=wing, room=room_filter, n_results=n)
+    except Exception as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
 
-    if not docs:
-        console.print(f"No results for: [bold]{query}[/bold]")
+    if "error" in result:
+        console.print(f"[red]{result['error']}[/red]")
+        raise typer.Exit(1)
+
+    hits = result.get("results", [])
+    if not hits:
+        console.print("[dim]No results found.[/dim]")
         return
 
-    console.print(f"\nResults for: [bold]{query}[/bold]\n")
-    for i, (doc, meta, dist) in enumerate(zip(docs, metas, dists), 1):
-        sim = round(max(0.0, 1 - dist), 3)
-        wing_name = meta.get("wing", "?")
-        room = meta.get("room", "?")
-        source = meta.get("source_file", "?")
-        console.print(f"[bold][{i}][/bold] {wing_name}/{room}  sim={sim}  src={source}")
-        snippet = doc.strip()
-        if len(snippet) > 300:
-            snippet = snippet[:297] + "..."
-        console.print(f"    {snippet}\n")
+    console.print(f"\n[bold]Found {len(hits)} result(s) for:[/bold] {query}\n")
+    for i, hit in enumerate(hits, 1):
+        similarity = 1 - hit.get("distance", 0)
+        room_name = hit.get("room", "?")
+        wing_name = hit.get("wing", "?")
+        source = hit.get("source_file", "unknown")
+        text = hit.get("text", "").strip()
+        # Truncate long text for display
+        if len(text) > 400:
+            text = text[:400] + "..."
+
+        header = Text()
+        header.append(f"#{i} ", style="bold")
+        header.append(f"[{wing_name}/{room_name}] ", style="cyan")
+        header.append(f"sim={similarity:.3f} ", style="green")
+        header.append(source, style="dim")
+
+        console.print(Panel(text, title=header, border_style="dim", padding=(0, 1)))
+
+
+@palace_app.command("dedup")
+def dedup(
+    project: str = typer.Option("", help="Filter by project (wing)"),
+    threshold: float = typer.Option(0.15, help="Cosine distance threshold for dedup"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show duplicates without removing"),
+):
+    """Remove near-duplicate drawers from the palace."""
+    paths = _paths()
+    palace_path = str(paths.palace_dir)
+
+    try:
+        from labit.memory.palace.dedup import dedup_palace
+    except ImportError:
+        console.print("[red]MemPalace dependencies not available.[/red]")
+        raise typer.Exit(1)
+
+    wing = project or None
+    dedup_palace(palace_path, wing=wing, threshold=threshold, dry_run=dry_run)

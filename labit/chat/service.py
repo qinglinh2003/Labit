@@ -562,6 +562,8 @@ class ChatService:
             deep_memory=force_deep_context,
         )
 
+        platform_context = self._platform_context(session.project)
+
         return f"""You are `{participant.name}` in a LABIT shared conversation.
 
 Session:
@@ -569,6 +571,8 @@ Session:
 - Mode: {session.mode.value}
 - Project: {session.project or "(none)"}
 - Participants: {participants}
+
+{platform_context}
 
 Guidelines:
 - Continue the conversation naturally.
@@ -757,11 +761,15 @@ Reply as `{participant.name}` only. Use plain text or markdown.
         project_label = session.project or "(none)"
         participants = ", ".join(item.name for item in session.participants)
         working_memory_text = self._render_compact_working_memory(working_memory)
+        platform_context = self._platform_context(session.project)
+
         return f"""You are `{participant.name}` in a LABIT research conversation.
 
 Project: {project_label}
 Mode: {session.mode.value}
 Participants: {participants}
+
+{platform_context}
 
 Guidelines:
 - Continue the conversation naturally.
@@ -807,6 +815,31 @@ Reply as `{participant.name}` only. Use plain text or markdown.
                 parts.append("Evidence refs:")
                 parts.extend(f"- {item}" for item in meaningful_refs[-6:])
         return "\n".join(parts) if parts else "(empty)"
+
+    def _platform_context(self, project: str | None) -> str:
+        """Build a static platform-awareness block that agents must always know."""
+        lines = [
+            "Platform (LABIT):",
+            "- LABIT is a research operating system that manages projects, hypotheses, experiments, documents, and remote compute.",
+            "- LABIT can manage remote compute via compute profiles and `/launch-exp` (SSH may still be relevant, but prefer Labit tooling by default).",
+            "- The LABIT codebase itself is a separate git repo. Do NOT commit, push, or modify LABIT source code from a project chat.",
+        ]
+        if project:
+            lines.extend([
+                f"- You are working on project '{project}'. This project has its own directory under vault/projects/{project}/.",
+                f"- You may read LABIT files for reference, but you should only create/modify files within vault/projects/{project}/ and its subdirectories.",
+                f"- Git operations (commit, push, branch) should only target the project's files, never LABIT's own source code.",
+            ])
+            try:
+                spec = self.project_service.load_project(project)
+                if spec.compute_profile:
+                    lines.append(f"- This project uses compute profile '{spec.compute_profile}'. Use `labit compute test {spec.compute_profile}` to verify connectivity, and `/launch-exp` to submit experiments.")
+                code_dir = self.project_service.project_code_dir(project)
+                if code_dir.exists():
+                    lines.append(f"- Project code directory: {code_dir.relative_to(self.paths.root)}")
+            except Exception:
+                pass
+        return "\n".join(lines)
 
     def _bound_paper_ids(self, session: ChatSession) -> list[str]:
         paper_ids: list[str] = []
