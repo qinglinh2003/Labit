@@ -712,6 +712,206 @@ def _print_doc_mode_hints(console: Console, session) -> None:
     console.print("")
 
 
+def _submit_and_monitor(
+    *,
+    console: Console,
+    experiment_service: ExperimentService,
+    active_launch_exp: LaunchExpSession,
+    current_session,
+    service: ChatService,
+    planner: ExperimentPlanner,
+    _hypothesis_service,
+    first_participant,
+    max_retries: int = 3,
+    stabilize_seconds: int = 90,
+    poll_interval: int = 15,
+) -> bool:
+    """Submit experiment, monitor for early failures, auto-fix and resubmit.
+
+    After submission, polls the remote log for *stabilize_seconds*. If the
+    process dies early, shows the error log and lets the agent revise run.sh,
+    then resubmits. Gives up after *max_retries* total attempts.
+    """
+    from labit.paths import RepoPaths
+
+    executor = SSHExecutor(RepoPaths.discover())
+    attempt = 0
+
+    while attempt < max_retries:
+        attempt += 1
+        console.print(f"[dim]Submitting experiment (attempt {attempt}/{max_retries})...[/dim]")
+        try:
+            receipt = experiment_service.submit_experiment(active_launch_exp)
+        except Exception as submit_exc:
+            console.print(f"[bold red]Submission error:[/bold red] {submit_exc}")
+            console.print("[dim]Experiment finalized but not submitted.[/dim]")
+            return False
+
+        if not receipt.accepted:
+            console.print(
+                Panel(
+                    f"[bold]Error[/bold]: {receipt.stderr_tail}",
+                    title="[bold red]Submission Failed[/bold red]",
+                    border_style="red",
+                )
+            )
+            return False
+
+        console.print(
+            Panel(
+                f"[bold]PID[/bold]: {receipt.pid}\n"
+                f"[bold]Log[/bold]: {receipt.log_path}\n"
+                f"[bold]Host[/bold]: {receipt.remote_host}",
+                title=f"[bold green]Submitted (attempt {attempt})[/bold green]",
+                border_style="green",
+            )
+        )
+
+        # ── Monitor phase: poll for early crash ──
+        console.print(f"[dim]Monitoring for early failures ({stabilize_seconds}s)... Ctrl+C to skip.[/dim]")
+        # Build a minimal artifact for polling
+        from labit.experiments.models import (
+            ExecutionBackend,
+            FrozenLaunchSpec,
+            LaunchArtifact,
+        )
+
+        exec_profile = experiment_service.build_default_execution_profile(active_launch_exp.project)
+        poll_artifact = LaunchArtifact(
+            launch_id=receipt.remote_job_id or "",
+            task_id="experiment",
+            experiment_id=active_launch_exp.experiment_id,
+            project=active_launch_exp.project,
+            executor=ExecutionBackend.SSH,
+            remote_user=exec_profile.user,
+            remote_host=exec_profile.host,
+            remote_port=exec_profile.port,
+            ssh_key=exec_profile.ssh_key,
+            frozen_spec=FrozenLaunchSpec(
+                command=active_launch_exp.run_sh_content or "#!/bin/bash\ntrue",
+                workdir=exec_profile.workdir,
+                output_dir=f"outputs/experiments/{active_launch_exp.experiment_id}",
+                env={},
+            ),
+            submission=receipt,
+        )
+
+        elapsed = 0
+        crashed = False
+        crash_log = ""
+        try:
+            while elapsed < stabilize_seconds:
+                time.sleep(poll_interval)
+                elapsed += poll_interval
+                try:
+                    poll_result = executor.poll(poll_artifact)
+                except Exception:
+                    continue
+                status = poll_result.get("status", "unknown")
+                if status == "running":
+                    remaining = stabilize_seconds - elapsed
+                    console.print(f"[dim]  [{elapsed}s] Running... ({remaining}s to stable)[/dim]")
+                elif status == "stopped":
+                    # Process died — check if it's a crash or normal completion
+                    try:
+                        collected = executor.collect(poll_artifact)
+                    except Exception:
+                        collected = {}
+                    log_tail = str(collected.get("log_tail", poll_result.get("stdout", "")))
+                    # If stopped very early, likely a crash
+                    if elapsed <= stabilize_seconds:
+                        crashed = True
+                        crash_log = log_tail
+                        console.print(f"[bold red]  [{elapsed}s] Process stopped early![/bold red]")
+                    break
+                else:
+                    console.print(f"[dim]  [{elapsed}s] Status: {status}[/dim]")
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Monitoring skipped.[/yellow]")
+            return False
+
+        if not crashed:
+            console.print(
+                Panel(
+                    f"Experiment running for {elapsed}s without errors.",
+                    title="[bold green]Experiment Stable[/bold green]",
+                    border_style="green",
+                )
+            )
+            return True
+
+        # ── Crash detected: show error and auto-fix ──
+        console.print(
+            Panel(
+                crash_log[-2000:] if crash_log else "(no log captured)",
+                title="[bold red]Early Crash Detected[/bold red]",
+                border_style="red",
+            )
+        )
+
+        if attempt >= max_retries:
+            console.print(f"[bold red]Exhausted {max_retries} retries. Giving up.[/bold red]")
+            console.print("[dim]Use /launch-exp resume to manually fix and resubmit.[/dim]")
+            return False
+
+        # Auto-fix: have the agent revise run.sh based on the error
+        console.print(f"[dim]Auto-fixing run.sh based on error log (attempt {attempt + 1}/{max_retries})...[/dim]")
+        try:
+            hyp_detail = _hypothesis_service().load_hypothesis(
+                current_session.project, active_launch_exp.hypothesis_id
+            )
+            code_context = experiment_service.get_code_context(current_session.project)
+            tasks_json = json.dumps([t.model_dump() for t in active_launch_exp.task_plans], indent=2)
+            try:
+                workdir = exec_profile.workdir or ""
+                setup_summary = exec_profile.setup_script or ""
+            except Exception:
+                workdir = ""
+                setup_summary = ""
+
+            provider = first_participant.provider if first_participant else None
+            fix_instruction = (
+                f"The experiment crashed immediately after submission. "
+                f"Here is the error log from the remote:\n\n"
+                f"```\n{crash_log[-3000:]}\n```\n\n"
+                f"Fix the run.sh to address this error. Common issues: "
+                f"wrong paths, missing dependencies, incorrect CLI arguments, "
+                f"environment assumptions."
+            )
+
+            with console.status("[bold cyan]Agent fixing run.sh...[/bold cyan]"):
+                result = planner.revise_run_sh(
+                    current_run_sh=active_launch_exp.run_sh_content,
+                    current_config_yaml=active_launch_exp.config_yaml_content,
+                    tasks_json=tasks_json,
+                    user_instruction=fix_instruction,
+                    code_tree=code_context,
+                    workdir=workdir,
+                    setup_script_summary=setup_summary,
+                    provider=provider,
+                )
+            active_launch_exp = experiment_service.save_script(
+                active_launch_exp,
+                result["run_sh"],
+                result["config_yaml"],
+            )
+            console.print(
+                Panel(
+                    f"[bold]Fix summary[/bold]: {result['summary']}\n"
+                    f"[bold]run.sh[/bold] ({len(result['run_sh'].splitlines())} lines)",
+                    title="[bold yellow]Script Revised[/bold yellow]",
+                    border_style="yellow",
+                )
+            )
+        except Exception as fix_exc:
+            console.print(f"[bold red]Auto-fix failed:[/bold red] {fix_exc}")
+            console.print("[dim]Use /launch-exp resume to manually fix and resubmit.[/dim]")
+            return False
+
+    console.print(f"[bold red]Exhausted {max_retries} retries.[/bold red]")
+    return False
+
+
 def _print_launch_exp_hints(console: Console, session: LaunchExpSession) -> None:
     phase_label = {
         LaunchExpPhase.TASK_BREAKDOWN: "Task Breakdown",
@@ -2282,7 +2482,7 @@ def run_chat_shell(
                         continue
                     try:
                         hyp_detail = _hypothesis_service().load_hypothesis(current_session.project, active_launch_exp.hypothesis_id)
-                        code_tree = experiment_service.get_code_tree(current_session.project)
+                        code_context = experiment_service.get_code_context(current_session.project)
                         planner = ExperimentPlanner(RepoPaths.discover())
                         first_participant = current_session.participants[0] if current_session.participants else None
                         provider = first_participant.provider if first_participant else None
@@ -2299,7 +2499,7 @@ def run_chat_shell(
                                 session=active_launch_exp,
                                 hypothesis_title=hyp_detail.record.title,
                                 hypothesis_claim=hyp_detail.record.claim,
-                                code_tree=code_tree,
+                                code_tree=code_context,
                                 workdir=workdir,
                                 setup_script_summary=setup_summary,
                                 provider=provider,
@@ -2330,6 +2530,7 @@ def run_chat_shell(
                         continue
                     if active_launch_exp.phase != LaunchExpPhase.SCRIPT_GENERATION:
                         console.print("[yellow]Warning:[/yellow] Not all phases completed. Exiting anyway.")
+                    submit_ok = False
                     if active_launch_exp.run_sh_content:
                         try:
                             detail = experiment_service.finalize_experiment(active_launch_exp)
@@ -2343,41 +2544,35 @@ def run_chat_shell(
                                     border_style="green",
                                 )
                             )
-                            # Auto-submit via SSH
-                            console.print("[dim]Submitting experiment to remote...[/dim]")
+                            # Submit + monitor loop
+                            submit_ok = _submit_and_monitor(
+                                console=console,
+                                experiment_service=experiment_service,
+                                active_launch_exp=active_launch_exp,
+                                current_session=current_session,
+                                service=service,
+                                planner=ExperimentPlanner(RepoPaths.discover()),
+                                _hypothesis_service=_hypothesis_service,
+                                first_participant=current_session.participants[0] if current_session.participants else None,
+                            )
                             try:
-                                receipt = experiment_service.submit_experiment(active_launch_exp)
-                                if receipt.accepted:
-                                    console.print(
-                                        Panel(
-                                            f"[bold]PID[/bold]: {receipt.pid}\n"
-                                            f"[bold]Log[/bold]: {receipt.log_path}\n"
-                                            f"[bold]Host[/bold]: {receipt.remote_host}",
-                                            title="[bold green]Experiment Submitted[/bold green]",
-                                            border_style="green",
-                                        )
-                                    )
-                                else:
-                                    console.print(
-                                        Panel(
-                                            f"[bold]Error[/bold]: {receipt.stderr_tail}",
-                                            title="[bold red]Submission Failed[/bold red]",
-                                            border_style="red",
-                                        )
-                                    )
-                            except Exception as submit_exc:
-                                console.print(f"[bold red]Submission error:[/bold red] {submit_exc}")
-                                console.print("[dim]Experiment finalized but not submitted. You can submit manually later.[/dim]")
-                            try:
+                                summary = (
+                                    f"Experiment planned and submitted: {detail.record.experiment_id} "
+                                    f"for {active_launch_exp.hypothesis_id}"
+                                    if submit_ok
+                                    else f"Experiment planned (submission pending): {detail.record.experiment_id} "
+                                         f"for {active_launch_exp.hypothesis_id}"
+                                )
                                 service.record_session_event(
                                     session_id=current_session.session_id,
                                     kind=SessionEventKind.ARTIFACT_EXPERIMENT_CREATED,
                                     actor="labit",
-                                    summary=f"Experiment planned and submitted: {detail.record.experiment_id} for {active_launch_exp.hypothesis_id}",
+                                    summary=summary,
                                     payload={
                                         "experiment_id": detail.record.experiment_id,
                                         "hypothesis_id": active_launch_exp.hypothesis_id,
                                         "task_count": len(detail.tasks),
+                                        "submitted": submit_ok,
                                     },
                                     evidence_refs=_session_evidence_refs(current_session)
                                     + [f"hypothesis:{active_launch_exp.hypothesis_id}", f"experiment:{detail.record.experiment_id}"],
@@ -2388,7 +2583,8 @@ def run_chat_shell(
                             console.print(f"[bold red]Error finalizing:[/bold red] {exc}")
                     else:
                         console.print("[dim]No script generated. Experiment not finalized.[/dim]")
-                    active_launch_exp = None
+                    if submit_ok:
+                        active_launch_exp = None
                     continue
 
                 # ── Resume existing experiment ──
@@ -2482,10 +2678,66 @@ def run_chat_shell(
                 rows: list[str] = []
                 rows_by_experiment: dict[str, list[str]] = {}
                 executor = SSHExecutor(RepoPaths.discover())
+                seen_launch_ids: set[str] = set()
+                max_rows = 10
                 for summary in experiments:
                     detail = experiment_service.load_experiment(current_session.project, summary.experiment_id)
+
+                    if len(rows) >= max_rows:
+                        break
+
+                    # ── Scan experiment-level launches (only latest per experiment) ──
+                    has_experiment_launch = False
+                    launches_dir = experiment_service.tasks_dir(
+                        current_session.project, detail.record.experiment_id
+                    ) / "launches"
+                    if launches_dir.is_dir():
+                        # Only show the most recent launch (sorted reverse = newest first)
+                        for launch_subdir in sorted(launches_dir.iterdir(), reverse=True):
+                            launch_yaml = launch_subdir / "launch.yaml"
+                            if not launch_yaml.exists():
+                                continue
+                            try:
+                                artifact = experiment_service.load_launch_artifact(
+                                    current_session.project,
+                                    detail.record.experiment_id,
+                                    launch_subdir.name,
+                                )
+                            except Exception:
+                                continue
+                            if not artifact.submission or not artifact.submission.accepted:
+                                continue
+                            seen_launch_ids.add(artifact.launch_id)
+                            try:
+                                collected = executor.collect(artifact)
+                            except Exception:
+                                collected = {}
+                            collected_status = str(collected.get("status", "unknown")).strip() or "unknown"
+                            log_tail = str(collected.get("log_tail", ""))[:500]
+                            status_label = collected_status
+                            if collected_status == "stopped":
+                                has_output = collected.get("output_dir_exists") or collected.get("artifact_refs")
+                                status_label = "completed" if has_output else "failed"
+
+                            row = (
+                                f"- {detail.record.experiment_id}/{artifact.launch_id} · "
+                                f"{status_label}"
+                            )
+                            if log_tail:
+                                last_line = log_tail.strip().rsplit("\n", 1)[-1][:120]
+                                row += f" · {last_line}"
+                            rows.append(f"[bold]{row.split(' · ', 1)[0]}[/bold] · {row.split(' · ', 1)[1]}")
+                            rows_by_experiment.setdefault(detail.record.experiment_id, []).append(row)
+                            has_experiment_launch = True
+                            break  # only show latest launch per experiment
+
+                    # ── Scan task-level launches ──
+                    if has_experiment_launch or len(rows) >= max_rows:
+                        continue
                     for task in detail.tasks:
                         if not task.latest_launch_id:
+                            continue
+                        if task.latest_launch_id in seen_launch_ids:
                             continue
                         task_record = experiment_service.load_task(
                             current_session.project,
@@ -2550,6 +2802,8 @@ def run_chat_shell(
                         )
                         rows.append(f"[bold]{row.split(' · ', 1)[0]}[/bold] · {row.split(' · ', 1)[1]}")
                         rows_by_experiment.setdefault(detail.record.experiment_id, []).append(row)
+                        if len(rows) >= max_rows:
+                            break
 
                 console.print("[bold]Debrief[/bold]")
                 if not rows:
@@ -2793,7 +3047,7 @@ def run_chat_shell(
                 elif phase == LaunchExpPhase.SCRIPT_GENERATION:
                     # User is iterating on run.sh
                     hyp_detail = _hypothesis_service().load_hypothesis(current_session.project, active_launch_exp.hypothesis_id)
-                    code_tree = exp_service.get_code_tree(current_session.project)
+                    code_tree = exp_service.get_code_context(current_session.project)
                     tasks_json = json.dumps([t.model_dump() for t in active_launch_exp.task_plans], indent=2)
                     # Get runtime context for revision prompt
                     try:

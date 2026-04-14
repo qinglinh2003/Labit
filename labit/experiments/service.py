@@ -1019,6 +1019,83 @@ class ExperimentService:
         self._tree(code_dir, code_dir, lines, depth=0, max_depth=max_depth)
         return "\n".join(lines) if lines else "(empty code directory)"
 
+    def get_code_context(self, project: str, *, max_total_chars: int = 40_000) -> str:
+        """Return code tree + contents of key source files for script generation.
+
+        Reads .py, .sh, .yaml config files from the project's code directory,
+        prioritising entry points (main, train, run, eval, scripts/) and smaller files.
+        Truncates to *max_total_chars* so it fits in an LLM prompt.
+        """
+        resolved = self._require_project(project)
+        code_dir = self.paths.vault_projects_dir / resolved / "code"
+        if not code_dir.exists():
+            return "(no code directory found)"
+
+        # 1) Tree listing (always included)
+        tree_lines: list[str] = []
+        self._tree(code_dir, code_dir, tree_lines, depth=0, max_depth=4)
+        tree_text = "\n".join(tree_lines) or "(empty)"
+
+        # 2) Collect candidate source files
+        EXTENSIONS = {".py", ".sh", ".bash", ".yaml", ".yml", ".toml", ".cfg", ".json"}
+        SKIP_DIRS = {"__pycache__", ".git", "node_modules", ".venv", "venv", "wandb", "outputs", "checkpoints"}
+        candidates: list[tuple[int, Path]] = []  # (priority, path)
+
+        for f in code_dir.rglob("*"):
+            if not f.is_file():
+                continue
+            if f.suffix not in EXTENSIONS:
+                continue
+            if any(part in SKIP_DIRS for part in f.parts):
+                continue
+            try:
+                size = f.stat().st_size
+            except OSError:
+                continue
+            if size > 100_000 or size == 0:  # skip huge / empty
+                continue
+            # Priority: lower = more important
+            name_lower = f.stem.lower()
+            rel_str = str(f.relative_to(code_dir)).lower()
+            priority = 50
+            if any(kw in name_lower for kw in ("main", "train", "run", "eval", "test", "extract")):
+                priority = 10
+            elif "script" in rel_str or "bin/" in rel_str:
+                priority = 15
+            elif name_lower in ("config", "setup", "pyproject"):
+                priority = 20
+            elif f.suffix == ".sh":
+                priority = 25
+            candidates.append((priority, f))
+
+        candidates.sort(key=lambda x: (x[0], x[1].stat().st_size))
+
+        # 3) Read files until budget
+        parts = [f"## Code tree\n```\n{tree_text}\n```\n"]
+        budget = max_total_chars - len(parts[0])
+
+        for _prio, fpath in candidates:
+            if budget <= 0:
+                break
+            rel = fpath.relative_to(code_dir)
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            header = f"\n## {rel}\n```{fpath.suffix.lstrip('.')}\n"
+            footer = "\n```\n"
+            overhead = len(header) + len(footer)
+            if overhead >= budget:
+                break
+            available = budget - overhead
+            if len(content) > available:
+                content = content[:available] + "\n... (truncated)"
+            chunk = header + content + footer
+            parts.append(chunk)
+            budget -= len(chunk)
+
+        return "".join(parts)
+
     def _tree(self, base: Path, current: Path, lines: list[str], depth: int, max_depth: int) -> None:
         if depth >= max_depth:
             return
