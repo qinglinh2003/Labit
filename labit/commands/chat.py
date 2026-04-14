@@ -115,6 +115,13 @@ _CHAT_SHELL_COMMANDS = (
     "/note",
     "/todo",
     "/doc",
+    "/doc auto",
+    "/doc start",
+    "/doc open",
+    "/doc done",
+    "/doc status",
+    "/doc publish",
+    "/doc list",
     "/hypothesis",
     "/launch-exp",
     "/swap",
@@ -690,6 +697,7 @@ def _print_doc_mode_hints(console: Console, session) -> None:
         "[dim]──── Document Mode ────[/dim]",
         "[dim]  Type feedback to revise the document (agent writes to file, not chat).[/dim]",
         "[dim]  /doc status   — show current document info[/dim]",
+        "[dim]  /doc auto [N] — auto-iterate N rounds (default 5, max 10); Ctrl+C to stop[/dim]",
         "[dim]  /doc done     — leave document mode (status unchanged)[/dim]",
         "[dim]  /doc publish   — mark document as active (usable after /doc done)[/dim]",
         "[dim]  Ctrl+C        — interrupt current revision[/dim]",
@@ -1518,8 +1526,139 @@ def run_chat_shell(
                     )
                     _print_doc_mode_hints(console, current_session)
                     continue
+                if doc_action == "auto":
+                    if active_doc is None:
+                        console.print("[bold red]Error:[/bold red] No active document. Use /doc start or /doc open first.")
+                        continue
+                    # Parse round count
+                    max_rounds = 5
+                    if doc_argument.strip():
+                        try:
+                            max_rounds = int(doc_argument.strip())
+                        except ValueError:
+                            console.print("[bold red]Usage:[/bold red] /doc auto [N]  (N = number of rounds, default 5, max 10)")
+                            continue
+                    max_rounds = min(max(max_rounds, 1), 10)
+
+                    doc_service = _document_service()
+                    drafter = _doc_drafter()
+                    author = current_session.participants[0]
+                    reviewer = (
+                        current_session.participants[1]
+                        if current_session.mode == ChatMode.ROUND_ROBIN and len(current_session.participants) >= 2
+                        else None
+                    )
+
+                    console.print(f"[bold yellow]Auto-iteration starting: up to {max_rounds} rounds. Ctrl+C to stop.[/bold yellow]")
+                    # Initial instruction for first round: use reviewer's last review or generic
+                    auto_instruction = "Review the document and improve it. Fix any issues, improve clarity, and strengthen the content."
+
+                    interrupted = False
+                    for round_num in range(1, max_rounds + 1):
+                        console.print(f"\n[bold]── Round {round_num}/{max_rounds} ──[/bold]")
+                        try:
+                            old_markdown = doc_service.read_document(active_doc)
+
+                            # Author revises
+                            with console.status(f"[bold blue]{author.name} revising (round {round_num})...[/bold blue]"):
+                                update = drafter.revise_document(
+                                    session=current_session,
+                                    transcript=service.transcript(current_session.session_id),
+                                    context_snapshot=service.context_snapshot(current_session.session_id),
+                                    doc_title=active_doc.title,
+                                    current_markdown=old_markdown,
+                                    user_instruction=auto_instruction,
+                                    interaction_log=doc_service.interaction_excerpt(active_doc),
+                                    author_name=author.name,
+                                    provider=author.provider,
+                                )
+                                active_doc = doc_service.revise_document(
+                                    doc_session=active_doc,
+                                    update=update,
+                                    user_instruction=auto_instruction,
+                                )
+                            console.print(
+                                Panel(
+                                    f"[bold]Iteration[/bold]: {active_doc.iteration}\n[bold]Summary[/bold]: {update.summary}",
+                                    title=f"[bold green]{author.name} · Round {round_num}[/bold green]",
+                                    border_style="green",
+                                )
+                            )
+
+                            # Reviewer reviews (round-robin) or self-review (single)
+                            if reviewer is not None:
+                                from labit.documents.drafter import compute_changed_sections
+
+                                new_markdown = doc_service.read_document(active_doc)
+                                changed_sections = compute_changed_sections(old_markdown, new_markdown)
+
+                                with console.status(f"[bold cyan]{reviewer.name} reviewing (round {round_num})...[/bold cyan]"):
+                                    review_update = drafter.review_document(
+                                        current_markdown=new_markdown,
+                                        revision_summary=update.summary,
+                                        user_instruction=auto_instruction,
+                                        reviewer_name=reviewer.name,
+                                        changed_sections=changed_sections,
+                                        provider=reviewer.provider,
+                                    )
+                                    active_doc = doc_service.record_review(
+                                        doc_session=active_doc,
+                                        update=review_update,
+                                        reviewer_name=reviewer.name,
+                                    )
+                                console.print(
+                                    Panel(
+                                        f"[bold]Review[/bold]: {review_update.summary}",
+                                        title=f"[bold cyan]{reviewer.name} · Review[/bold cyan]",
+                                        border_style="cyan",
+                                    )
+                                )
+                                # Use reviewer feedback as next round's instruction
+                                auto_instruction = review_update.summary
+                            else:
+                                # Single agent: use own revision summary as next instruction
+                                auto_instruction = f"Continue improving. Previous changes: {update.summary}"
+
+                            # Convergence check: all review blocks closed + no new open reviews
+                            from labit.documents.drafter import count_open_reviews
+
+                            current_md = doc_service.read_document(active_doc)
+                            open_count = count_open_reviews(current_md)
+                            if open_count == 0:
+                                console.print(f"[bold green]Converged at round {round_num} — all review blocks resolved, no open issues remaining.[/bold green]")
+                                break
+                            else:
+                                console.print(f"[dim]  {open_count} open review(s) remaining[/dim]")
+
+                        except KeyboardInterrupt:
+                            console.print(f"\n[bold yellow]Auto-iteration interrupted at round {round_num}.[/bold yellow]")
+                            interrupted = True
+                            break
+                        except Exception as exc:
+                            console.print(f"[bold red]Error in round {round_num}:[/bold red] {exc}")
+                            break
+
+                    if not interrupted:
+                        console.print(f"[bold green]Auto-iteration complete. {active_doc.iteration} total iterations.[/bold green]")
+                    _print_doc_mode_hints(console, current_session)
+                    try:
+                        service.record_session_event(
+                            session_id=current_session.session_id,
+                            kind=SessionEventKind.ARTIFACT_DOCUMENT_UPDATED,
+                            actor="labit",
+                            summary=f"Document auto-iterated: {active_doc.title}",
+                            payload={
+                                "doc_id": active_doc.doc_id,
+                                "title": active_doc.title,
+                                "iteration": active_doc.iteration,
+                            },
+                            evidence_refs=_session_evidence_refs(current_session) + [f"document:{active_doc.document_path}"],
+                        )
+                    except Exception:
+                        pass
+                    continue
                 if doc_action != "start":
-                    console.print("[bold red]Usage:[/bold red] /doc start <title> | /doc open <id> | /doc status | /doc done | /doc publish <id> | /doc list")
+                    console.print("[bold red]Usage:[/bold red] /doc start <title> | /doc open <id> | /doc auto [N] | /doc status | /doc done | /doc publish <id> | /doc list")
                     continue
                 title = doc_argument
                 if not title:

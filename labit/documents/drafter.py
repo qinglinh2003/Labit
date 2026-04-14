@@ -21,6 +21,15 @@ def _excerpt(text: str, max_chars: int = 200) -> str:
     return text[:max_chars - 1] + "…"
 
 
+_REVIEW_OPEN_RE = re.compile(r"<!--\s*review:\w+:\w+:open\s*-->")
+_REVIEW_CLOSED_RE = re.compile(r"<!--\s*review:\w+:\w+:closed\s*-->")
+
+
+def count_open_reviews(markdown: str) -> int:
+    """Count the number of open review blocks in a document."""
+    return len(_REVIEW_OPEN_RE.findall(markdown))
+
+
 def compute_changed_sections(old_md: str, new_md: str) -> list[dict[str, str]]:
     """Compare two markdown docs section-by-section, return list of changed sections.
 
