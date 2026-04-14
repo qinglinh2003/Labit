@@ -92,7 +92,7 @@ def list_hypotheses(
 
 @hypothesis_app.command("show", help="Show one hypothesis from the active project.")
 def show_hypothesis(
-    hypothesis_id: str = typer.Argument(..., help="Hypothesis id, for example h001."),
+    hypothesis_id: str = typer.Argument(..., help="Hypothesis id, for example h-1a2b3c4d."),
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
     project = _require_active_project(as_json=json_output)

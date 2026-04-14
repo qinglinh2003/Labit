@@ -89,7 +89,7 @@ def list_experiments(
 
 @experiment_app.command("show", help="Show one experiment from the active project.")
 def show_experiment(
-    experiment_id: str = typer.Argument(..., help="Experiment id, for example e001."),
+    experiment_id: str = typer.Argument(..., help="Experiment id, for example e-1a2b3c4d."),
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
     project = _require_active_project(as_json=json_output)

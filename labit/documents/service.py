@@ -357,7 +357,11 @@ class DocumentService:
             if meta:
                 meta["file"] = str(md_file.relative_to(self.paths.root))
                 docs.append(meta)
-        return docs
+        return sorted(
+            docs,
+            key=lambda item: (item.get("updated_at", ""), item.get("doc_id", "")),
+            reverse=True,
+        )
 
     # ── Internal ────────────────────────────────────────────
 
@@ -385,20 +389,21 @@ class DocumentService:
         return candidate
 
     def _next_doc_id(self, project: str) -> str:
-        """Scan existing documents and return next available doc_id (d01, d02, ...)."""
-        designs_dir = self._designs_dir(project)
-        if not designs_dir.exists():
-            return "d01"
-        max_num = 0
-        for md_file in designs_dir.glob("*.md"):
-            meta = self._read_frontmatter(md_file)
-            if meta and "doc_id" in meta:
-                try:
-                    num = int(meta["doc_id"].lstrip("d"))
-                    max_num = max(max_num, num)
-                except (ValueError, AttributeError):
-                    pass
-        return f"d{max_num + 1:02d}"
+        """Generate a globally unique doc_id (d-<8hex>)."""
+        from labit.utils.ids import generate_unique_id
+
+        return generate_unique_id("d", self._doc_id_exists_anywhere)
+
+    def _doc_id_exists_anywhere(self, doc_id: str) -> bool:
+        for project_name in self.project_service.list_project_names():
+            designs_dir = self._designs_dir(project_name)
+            if not designs_dir.exists():
+                continue
+            for md_file in designs_dir.glob("*.md"):
+                meta = self._read_frontmatter(md_file)
+                if meta and meta.get("doc_id") == doc_id:
+                    return True
+        return False
 
     def _find_document(self, project: str, doc_id: str) -> tuple[Path | None, dict[str, Any] | None]:
         """Find a document by doc_id in a project."""

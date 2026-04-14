@@ -72,7 +72,7 @@ class HypothesisService:
 
         return sorted(
             summaries_by_id.values(),
-            key=lambda item: self._hypothesis_sort_key(item.hypothesis_id),
+            key=lambda item: (item.updated_at, item.hypothesis_id),
             reverse=True,
         )
 
@@ -89,16 +89,20 @@ class HypothesisService:
         raise FileNotFoundError(f"Hypothesis '{hypothesis_id}' not found in project '{resolved}'.")
 
     def next_hypothesis_id(self, project: str) -> str:
-        resolved = self._require_project(project)
-        hypotheses_dir = self.hypotheses_dir(resolved)
-        highest = 0
-        if hypotheses_dir.exists():
-            for path in hypotheses_dir.iterdir():
-                match = re.fullmatch(r"h(\d+)(?:\.yaml)?", path.name)
-                if not match:
-                    continue
-                highest = max(highest, int(match.group(1)))
-        return f"h{highest + 1:03d}"
+        self._require_project(project)
+        from labit.utils.ids import generate_unique_id
+
+        return generate_unique_id("h", self._hypothesis_id_exists_anywhere)
+
+    def _hypothesis_id_exists_anywhere(self, hypothesis_id: str) -> bool:
+        for project_name in self.project_service.list_project_names():
+            hypotheses_dir = self.hypotheses_dir(project_name)
+            if (hypotheses_dir / hypothesis_id).exists():
+                return True
+            legacy_path = hypotheses_dir / f"{hypothesis_id}.yaml"
+            if legacy_path.exists():
+                return True
+        return False
 
     def create_hypothesis(
         self,

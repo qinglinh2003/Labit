@@ -83,7 +83,7 @@ class ExperimentService:
                     path=detail.path,
                 )
             )
-        return sorted(summaries, key=lambda item: self._experiment_sort_key(item.experiment_id), reverse=True)
+        return sorted(summaries, key=lambda item: (item.updated_at, item.experiment_id), reverse=True)
 
     def load_experiment(self, project: str, experiment_id: str) -> ExperimentDetail:
         resolved = self._require_project(project)
@@ -93,16 +93,17 @@ class ExperimentService:
         return self._load_detail(experiment_dir)
 
     def next_experiment_id(self, project: str) -> str:
-        resolved = self._require_project(project)
-        experiments_dir = self.experiments_dir(resolved)
-        highest = 0
-        if experiments_dir.exists():
-            for path in experiments_dir.iterdir():
-                match = re.fullmatch(r"e(\d+)", path.name)
-                if not match:
-                    continue
-                highest = max(highest, int(match.group(1)))
-        return f"e{highest + 1:03d}"
+        self._require_project(project)
+        from labit.utils.ids import generate_unique_id
+
+        return generate_unique_id("e", self._experiment_id_exists_anywhere)
+
+    def _experiment_id_exists_anywhere(self, experiment_id: str) -> bool:
+        for project_name in self.project_service.list_project_names():
+            experiments_dir = self.experiments_dir(project_name)
+            if (experiments_dir / experiment_id).exists():
+                return True
+        return False
 
     def next_task_id(self, project: str, experiment_id: str) -> str:
         resolved = self._require_project(project)
