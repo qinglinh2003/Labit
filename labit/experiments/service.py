@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import subprocess
 from collections.abc import Iterable
 from pathlib import Path
@@ -970,7 +971,11 @@ class ExperimentService:
         self._refresh_index(resolved)
         return self.load_experiment(resolved, experiment_id)
 
-    def submit_experiment(self, session: LaunchExpSession) -> SubmissionReceipt:
+    def submit_experiment(
+        self,
+        session: LaunchExpSession,
+        env_overrides: dict[str, str] | None = None,
+    ) -> SubmissionReceipt:
         """Submit the experiment-level run.sh via SSH."""
         from labit.experiments.executors.ssh import SSHExecutor
 
@@ -999,11 +1004,12 @@ class ExperimentService:
         # Wrap the experiment's run.sh with the compute profile's setup
         # script so that venv, git pull, and cd workdir happen first.
         raw_command = run_sh_path.read_text(encoding="utf-8")
+        launch_env = {str(k): str(v) for k, v in (env_overrides or {}).items() if str(v).strip()}
         frozen_spec = FrozenLaunchSpec(
             command=raw_command,
             workdir=execution.workdir,
             output_dir=f"outputs/experiments/{experiment_id}",
-            env={},
+            env=launch_env,
         )
         wrapped_run_sh = self._render_run_sh(frozen_spec, execution)
         wrapped_path = launch_dir / "run.sh"
@@ -1347,8 +1353,7 @@ class ExperimentService:
         lines = ["#!/usr/bin/env bash", "set -euo pipefail"]
         lines.extend(self._render_runtime_preamble(execution))
         for key, value in spec.env.items():
-            escaped = value.replace('"', '\\"')
-            lines.append(f'export {key}="{escaped}"')
+            lines.append(f"export {key}={shlex.quote(value)}")
         lines.append(spec.command)
         return "\n".join(lines).rstrip() + "\n"
 

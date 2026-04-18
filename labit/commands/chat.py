@@ -4,6 +4,7 @@ import json
 import re
 import threading
 import time
+from datetime import datetime
 
 import typer
 from rich.console import Console, Group, RenderableType
@@ -54,6 +55,7 @@ from labit.services.project_service import ProjectService
 
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 
 chat_app = typer.Typer(
     help="Shared free conversation sessions with one or more agent backends.",
@@ -135,6 +137,7 @@ _CHAT_SHELL_COMMANDS = (
     "/launch-exp approve-task",
     "/launch-exp reopen-task",
     "/launch-exp generate-script",
+    "/launch-exp run-task",
     "/launch-exp status",
     "/launch-exp done",
     "/debrief",
@@ -144,6 +147,7 @@ _CHAT_SHELL_COMMANDS = (
     "/dev status",
     "/dev continue",
     "/dev stop",
+    "/dev finish",
     "/new",
     "/switch",
     "/exit",
@@ -638,13 +642,15 @@ def _shell_help() -> None:
     table.add_row("/launch-exp approve-task <id>", "Approve a specific task's detailed plan.")
     table.add_row("/launch-exp reopen-task <id>", "Reopen a previously approved task for re-planning.")
     table.add_row("/launch-exp generate-script", "Generate run.sh from approved task plans.")
+    table.add_row("/launch-exp run-task <id>", "Submit only one task from the run.sh, reusing earlier outputs.")
     table.add_row("/launch-exp status", "Show current experiment planning status.")
     table.add_row("/launch-exp done", "Finalize the experiment and exit planning mode.")
     table.add_row("/debrief", "Inspect active experiment launches and show their latest runtime state.")
     table.add_row("/review-results <hypothesis_id>", "Summarize experiments linked to a hypothesis, suggest a resolution, and optionally write the decision back.")
-    table.add_row("/dev start <task>", "Start autonomous dual-agent dev loop (writer+reviewer auto-iterate).")
+    table.add_row("/dev start <task>", "Start autonomous dev loop in an isolated worktree (writer+reviewer auto-iterate).")
     table.add_row("/dev status", "Show current dev loop status.")
     table.add_row("/dev continue", "Resume dev loop after a decision point.")
+    table.add_row("/dev finish", "Merge, keep, or discard the dev worktree branch.")
     table.add_row("/dev stop", "Stop the current dev loop.")
     table.add_row("/exit", "Leave the chat shell.")
     console.print(Panel(table, title="LABIT Chat Commands", border_style=_COMMAND_COLOR))
@@ -739,6 +745,7 @@ def _submit_and_monitor(
     max_retries: int = 3,
     stabilize_seconds: int = 90,
     poll_interval: int = 15,
+    env_overrides: dict[str, str] | None = None,
 ) -> bool:
     """Submit experiment, monitor for early failures, auto-fix and resubmit.
 
@@ -750,12 +757,13 @@ def _submit_and_monitor(
 
     executor = SSHExecutor(RepoPaths.discover())
     attempt = 0
+    launch_env = {str(k): str(v) for k, v in (env_overrides or {}).items() if str(v).strip()}
 
     while attempt < max_retries:
         attempt += 1
         console.print(f"[dim]Submitting experiment (attempt {attempt}/{max_retries})...[/dim]")
         try:
-            receipt = experiment_service.submit_experiment(active_launch_exp)
+            receipt = experiment_service.submit_experiment(active_launch_exp, env_overrides=launch_env)
         except Exception as submit_exc:
             console.print(f"[bold red]Submission error:[/bold red] {submit_exc}")
             console.print("[dim]Experiment finalized but not submitted.[/dim]")
@@ -775,7 +783,8 @@ def _submit_and_monitor(
             Panel(
                 f"[bold]PID[/bold]: {receipt.pid}\n"
                 f"[bold]Log[/bold]: {receipt.log_path}\n"
-                f"[bold]Host[/bold]: {receipt.remote_host}",
+                f"[bold]Host[/bold]: {receipt.remote_host}"
+                + ("" if not launch_env else "\n[bold]Env[/bold]: " + ", ".join(f"{k}={v}" for k, v in launch_env.items())),
                 title=f"[bold green]Submitted (attempt {attempt})[/bold green]",
                 border_style="green",
             )
@@ -805,7 +814,7 @@ def _submit_and_monitor(
                 command=active_launch_exp.run_sh_content or "#!/bin/bash\ntrue",
                 workdir=exec_profile.workdir,
                 output_dir=f"outputs/experiments/{active_launch_exp.experiment_id}",
-                env={},
+                env=launch_env,
             ),
             submission=receipt,
         )
@@ -892,6 +901,14 @@ def _submit_and_monitor(
                 f"wrong paths, missing dependencies, incorrect CLI arguments, "
                 f"environment assumptions."
             )
+            if launch_env:
+                fix_instruction += (
+                    "\n\nThis launch is a task-level retry with environment overrides: "
+                    + ", ".join(f"{k}={v}" for k, v in launch_env.items())
+                    + ". Preserve the LABIT_ONLY_TASK/LABIT_START_AT/LABIT_FORCE_TASK/"
+                    "LABIT_FORCE_CLEAN resume contract, should_run_task(), and "
+                    "require_checkpoint() while fixing the crash."
+                )
 
             with console.status("[bold cyan]Agent fixing run.sh...[/bold cyan]"):
                 result = planner.revise_run_sh(
@@ -909,6 +926,14 @@ def _submit_and_monitor(
                 result["run_sh"],
                 result["config_yaml"],
             )
+            if launch_env:
+                resume_issues = _run_sh_resume_contract_issues(active_launch_exp.run_sh_content)
+                if resume_issues:
+                    console.print(
+                        "[bold red]Auto-fix removed or failed to preserve task-level resume controls.[/bold red]\n"
+                        f"[dim]Issues: {', '.join(resume_issues)}[/dim]"
+                    )
+                    return False
             console.print(
                 Panel(
                     f"[bold]Fix summary[/bold]: {result['summary']}\n"
@@ -924,6 +949,52 @@ def _submit_and_monitor(
 
     console.print(f"[bold red]Exhausted {max_retries} retries.[/bold red]")
     return False
+
+
+def _run_sh_has_task_resume_contract(run_sh: str) -> bool:
+    return not _run_sh_resume_contract_issues(run_sh)
+
+
+def _run_sh_resume_contract_issues(run_sh: str) -> list[str]:
+    """Return missing pieces of the task-level resume contract.
+
+    This is intentionally heuristic: run.sh is arbitrary bash, but checking for
+    helpers in addition to env var names catches scripts that merely mention the
+    contract in comments without implementing it.
+    """
+    issues: list[str] = []
+    required_markers = (
+        "LABIT_ONLY_TASK",
+        "LABIT_START_AT",
+        "LABIT_FORCE_TASK",
+        "LABIT_FORCE_CLEAN",
+    )
+    for marker in required_markers:
+        if marker not in run_sh:
+            issues.append(f"missing {marker}")
+    if not re.search(r"(\bshould_run_task\s*\(\s*\)|\bfunction\s+should_run_task\b)", run_sh):
+        issues.append("missing should_run_task() helper")
+    if not re.search(r"(\brequire_checkpoint\s*\(\s*\)|\bfunction\s+require_checkpoint\b)", run_sh):
+        issues.append("missing require_checkpoint() helper")
+    destructive_lines: list[str] = []
+    lines = run_sh.splitlines()
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not re.search(r"\brm\s+(-[rfRF]+\s+)+", stripped) or stripped.startswith("#"):
+            continue
+        guard_context = "\n".join(
+            context_line
+            for context_line in lines[max(0, idx - 4): idx + 1]
+            if not context_line.strip().startswith("#")
+        )
+        if "LABIT_FORCE_CLEAN" not in guard_context:
+            destructive_lines.append(stripped)
+    if destructive_lines:
+        issues.append(
+            "contains cleanup not visibly guarded by LABIT_FORCE_CLEAN: "
+            + destructive_lines[0][:120]
+        )
+    return issues
 
 
 def _print_launch_exp_hints(console: Console, session: LaunchExpSession) -> None:
@@ -947,6 +1018,7 @@ def _print_launch_exp_hints(console: Console, session: LaunchExpSession) -> None
     elif session.phase == LaunchExpPhase.SCRIPT_GENERATION:
         lines.append("[dim]  /launch-exp generate-script  — generate run.sh[/dim]")
         if session.run_sh_content:
+            lines.append("[dim]  /launch-exp run-task <id>    — submit only one task, reusing prior outputs[/dim]")
             lines.append("[dim]  /launch-exp done              — finalize and exit planning mode[/dim]")
         else:
             lines.append("[dim]  Generate script first, then /launch-exp done to finalize.[/dim]")
@@ -1405,6 +1477,7 @@ def _run_streaming_turn(
     force_deep_context: bool = False,
     reasoning_effort: str | None = None,
     skip_participants: set[str] | None = None,
+    cwd_override: str | None = None,
 ) -> object | None:
     _render_user_shell_message(query, attachments=attachments)
     # Temporarily filter out muted participants for this turn
@@ -1494,6 +1567,7 @@ def _run_streaming_turn(
                 on_reply_complete=_on_reply_complete,
                 cancel_event=cancel_event,
                 skip_participants=skip_participants,
+                cwd_override=cwd_override,
             )
         except KeyboardInterrupt:
             cancel_event.set()
@@ -1560,7 +1634,12 @@ class DevLoopSession:
     status: str = "active"  # active|waiting_decision|completed|stopped
     scope_label: str = ""
     scope_pathspecs: list[str] = field(default_factory=list)
+    scope_git_root: str = ""  # git root for the dev scope (may differ from RepoPaths.root for nested repos)
+    branch_repo_root: str = ""  # repo that owns dev_branch and worktree metadata
+    worktree_path: str = ""  # isolated worktree used by this dev loop, if any
     initial_dirty_files: list[str] = field(default_factory=list)
+    dev_branch: str = ""  # branch created for this dev loop
+    original_branch: str = ""  # branch to return to after dev loop
 
 
 def _parse_dev_decision(text: str) -> DevDecision | None:
@@ -1646,15 +1725,25 @@ def _git_output(*args: str, cwd: Path, timeout: int = 10) -> str:
     return result.stdout.strip()
 
 
-def _resolve_dev_scope(session) -> tuple[str, list[str]]:
-    """Choose the git scope that /dev should review."""
+def _resolve_dev_scope(session) -> tuple[str, list[str], Path]:
+    """Choose the git scope that /dev should review.
+
+    Returns (label, pathspecs, git_root).
+    git_root may point to a nested repo (e.g. vault/projects/X/code/.git)
+    rather than the outer Research-OS repo.
+    """
     paths = RepoPaths.discover()
     project = session.project or ""
     if not project:
-        return ("repository", ["."])
+        return ("repository", ["."], paths.root)
 
     project_dir = paths.vault_projects_dir / project
     if project_dir.exists():
+        # Check for nested git repo in project code dir
+        code_dir = project_dir / "code"
+        if code_dir.exists() and (code_dir / ".git").exists():
+            return (f"project code ({project})", ["."], code_dir)
+
         try:
             spec = ProjectService(paths).load_project(project)
         except Exception:
@@ -1662,19 +1751,23 @@ def _resolve_dev_scope(session) -> tuple[str, list[str]]:
         repo_root_remote = _normalize_git_remote(_git_output("git", "config", "--get", "remote.origin.url", cwd=paths.root))
         spec_remote = _normalize_git_remote(spec.repo) if spec and spec.repo else ""
         if spec_remote and repo_root_remote and spec_remote == repo_root_remote:
-            return (f"repository ({paths.root.name})", ["."])
-        return (f"project ({project})", [str(project_dir)])
-    return ("repository", ["."])
+            return (f"repository ({paths.root.name})", ["."], paths.root)
+        try:
+            project_pathspec = str(project_dir.relative_to(paths.root))
+        except ValueError:
+            project_pathspec = str(project_dir)
+        return (f"project ({project})", [project_pathspec], paths.root)
+    return ("repository", ["."], paths.root)
 
 
-def _list_scope_dirty_files(pathspecs: list[str]) -> list[str]:
-    paths = RepoPaths.discover()
+def _list_scope_dirty_files(pathspecs: list[str], git_root: Path | None = None) -> list[str]:
+    cwd = str(git_root) if git_root else str(RepoPaths.discover().root)
     try:
         result = subprocess.run(
             ["git", "status", "--porcelain", "--", *pathspecs],
             capture_output=True,
             text=True,
-            cwd=str(paths.root),
+            cwd=cwd,
             timeout=10,
         )
     except Exception:
@@ -1691,13 +1784,119 @@ def _list_scope_dirty_files(pathspecs: list[str]) -> list[str]:
     return dirty
 
 
-def _get_scope_diff(pathspecs: list[str]) -> str:
-    """Get git diff for the selected /dev scope."""
+def _create_dev_branch(task: str, git_root: Path | None = None) -> tuple[str, str]:
+    """Create a dev branch and return (branch_name, original_branch)."""
+    cwd = git_root or RepoPaths.discover().root
+    original = _git_output("git", "rev-parse", "--abbrev-ref", "HEAD", cwd=cwd) or "main"
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", task.lower())[:40].strip("-")
+    timestamp = datetime.now().strftime("%m%d-%H%M")
+    branch_name = f"labit-dev/{slug}-{timestamp}"
+    subprocess.run(
+        ["git", "checkout", "-b", branch_name],
+        capture_output=True, text=True, cwd=str(cwd),
+    )
+    return branch_name, original
+
+
+def _create_dev_worktree(
+    *,
+    task: str,
+    git_root: Path,
+    project: str | None,
+) -> tuple[str, str, Path]:
+    """Create an isolated git worktree for a /dev run.
+
+    Returns (branch_name, original_branch, worktree_path). The original checkout is
+    not switched; writer/reviewer turns run inside the returned worktree path.
+    """
     paths = RepoPaths.discover()
+    original = _git_output("git", "rev-parse", "--abbrev-ref", "HEAD", cwd=git_root) or "main"
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", task.lower())[:40].strip("-") or "task"
+    timestamp = datetime.now().strftime("%m%d-%H%M%S")
+    branch_name = f"labit-dev/{slug}-{timestamp}"
+    project_slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", project or git_root.name).strip("-") or "repo"
+    worktree_path = paths.root / ".labit" / "dev-worktrees" / project_slug / f"{slug}-{timestamp}"
+    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+
+    result = subprocess.run(
+        ["git", "worktree", "add", "-b", branch_name, str(worktree_path), "HEAD"],
+        capture_output=True,
+        text=True,
+        cwd=str(git_root),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "git worktree add failed")
+    return branch_name, original, worktree_path
+
+
+def _remove_dev_worktree(repo_root: Path, worktree_path: Path) -> tuple[bool, str]:
+    """Remove a /dev worktree. Returns (ok, message)."""
+    if not str(worktree_path):
+        return True, ""
+    result = subprocess.run(
+        ["git", "worktree", "remove", "--force", str(worktree_path)],
+        capture_output=True,
+        text=True,
+        cwd=str(repo_root),
+    )
+    subprocess.run(
+        ["git", "worktree", "prune"],
+        capture_output=True,
+        text=True,
+        cwd=str(repo_root),
+    )
+    if result.returncode != 0:
+        return False, result.stderr.strip() or result.stdout.strip()
+    return True, ""
+
+
+def _dev_auto_commit(round_num: int, pathspecs: list[str], task: str, git_root: Path | None = None) -> str | None:
+    """Stage and commit changes from a dev round. Returns commit hash or None."""
+    cwd = git_root or RepoPaths.discover().root
+    # Stage changes in scope
+    subprocess.run(
+        ["git", "add", "--", *pathspecs],
+        capture_output=True, text=True, cwd=str(cwd),
+    )
+    # Check if there's anything to commit
+    status = _git_output("git", "diff", "--cached", "--stat", cwd=cwd)
+    if not status:
+        return None
+    msg = f"dev(round {round_num}): {task[:60]}"
+    result = subprocess.run(
+        ["git", "commit", "-m", msg, "--no-verify"],
+        capture_output=True, text=True, cwd=str(cwd),
+    )
+    if result.returncode != 0:
+        return None
+    return _git_output("git", "rev-parse", "--short", "HEAD", cwd=cwd)
+
+
+def _get_last_commit_diff(git_root: Path | None = None) -> str:
+    """Get the diff of the most recent commit (for reviewer to review per-round changes)."""
+    cwd = git_root or RepoPaths.discover().root
     try:
-        stat = _git_output("git", "diff", "--stat", "--", *pathspecs, cwd=paths.root)
-        diff = _git_output("git", "diff", "--", *pathspecs, cwd=paths.root)
-        untracked = _git_output("git", "status", "--porcelain", "--", *pathspecs, cwd=paths.root)
+        diff = _git_output("git", "diff", "HEAD~1..HEAD", cwd=cwd)
+        stat = _git_output("git", "diff", "--stat", "HEAD~1..HEAD", cwd=cwd)
+    except Exception:
+        return "(unable to get commit diff)"
+    parts = []
+    if stat:
+        parts.append(f"Diff stat:\n{stat}")
+    if diff:
+        if len(diff) > 8000:
+            diff = diff[:8000] + "\n... (truncated)"
+        parts.append(f"Full diff:\n{diff}")
+    return "\n\n".join(parts) if parts else "(no changes in last commit)"
+
+
+def _get_scope_diff(pathspecs: list[str], git_root: Path | None = None) -> str:
+    """Get git diff for the selected /dev scope."""
+    cwd = git_root or RepoPaths.discover().root
+    try:
+        stat = _git_output("git", "diff", "--stat", "--", *pathspecs, cwd=cwd)
+        diff = _git_output("git", "diff", "--", *pathspecs, cwd=cwd)
+        untracked = _git_output("git", "status", "--porcelain", "--", *pathspecs, cwd=cwd)
     except Exception:
         return "(unable to get diff)"
     parts = []
@@ -1751,6 +1950,8 @@ def _run_dev_loop(
     project = session.project
     scope_label = dev_session.scope_label or "repository"
     scope_pathspecs = dev_session.scope_pathspecs or ["."]
+    scope_git_root = Path(dev_session.scope_git_root) if dev_session.scope_git_root else RepoPaths.discover().root
+    turn_cwd = str(scope_git_root)
 
     for round_num in range(dev_session.current_round + 1, dev_session.max_rounds + 1):
         dev_session.current_round = round_num
@@ -1762,6 +1963,12 @@ def _run_dev_loop(
         writer_query_parts = [f"[Dev Loop — Round {round_num}/{dev_session.max_rounds}]"]
         writer_query_parts.append(f"Task: {dev_session.task}")
         writer_query_parts.append(f"Scope: {scope_label}")
+        writer_query_parts.append(f"Editable workspace: {turn_cwd}")
+        if dev_session.worktree_path:
+            writer_query_parts.append(
+                "This /dev loop is running in an isolated git worktree. "
+                "Use the editable workspace path above, not the original checkout, for all file edits and commands."
+            )
 
         # Include decision answer if pending
         if dev_session.user_decision:
@@ -1795,6 +2002,7 @@ def _run_dev_loop(
                 session=session,
                 query=writer_query,
                 skip_participants=skip_for_writer,
+                cwd_override=turn_cwd,
             )
         except KeyboardInterrupt:
             console.print(f"\n[bold yellow]Dev loop interrupted at round {round_num} (writer phase).[/bold yellow]")
@@ -1808,10 +2016,15 @@ def _run_dev_loop(
 
         writer_text = writer_result.replies[0].message.content
         dev_round.writer_summary = writer_text[:500]
-        changed_files = _list_scope_dirty_files(scope_pathspecs)
+        changed_files = _list_scope_dirty_files(scope_pathspecs, scope_git_root)
         if dev_session.initial_dirty_files:
             changed_files = [item for item in changed_files if item not in dev_session.initial_dirty_files] or changed_files
         dev_round.changed_files = changed_files[:20]
+
+        # Auto-commit writer's changes to the dev branch
+        commit_hash = _dev_auto_commit(round_num, scope_pathspecs, dev_session.task, scope_git_root)
+        if commit_hash:
+            console.print(f"[dim]Auto-committed: {commit_hash}[/dim]")
 
         # Check for decision needed
         decision = _parse_dev_decision(writer_text)
@@ -1826,22 +2039,21 @@ def _run_dev_loop(
         # ── Reviewer turn ──
         console.print(f"\n[dim]── Reviewer ({reviewer.name}) ──[/dim]")
 
-        diff_text = _get_scope_diff(scope_pathspecs)
+        # Use per-commit diff if we just committed, otherwise fall back to worktree diff
+        if commit_hash:
+            diff_text = _get_last_commit_diff(scope_git_root)
+        else:
+            diff_text = _get_scope_diff(scope_pathspecs, scope_git_root)
 
         reviewer_query_parts = [f"[Dev Loop — Review Round {round_num}/{dev_session.max_rounds}]"]
         reviewer_query_parts.append(f"Task: {dev_session.task}")
         reviewer_query_parts.append(f"Scope: {scope_label}")
-        if dev_session.initial_dirty_files:
-            reviewer_query_parts.append(
-                "Pre-existing dirty files before /dev started:\n"
-                + "\n".join(f"- {item}" for item in dev_session.initial_dirty_files[:20])
-                + "\nFocus on validating the writer's intended change, not unrelated pre-existing edits."
-            )
+        reviewer_query_parts.append(f"Editable workspace: {turn_cwd}")
         if dev_round.changed_files:
             reviewer_query_parts.append(
-                "Files currently changed in scope:\n" + "\n".join(f"- {item}" for item in dev_round.changed_files[:20])
+                "Files changed this round:\n" + "\n".join(f"- {item}" for item in dev_round.changed_files[:20])
             )
-        reviewer_query_parts.append(f"\nWriter's changes:\n{diff_text}")
+        reviewer_query_parts.append(f"\nWriter's changes (this round only):\n{diff_text}")
 
         if dev_session.test_mode == "on":
             reviewer_query_parts.append(
@@ -1869,6 +2081,7 @@ def _run_dev_loop(
                 session=session,
                 query=reviewer_query,
                 skip_participants=skip_for_reviewer,
+                cwd_override=turn_cwd,
             )
         except KeyboardInterrupt:
             console.print(f"\n[bold yellow]Dev loop interrupted at round {round_num} (reviewer phase).[/bold yellow]")
@@ -1925,6 +2138,10 @@ def _render_dev_status(dev_session: DevLoopSession) -> None:
         f"[bold]Status[/bold]: {dev_session.status}",
         f"[bold]Test mode[/bold]: {dev_session.test_mode}",
         f"[bold]Scope[/bold]: {dev_session.scope_label or 'repository'}",
+        f"[bold]Git root[/bold]: {dev_session.scope_git_root or '(default)'}",
+        f"[bold]Branch repo[/bold]: {dev_session.branch_repo_root or dev_session.scope_git_root or '(default)'}",
+        f"[bold]Worktree[/bold]: {dev_session.worktree_path or '(none)'}",
+        f"[bold]Branch[/bold]: {dev_session.dev_branch or '(none)'}",
     ]
     if dev_session.history:
         last = dev_session.history[-1]
@@ -2934,7 +3151,10 @@ def run_chat_shell(
                         console.print("[bold red]Error:[/bold red] Not in script generation phase. Approve all tasks first.")
                         continue
                     try:
-                        hyp_detail = _hypothesis_service().load_hypothesis(current_session.project, active_launch_exp.hypothesis_id)
+                        hyp_detail = _hypothesis_service().load_hypothesis(
+                            current_session.project,
+                            active_launch_exp.hypothesis_id,
+                        )
                         code_context = experiment_service.get_code_context(current_session.project)
                         planner = ExperimentPlanner(RepoPaths.discover())
                         first_participant = current_session.participants[0] if current_session.participants else None
@@ -2975,6 +3195,118 @@ def run_chat_shell(
                         _print_launch_exp_hints(console, active_launch_exp)
                     except Exception as exc:
                         console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                if sub_arg.startswith("run-task"):
+                    task_id = sub_arg.replace("run-task", "").strip()
+                    if active_launch_exp is None or active_launch_exp.phase != LaunchExpPhase.SCRIPT_GENERATION:
+                        console.print("[bold red]Error:[/bold red] Not in script generation phase. Use /launch-exp resume <experiment_id> first for an existing experiment.")
+                        continue
+                    if not task_id:
+                        console.print("[bold red]Usage:[/bold red] /launch-exp run-task <task_id>")
+                        continue
+                    known_task_ids = {t.id for t in active_launch_exp.task_plans}
+                    if known_task_ids and task_id not in known_task_ids:
+                        console.print(f"[bold red]Error:[/bold red] Unknown task '{task_id}'. Known tasks: {', '.join(sorted(known_task_ids))}")
+                        continue
+                    if not active_launch_exp.run_sh_content:
+                        console.print("[bold red]Error:[/bold red] No run.sh available. Use /launch-exp generate-script first.")
+                        continue
+
+                    try:
+                        hyp_detail = _hypothesis_service().load_hypothesis(current_session.project, active_launch_exp.hypothesis_id)
+                        code_context = experiment_service.get_code_context(current_session.project)
+                        planner = ExperimentPlanner(RepoPaths.discover())
+                        first_participant = current_session.participants[0] if current_session.participants else None
+                        provider = first_participant.provider if first_participant else None
+                        tasks_json = json.dumps([t.model_dump() for t in active_launch_exp.task_plans], indent=2)
+                        try:
+                            exec_profile = experiment_service.build_default_execution_profile(current_session.project)
+                            workdir = exec_profile.workdir or ""
+                            setup_summary = exec_profile.setup_script or ""
+                        except Exception:
+                            workdir = ""
+                            setup_summary = ""
+
+                        resume_issues = _run_sh_resume_contract_issues(active_launch_exp.run_sh_content)
+                        if resume_issues:
+                            console.print("[dim]run.sh does not expose task-level resume controls; asking agent to add them before submitting...[/dim]")
+                            instruction = (
+                                f"Revise this run.sh so it supports task-level resume/retry controls, then keep the existing experiment logic intact.\n"
+                                f"Required contract:\n"
+                                f"- LABIT_ONLY_TASK={task_id} runs only task {task_id} after verifying dependency checkpoints.\n"
+                                f"- LABIT_START_AT={task_id} skips tasks before {task_id}.\n"
+                                f"- LABIT_FORCE_TASK={task_id} reruns {task_id} even if its checkpoint exists.\n"
+                                f"- Default reruns must be non-destructive: do not delete prior outputs unless LABIT_FORCE_CLEAN=1.\n"
+                                f"- Add should_run_task() and require_checkpoint() bash helpers.\n"
+                                f"Current missing/unsafe pieces: {', '.join(resume_issues)}.\n"
+                                f"Preserve the standard experiment_results.json output contract."
+                            )
+                            with console.status("[bold cyan]Adding task-level resume support to run.sh...[/bold cyan]"):
+                                result = planner.revise_run_sh(
+                                    current_run_sh=active_launch_exp.run_sh_content,
+                                    current_config_yaml=active_launch_exp.config_yaml_content,
+                                    tasks_json=tasks_json,
+                                    user_instruction=instruction,
+                                    code_tree=code_context,
+                                    workdir=workdir,
+                                    setup_script_summary=setup_summary,
+                                    provider=provider,
+                                )
+                            active_launch_exp = experiment_service.save_script(
+                                active_launch_exp,
+                                result["run_sh"],
+                                result["config_yaml"],
+                            )
+                            resume_issues = _run_sh_resume_contract_issues(active_launch_exp.run_sh_content)
+                            if resume_issues:
+                                console.print(
+                                    "[bold red]Error:[/bold red] Agent revision did not add the required task-level resume controls. "
+                                    "Revise run.sh manually or try again.\n"
+                                    f"[dim]Still missing: {', '.join(resume_issues)}[/dim]"
+                                )
+                                continue
+                            console.print(
+                                Panel(
+                                    f"[bold]Summary[/bold]: {result['summary']}\n"
+                                    f"[bold]run.sh[/bold]: {len(result['run_sh'].splitlines())} lines",
+                                    title="[bold green]Resume Controls Added[/bold green]",
+                                    border_style="green",
+                                )
+                            )
+
+                        detail = experiment_service.finalize_experiment(active_launch_exp)
+                        env_overrides = {
+                            "LABIT_ONLY_TASK": task_id,
+                            "LABIT_START_AT": task_id,
+                            "LABIT_FORCE_TASK": task_id,
+                        }
+                        console.print(
+                            Panel(
+                                f"[bold]Experiment[/bold]: {detail.record.experiment_id}\n"
+                                f"[bold]Task[/bold]: {task_id}\n"
+                                f"[bold]Mode[/bold]: run only this task; reuse prior outputs",
+                                title="[bold cyan]Task Retry Submit[/bold cyan]",
+                                border_style="cyan",
+                            )
+                        )
+                        submit_ok = _submit_and_monitor(
+                            console=console,
+                            experiment_service=experiment_service,
+                            active_launch_exp=active_launch_exp,
+                            current_session=current_session,
+                            service=service,
+                            planner=planner,
+                            _hypothesis_service=_hypothesis_service,
+                            first_participant=first_participant,
+                            env_overrides=env_overrides,
+                        )
+                        if submit_ok:
+                            active_launch_exp = None
+                        else:
+                            console.print("[yellow]Task retry was not confirmed stable; keeping launch-exp session active for revision.[/yellow]")
+                    except Exception as exc:
+                        console.print(f"[bold red]Error submitting task retry:[/bold red] {exc}")
                     continue
 
                 if sub_arg == "done":
@@ -3737,7 +4069,99 @@ def run_chat_shell(
                     else:
                         active_dev.status = "stopped"
                         console.print("[bold yellow]Dev loop stopped.[/bold yellow]")
+                        if active_dev.dev_branch:
+                            console.print(Panel(
+                                (
+                                    f"[bold]Branch[/bold]: {active_dev.dev_branch}\n"
+                                    f"[bold]Original[/bold]: {active_dev.original_branch}\n\n"
+                                    f"[bold]Branch repo[/bold]: {active_dev.branch_repo_root or active_dev.scope_git_root}\n"
+                                    f"[bold]Worktree[/bold]: {active_dev.worktree_path or '(none)'}\n\n"
+                                    "Use [bold]/dev finish[/bold] to merge, keep, or discard safely."
+                                ),
+                                title="[bold]Dev Branch[/bold]",
+                                border_style="blue",
+                            ))
                         active_dev = None
+                    continue
+
+                if dev_action == "finish":
+                    if active_dev is None:
+                        console.print("[dim]No active dev loop.[/dim]")
+                        continue
+                    if not active_dev.dev_branch:
+                        console.print("[dim]No dev branch to finish (--branch off was used).[/dim]")
+                        active_dev = None
+                        continue
+                    # Show options: merge, PR, discard, or keep
+                    console.print(Panel(
+                        (
+                            f"[bold]Branch[/bold]: {active_dev.dev_branch}\n"
+                            f"[bold]Original[/bold]: {active_dev.original_branch}\n"
+                            f"[bold]Worktree[/bold]: {active_dev.worktree_path or '(none)'}\n"
+                            f"[bold]Rounds[/bold]: {active_dev.current_round}\n\n"
+                            "[bold]What would you like to do?[/bold]\n"
+                            f"  [bold cyan]1[/bold cyan] — Merge into {active_dev.original_branch}\n"
+                            "  [bold cyan]2[/bold cyan] — Keep branch and remove worktree\n"
+                            "  [bold cyan]3[/bold cyan] — Discard branch and remove worktree\n"
+                        ),
+                        title="[bold green]Finish Dev Loop[/bold green]",
+                        border_style="green",
+                    ))
+                    try:
+                        choice = Prompt.ask("Choice", choices=["1", "2", "3"], default="1")
+                    except (KeyboardInterrupt, EOFError):
+                        continue
+                    finish_cwd = active_dev.branch_repo_root or active_dev.scope_git_root or str(RepoPaths.discover().root)
+                    finish_repo = Path(finish_cwd)
+                    finish_worktree = Path(active_dev.worktree_path) if active_dev.worktree_path else None
+                    # Validate the dev branch exists in this repo
+                    branch_check = _git_output(
+                        "git", "branch", "--list", active_dev.dev_branch, cwd=finish_repo
+                    )
+                    if not branch_check:
+                        console.print(
+                            f"[bold red]Branch '{active_dev.dev_branch}' not found in {finish_cwd}.[/bold red]\n"
+                            "This can happen if the dev session was created before a scope change.\n"
+                            "Refusing to guess which repo should be merged."
+                        )
+                        active_dev = None
+                        continue
+                    if choice == "1":
+                        # Merge into original branch
+                        subprocess.run(["git", "checkout", active_dev.original_branch], capture_output=True, cwd=finish_cwd)
+                        result = subprocess.run(
+                            ["git", "merge", active_dev.dev_branch, "--no-edit"],
+                            capture_output=True, text=True, cwd=finish_cwd,
+                        )
+                        if result.returncode == 0:
+                            console.print(f"[bold green]Merged {active_dev.dev_branch} into {active_dev.original_branch}.[/bold green]")
+                            if finish_worktree is not None:
+                                ok, msg = _remove_dev_worktree(finish_repo, finish_worktree)
+                                if ok:
+                                    console.print(f"[dim]Removed worktree {finish_worktree}.[/dim]")
+                                else:
+                                    console.print(f"[yellow]Worktree cleanup failed:[/yellow] {msg}")
+                        else:
+                            console.print(f"[bold red]Merge failed:[/bold red] {result.stderr.strip()}")
+                            console.print(f"You are now on [bold]{active_dev.original_branch}[/bold]. Resolve manually.")
+                    elif choice == "2":
+                        # Keep branch, remove worktree if present, switch back
+                        subprocess.run(["git", "checkout", active_dev.original_branch], capture_output=True, cwd=finish_cwd)
+                        if finish_worktree is not None:
+                            ok, msg = _remove_dev_worktree(finish_repo, finish_worktree)
+                            if not ok:
+                                console.print(f"[yellow]Worktree cleanup failed:[/yellow] {msg}")
+                        console.print(f"[bold]Branch {active_dev.dev_branch} is preserved.[/bold]")
+                    elif choice == "3":
+                        # Discard branch and worktree
+                        subprocess.run(["git", "checkout", active_dev.original_branch], capture_output=True, cwd=finish_cwd)
+                        if finish_worktree is not None:
+                            ok, msg = _remove_dev_worktree(finish_repo, finish_worktree)
+                            if not ok:
+                                console.print(f"[yellow]Worktree cleanup failed:[/yellow] {msg}")
+                        subprocess.run(["git", "branch", "-D", active_dev.dev_branch], capture_output=True, cwd=finish_cwd)
+                        console.print(f"[bold red]Discarded branch {active_dev.dev_branch}.[/bold red]")
+                    active_dev = None
                     continue
 
                 if dev_action == "continue":
@@ -3784,6 +4208,12 @@ def run_chat_shell(
                     if tm_match:
                         test_mode = tm_match.group(1)
                         task_text = task_text[:tm_match.start()] + task_text[tm_match.end():]
+                    # Extract --branch off|auto (default: auto)
+                    branch_mode = "auto"
+                    bm_match = re.search(r"--branch\s+(off|auto)", task_text)
+                    if bm_match:
+                        branch_mode = bm_match.group(1)
+                        task_text = task_text[:bm_match.start()] + task_text[bm_match.end():]
                     task_text = task_text.strip()
                     if not task_text:
                         console.print("[bold red]Usage:[/bold red] /dev start <task description>")
@@ -3798,8 +4228,64 @@ def run_chat_shell(
                         writer_name = participants[0].name
                         reviewer_name = participants[0].name
 
-                    scope_label, scope_pathspecs = _resolve_dev_scope(current_session)
-                    initial_dirty_files = _list_scope_dirty_files(scope_pathspecs)
+                    scope_label, scope_pathspecs, scope_git_root = _resolve_dev_scope(current_session)
+                    initial_dirty_files = _list_scope_dirty_files(scope_pathspecs, scope_git_root)
+
+                    # In isolated worktree mode, dirty files in the original checkout
+                    # are not copied into the worktree. In branch-off mode, refuse
+                    # dirty starts unless the user explicitly opts in.
+                    allow_dirty = "--allow-dirty" in dev_argument
+                    if "--allow-dirty" in dev_argument:
+                        task_text = re.sub(r"--allow-dirty\s*", "", task_text).strip()
+                    if branch_mode == "off" and initial_dirty_files and not allow_dirty:
+                        console.print(
+                            "[bold red]Error:[/bold red] Working tree has uncommitted changes. "
+                            "Commit or stash them first, or use [bold]--allow-dirty[/bold] to proceed anyway."
+                        )
+                        preview = "\n".join(f"- {item}" for item in initial_dirty_files[:10])
+                        console.print(Panel(preview, title="Dirty Files", border_style="red"))
+                        continue
+                    if branch_mode == "auto" and initial_dirty_files:
+                        preview = "\n".join(f"- {item}" for item in initial_dirty_files[:10])
+                        console.print(Panel(
+                            preview,
+                            title="[yellow]Original Checkout Has Dirty Files[/yellow]",
+                            border_style="yellow",
+                        ))
+                        console.print(
+                            "[yellow]Note:[/yellow] /dev will use a clean isolated worktree from HEAD; "
+                            "the dirty files above will not be included unless committed first."
+                        )
+
+                    # Create isolated dev worktree (unless --branch off)
+                    dev_branch = ""
+                    original_branch = ""
+                    branch_repo_root = scope_git_root
+                    worktree_path = Path("")
+                    active_scope_git_root = scope_git_root
+                    active_scope_pathspecs = scope_pathspecs
+                    if branch_mode == "auto":
+                        try:
+                            dev_branch, original_branch, worktree_path = _create_dev_worktree(
+                                task=task_text,
+                                git_root=scope_git_root,
+                                project=current_session.project,
+                            )
+                        except Exception as exc:
+                            console.print(f"[bold red]Failed to create dev worktree:[/bold red] {exc}")
+                            continue
+                        active_scope_git_root = worktree_path
+                        active_scope_pathspecs = ["."]
+                        initial_dirty_files = []
+                    else:
+                        # Stay on current branch
+                        try:
+                            original_branch = _git_output(
+                                "git", "rev-parse", "--abbrev-ref", "HEAD",
+                                cwd=scope_git_root,
+                            )
+                        except Exception:
+                            pass
 
                     active_dev = DevLoopSession(
                         task=task_text,
@@ -3808,8 +4294,13 @@ def run_chat_shell(
                         max_rounds=max_rounds,
                         test_mode=test_mode,
                         scope_label=scope_label,
-                        scope_pathspecs=scope_pathspecs,
+                        scope_pathspecs=active_scope_pathspecs,
+                        scope_git_root=str(active_scope_git_root),
+                        branch_repo_root=str(branch_repo_root),
+                        worktree_path=str(worktree_path) if str(worktree_path) != "." else "",
                         initial_dirty_files=initial_dirty_files,
+                        dev_branch=dev_branch,
+                        original_branch=original_branch,
                     )
 
                     console.print(Panel(
@@ -3819,28 +4310,38 @@ def run_chat_shell(
                             f"[bold]Reviewer[/bold]: {reviewer_name}\n"
                             f"[bold]Max rounds[/bold]: {max_rounds}\n"
                             f"[bold]Test mode[/bold]: {test_mode}\n"
-                            f"[bold]Scope[/bold]: {scope_label}"
+                            f"[bold]Scope[/bold]: {scope_label}\n"
+                            f"[bold]Branch repo[/bold]: {branch_repo_root}\n"
+                            f"[bold]Editable workspace[/bold]: {active_scope_git_root}\n"
+                            f"[bold]Branch[/bold]: {dev_branch + ' (from ' + original_branch + ')' if dev_branch else original_branch + ' (no worktree isolation)'}"
                         ),
                         title="[bold green]Dev Loop Starting[/bold green]",
                         border_style="green",
                     ))
-                    if initial_dirty_files:
-                        console.print(
-                            "[yellow]Scope is already dirty before /dev starts. "
-                            "Reviewer will try to ignore unrelated edits, but a clean worktree is more reliable.[/yellow]"
-                        )
-                        preview = "\n".join(f"- {item}" for item in initial_dirty_files[:10])
-                        console.print(Panel(preview, title="Pre-existing Dirty Files", border_style="yellow"))
 
                     active_dev = _run_dev_loop(
                         service=service,
                         session=current_session,
                         dev_session=active_dev,
                     )
+                    # Show branch summary after loop ends
+                    if active_dev.dev_branch and active_dev.status in ("completed", "stopped"):
+                        console.print(Panel(
+                            (
+                                f"[bold]Branch[/bold]: {active_dev.dev_branch}\n"
+                                f"[bold]Original[/bold]: {active_dev.original_branch}\n"
+                                f"[bold]Branch repo[/bold]: {active_dev.branch_repo_root or active_dev.scope_git_root}\n"
+                                f"[bold]Worktree[/bold]: {active_dev.worktree_path or '(none)'}\n"
+                                f"[bold]Rounds[/bold]: {active_dev.current_round}\n\n"
+                                "Use [bold]/dev finish[/bold] to merge, keep, or discard the branch."
+                            ),
+                            title="[bold]Dev Loop Finished[/bold]",
+                            border_style="blue",
+                        ))
                     continue
 
                 console.print(
-                    "[bold red]Usage:[/bold red] /dev start <task> | /dev status | /dev continue | /dev stop"
+                    "[bold red]Usage:[/bold red] /dev start <task> | /dev status | /dev continue | /dev finish | /dev stop"
                 )
                 continue
 
