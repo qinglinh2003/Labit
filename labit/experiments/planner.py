@@ -406,6 +406,25 @@ The script should:
 3. Print clear status messages for each task (e.g., "[t001] Running data preprocessing...")
 4. Skip tasks whose checkpoint already exists (with a message)
 5. Call code from the project's code directory — do NOT inline large implementations in the script
+6. At the very end, write a `$PWD/experiment_results.json` summarizing the run
+
+IMPORTANT — Standard results file:
+Your script MUST end with a block that writes `$PWD/experiment_results.json`.
+This file is the contract between the experiment and Labit's review system.
+Format:
+```json
+{{
+  "status": "completed",
+  "metrics": {{"auroc": 0.72, "accuracy": 0.85}},
+  "conclusion": "one-sentence takeaway from the results",
+  "artifacts": ["relative/path/to/key/output1.json", "relative/path/to/output2.pt"]
+}}
+```
+- `status`: "completed" if all tasks succeeded, "failed" if any critical task failed
+- `metrics`: key numeric results (keep it flat, names should match the hypothesis criteria)
+- `conclusion`: one sentence summarizing whether the hypothesis is supported or not
+- `artifacts`: list of key output file paths (relative to $PWD)
+If the script fails midway, use a trap to still write the file with `"status": "failed"` and `"error": "<message>"`.
 
 Also generate a config.yaml if the experiment needs one (leave empty string if not needed).
 
@@ -452,6 +471,9 @@ Remember: your script is ONLY the body. Do NOT add shebang, `set -euo pipefail`,
 or `cd` to workdir. These are handled by the wrapper. Use `$PWD` for the project directory, never `dirname "$0"`.
 
 The user wants changes to the current script. Apply their feedback precisely.
+
+IMPORTANT: The script MUST still write `$PWD/experiment_results.json` at the end (see original generation rules).
+If the current script already does this, preserve it. If not, add it.
 
 Approved task plans:
 {tasks_json}
