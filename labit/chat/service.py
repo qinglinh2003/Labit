@@ -171,6 +171,7 @@ class ChatService:
         on_reply_complete: Callable[[ChatParticipant, str], None] | None = None,
         cancel_event: threading.Event | None = None,
         skip_participants: set[str] | None = None,
+        cwd_override: str | None = None,
     ) -> ChatTurnResult:
         return self._ask_impl(
             session_id=session_id,
@@ -183,6 +184,7 @@ class ChatService:
             on_reply_complete=on_reply_complete,
             cancel_event=cancel_event,
             skip_participants=skip_participants,
+            cwd_override=cwd_override,
         )
 
     def _ask_impl(
@@ -198,6 +200,7 @@ class ChatService:
         on_reply_complete: Callable[[ChatParticipant, str], None] | None = None,
         cancel_event: threading.Event | None = None,
         skip_participants: set[str] | None = None,
+        cwd_override: str | None = None,
     ) -> ChatTurnResult:
         session = self.load_session(session_id)
         if session.status != ChatStatus.ACTIVE:
@@ -255,6 +258,7 @@ class ChatService:
                             on_reply_complete=on_reply_complete,
                             cancel_event=cancel_event,
                             persist=False,
+                            cwd_override=cwd_override,
                         )
                     except (StreamCancelled, KeyboardInterrupt):
                         reply_queue.put((index, None))
@@ -308,6 +312,7 @@ class ChatService:
                         on_reply_delta=on_reply_delta,
                         on_reply_complete=on_reply_complete,
                         cancel_event=cancel_event,
+                        cwd_override=cwd_override,
                     )
                     replies.append(reply)
                     working_transcript.append(reply.message)
@@ -439,6 +444,7 @@ class ChatService:
         on_reply_complete: Callable[[ChatParticipant, str], None] | None = None,
         cancel_event: threading.Event | None = None,
         persist: bool = True,
+        cwd_override: str | None = None,
     ) -> ChatReply:
         adapter = self.registry.get(participant.provider)
         request = AgentRequest(
@@ -450,7 +456,7 @@ class ChatService:
                 snapshot=snapshot,
                 force_deep_context=force_deep_context,
             ),
-            cwd=str(self.paths.root),
+            cwd=cwd_override or str(self.paths.root),
             image_paths=self._recent_image_paths(transcript),
             extra_args=self._conversation_extra_args(
                 participant.provider,

@@ -408,6 +408,22 @@ The script should:
 5. Call code from the project's code directory — do NOT inline large implementations in the script
 6. At the very end, write a `$PWD/experiment_results.json` summarizing the run
 
+IMPORTANT — Resume/retry contract:
+The script MUST support task-level resume controls so failed experiments can reuse completed work:
+- `LABIT_ONLY_TASK=t004`: run only task `t004` after verifying its dependency checkpoints; skip all other tasks.
+- `LABIT_START_AT=t004`: skip tasks before `t004`; run `t004` and later tasks.
+- `LABIT_FORCE_TASK=t004`: rerun `t004` even if its checkpoint already exists.
+- `LABIT_FORCE_CLEAN=1`: only then remove existing output directories or expensive artifacts.
+
+Default behavior must be non-destructive. Do not `rm -rf` feature directories, probe directories, caches,
+or previous stage outputs unless `LABIT_FORCE_CLEAN=1` is set. Prefer per-task output files and checkpoint
+checks so rerunning after a late failure reuses earlier task outputs.
+
+Implement the resume controls in bash helpers near the top of the body, for example:
+- `task_index <task_id>` to compare task ordering
+- `should_run_task <task_id> <checkpoint_path>` to enforce ONLY_TASK/START_AT/FORCE_TASK/checkpoint logic
+- `require_checkpoint <task_id> <path>` to fail fast when a dependency output is missing
+
 IMPORTANT — Standard results file:
 Your script MUST end with a block that writes `$PWD/experiment_results.json`.
 This file is the contract between the experiment and Labit's review system.
@@ -474,6 +490,13 @@ The user wants changes to the current script. Apply their feedback precisely.
 
 IMPORTANT: The script MUST still write `$PWD/experiment_results.json` at the end (see original generation rules).
 If the current script already does this, preserve it. If not, add it.
+
+IMPORTANT: The script MUST support task-level resume controls:
+- `LABIT_ONLY_TASK=t004`: run only task `t004` after verifying dependency checkpoints.
+- `LABIT_START_AT=t004`: skip tasks before `t004`; run `t004` and later tasks.
+- `LABIT_FORCE_TASK=t004`: rerun `t004` even if its checkpoint exists.
+- `LABIT_FORCE_CLEAN=1`: only then remove previous outputs.
+Default behavior must be non-destructive. Preserve completed expensive outputs unless explicitly forced.
 
 Approved task plans:
 {tasks_json}
