@@ -118,22 +118,22 @@ class ExperimentExecutionProfile(BaseModel):
 
     backend: ExecutionBackend
     profile: str = "default"
+    user: str = "root"
     host: str = ""
+    port: int = 22
+    ssh_key: str = ""
     workdir: str = ""
     datadir: str = ""
-    runtime: ExecutionRuntime = ExecutionRuntime.PLAIN
-    conda_env: str = ""
-    conda_init: str = ""
-    uv_project: str = ""
+    setup_script: str = ""
 
     @field_validator(
         "profile",
+        "user",
         "host",
+        "ssh_key",
         "workdir",
         "datadir",
-        "conda_env",
-        "conda_init",
-        "uv_project",
+        "setup_script",
         mode="before",
     )
     @classmethod
@@ -147,13 +147,10 @@ class ExperimentExecutionProfile(BaseModel):
     @model_validator(mode="after")
     def validate_runtime_requirements(self) -> "ExperimentExecutionProfile":
         if self.backend == ExecutionBackend.SSH:
-            if not self.host or not self.workdir:
-                raise ValueError("SSH execution requires both host and workdir.")
-        if self.runtime == ExecutionRuntime.CONDA:
-            if not self.conda_env or not self.conda_init:
-                raise ValueError("Conda execution requires conda_env and conda_init.")
-        if self.runtime == ExecutionRuntime.UV and not self.uv_project:
-            raise ValueError("UV execution requires uv_project.")
+            if not self.user or not self.host or not self.workdir:
+                raise ValueError("SSH execution requires user, host, and workdir.")
+        if self.port < 1 or self.port > 65535:
+            raise ValueError("SSH execution requires a valid port.")
         return self
 
 
@@ -558,7 +555,10 @@ class LaunchArtifact(BaseModel):
     experiment_id: str
     project: str
     executor: ExecutionBackend
+    remote_user: str = "root"
     remote_host: str = ""
+    remote_port: int = 22
+    ssh_key: str = ""
     status: LaunchStatus = LaunchStatus.PREPARED
     frozen_spec: FrozenLaunchSpec
     code_snapshot: CodeSnapshot = Field(default_factory=CodeSnapshot)
@@ -575,7 +575,9 @@ class LaunchArtifact(BaseModel):
         "task_id",
         "experiment_id",
         "project",
+        "remote_user",
         "remote_host",
+        "ssh_key",
         "run_sh_path",
         "run_py_path",
         "env_json_path",
@@ -626,6 +628,67 @@ class ExperimentDetail(BaseModel):
     launch_markdown: str = ""
     debrief_markdown: str = ""
     review_markdown: str = ""
+
+
+class LaunchExpPhase(str, Enum):
+    TASK_BREAKDOWN = "task_breakdown"
+    TASK_PLANNING = "task_planning"
+    SCRIPT_GENERATION = "script_generation"
+
+
+class ExperimentTaskPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    name: str
+    goal: str = ""
+    depends_on: list[str] = Field(default_factory=list)
+    entry_hint: str = ""
+    inputs: str = ""
+    outputs: str = ""
+    checkpoint: str = ""
+    failure_modes: str = ""
+    approved: bool = False
+
+    @field_validator("id", "name", "goal", "entry_hint", "inputs", "outputs", "checkpoint", "failure_modes", mode="before")
+    @classmethod
+    def strip_text(cls, value: object) -> object:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+
+class LaunchExpSession(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    hypothesis_id: str
+    project: str
+    phase: LaunchExpPhase = LaunchExpPhase.TASK_BREAKDOWN
+    experiment_id: str | None = None
+    task_plans: list[ExperimentTaskPlan] = Field(default_factory=list)
+    current_task_index: int = 0
+    run_sh_content: str = ""
+    config_yaml_content: str = ""
+    log_path: str = ""
+    created_at: str = Field(default_factory=utc_now_iso)
+
+    @property
+    def all_tasks_approved(self) -> bool:
+        return bool(self.task_plans) and all(t.approved for t in self.task_plans)
+
+    @property
+    def current_task(self) -> ExperimentTaskPlan | None:
+        if 0 <= self.current_task_index < len(self.task_plans):
+            return self.task_plans[self.current_task_index]
+        return None
+
+    def next_unapproved_task_index(self) -> int | None:
+        for i, t in enumerate(self.task_plans):
+            if not t.approved:
+                return i
+        return None
 
 
 class HypothesisReviewSuggestion(BaseModel):

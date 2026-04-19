@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 
 import typer
-from rich.console import Console, RenderableType
+from rich.console import Console, Group, RenderableType
 from rich.live import Live
 from labit.rendering import LaTeXMarkdown as Markdown
 from rich.panel import Panel
@@ -22,9 +23,15 @@ from labit.chat.models import ChatMode
 from labit.chat.service import ChatService
 from labit.chat.synthesizer import DiscussionSynthesizer
 from labit.context.events import SessionEventKind
+from labit.documents.drafter import DocDrafter
+from labit.documents.models import DocSession, DocStatus
+from labit.documents.service import DocumentService
 from labit.experiments.executors.ssh import SSHExecutor
 from labit.experiments.models import (
     ExperimentDraft,
+    ExperimentTaskPlan,
+    LaunchExpPhase,
+    LaunchExpSession,
     ResearchRole,
     TaskDraft,
     TaskKind,
@@ -32,8 +39,10 @@ from labit.experiments.models import (
     TaskSpec,
     TaskStatus,
 )
+from labit.experiments.planner import ExperimentPlanner
 from labit.experiments.service import ExperimentService
 from labit.hypotheses.drafter import HypothesisDrafter
+from labit.hypotheses.models import HypothesisDraft
 from labit.hypotheses.models import HypothesisResolution, HypothesisState, utc_now_iso
 from labit.hypotheses.service import HypothesisService
 from labit.investigations.service import InvestigationService
@@ -57,7 +66,7 @@ _LABIT_THEME = Theme(
         "markdown.h5": "grey70 underline",
         "markdown.h6": "dim italic",
         # ── Inline ───────────────────────────────────────────────
-        "markdown.strong": "bold",
+        "markdown.strong": "bold #0080ff",
         "markdown.em": "italic dim",
         "markdown.emph": "italic dim",
         "markdown.s": "dim strike",
@@ -79,11 +88,57 @@ _LABIT_THEME = Theme(
 _CODE_THEME = "default"
 
 console = Console(theme=_LABIT_THEME)
+_COMMAND_COLOR = "#0080ff"
+_ACCENT_COLOR = "#a0a000"
 
 _PROVIDER_STYLES = {
     "claude": ("blue", "CLAUDE"),
     "codex": ("green", "CODEX"),
 }
+
+_CHAT_SHELL_COMMANDS = (
+    "/help",
+    "/list",
+    "/show",
+    "/mode",
+    "/memory",
+    "/paste-image",
+    "/image",
+    "/think",
+    "/think-long-term",
+    "/think-ltm",
+    "/long-term-memory",
+    "/ltm",
+    "/synthesize",
+    "/investigate",
+    "/idea",
+    "/note",
+    "/todo",
+    "/doc",
+    "/doc auto",
+    "/doc start",
+    "/doc open",
+    "/doc done",
+    "/doc status",
+    "/doc publish",
+    "/doc list",
+    "/hypothesis",
+    "/launch-exp",
+    "/swap",
+    "/mute",
+    "/launch-exp resume",
+    "/launch-exp approve-tasks",
+    "/launch-exp approve-task",
+    "/launch-exp reopen-task",
+    "/launch-exp generate-script",
+    "/launch-exp status",
+    "/launch-exp done",
+    "/debrief",
+    "/review-results",
+    "/new",
+    "/switch",
+    "/exit",
+)
 
 
 def _chat_service() -> ChatService:
@@ -112,6 +167,14 @@ def _experiment_service() -> ExperimentService:
 
 def _idea_drafter() -> IdeaDrafter:
     return IdeaDrafter(RepoPaths.discover())
+
+
+def _doc_drafter() -> DocDrafter:
+    return DocDrafter(RepoPaths.discover())
+
+
+def _document_service() -> DocumentService:
+    return DocumentService(RepoPaths.discover())
 
 
 def _investigation_service() -> InvestigationService:
@@ -294,11 +357,14 @@ def _agent_panel(
     *,
     turn_index: int | None = None,
     thinking: _ThinkingIndicator | None = None,
+    status_text: str | None = None,
 ) -> Panel:
     color, label = _PROVIDER_STYLES.get(provider_name, ("cyan", provider_name.upper()))
     title = f"{label} · {speaker}"
     if turn_index is not None:
         title = f"{title} · turn {turn_index}"
+    if status_text:
+        title = f"{title} · {status_text}"
     body: RenderableType = _md(content) if content.strip() else (thinking or _ThinkingIndicator())
     return Panel(body, title=title, border_style=color)
 
@@ -363,7 +429,7 @@ def _render_shell_header(session) -> None:
         f"[bold]Mode[/bold]: {mode_label}\n"
         f"[bold]Participants[/bold]: {participants}\n"
         f"[bold]Session ID[/bold]: {session.session_id}\n"
-        "[dim]Type a message to continue. Ctrl-V pastes one clipboard image. Use /help to see shell commands.[/dim]"
+        "[dim]Type a message to continue. Use /help to see shell commands.[/dim]"
     )
     console.print(Panel(body, title=f"[bold green]LABIT Chat · {session.title}[/bold green]", border_style="green"))
 
@@ -401,6 +467,50 @@ def _box_bottom(width: int) -> str:
     return f"╰{'─' * (width - 2)}╯"
 
 
+def _command_chip(label: str) -> str:
+    return f"[bold {_COMMAND_COLOR}]{label}[/bold {_COMMAND_COLOR}]"
+
+
+def _render_console_header(*, project: str, mode: str, participants: str) -> None:
+    console.print(f"[dim]{project} · {mode} · {participants}[/dim]")
+    console.print(
+        "Shortcuts: "
+        + " · ".join(
+            [
+                _command_chip("/help"),
+                _command_chip("/think"),
+                _command_chip("/think-ltm"),
+                _command_chip("/ltm"),
+                _command_chip("/image"),
+                _command_chip("/exit"),
+            ]
+        )
+    )
+    console.print(
+        "Research: "
+        + " · ".join(
+            [
+                _command_chip("/memory"),
+                _command_chip("/idea"),
+                _command_chip("/todo"),
+                _command_chip("/doc"),
+                _command_chip("/investigate"),
+                _command_chip("/hypothesis"),
+            ]
+        )
+    )
+    console.print(
+        "Multi-agent: "
+        + " · ".join(
+            [
+                _command_chip("/mode"),
+                _command_chip("/swap"),
+                _command_chip("/mute"),
+            ]
+        )
+    )
+
+
 def _prompt_in_box(session) -> ComposerResult:
     width = _box_width()
     inner_width = width - 2
@@ -408,16 +518,8 @@ def _prompt_in_box(session) -> ComposerResult:
     mode = session.mode.value
     participants = ", ".join(f"{item.name}:{item.provider.value}" for item in session.participants)
     prompt_prefix = " › "
-    meta_line = f"{project} · {mode} · {participants}"
-    shortcut_lines = [
-        "Shortcuts: Ctrl-V image · /help · /think · /ltm · /image · /exit",
-        "Research: /memory · /idea · /todo · /investigate · /hypothesis",
-    ]
-
     if not console.is_terminal:
-        console.print(f"[dim]{meta_line}[/dim]")
-        for line in shortcut_lines:
-            console.print(f"[dim]{line}[/dim]")
+        _render_console_header(project=project, mode=mode, participants=participants)
         console.print(f"[yellow]{_box_top('Input', width)}[/yellow]")
         console.print(f"[yellow]{_box_line('', width)}[/yellow]")
         console.print(f"[yellow]│[/yellow]{prompt_prefix}", end="")
@@ -427,15 +529,13 @@ def _prompt_in_box(session) -> ComposerResult:
         return ComposerResult(text=raw)
 
     if prompt_toolkit_available():
-        console.print(f"[dim]{meta_line}[/dim]")
-        for line in shortcut_lines:
-            console.print(f"[dim]{line}[/dim]")
+        _render_console_header(project=project, mode=mode, participants=participants)
         return prompt_with_clipboard_image(
             console=console,
             paths=RepoPaths.discover(),
             session_id=session.session_id,
-            prompt_prefix="› ",
-            show_frame=True,
+            prompt_prefix=prompt_prefix,
+            slash_commands=_CHAT_SHELL_COMMANDS,
         )
 
     top = _box_top("Input", width)
@@ -448,9 +548,7 @@ def _prompt_in_box(session) -> ComposerResult:
     yellow = "\x1b[33m"
     reset = "\x1b[0m"
 
-    console.print(f"[dim]{meta_line}[/dim]")
-    for line in shortcut_lines:
-        console.print(f"[dim]{line}[/dim]")
+    _render_console_header(project=project, mode=mode, participants=participants)
     stream.write(f"{yellow}{top}{reset}\n")
     stream.write(f"{yellow}{empty}{reset}\n")
     stream.write(f"{yellow}{prompt_line}{reset}\n")
@@ -494,32 +592,48 @@ def _open_default_session(
 
 
 def _shell_help() -> None:
-    table = Table(show_header=True, header_style="bold magenta")
-    table.add_column("Command", style="bold")
+    table = Table(show_header=True, header_style=f"bold {_COMMAND_COLOR}")
+    table.add_column("Command", style=f"bold {_COMMAND_COLOR}")
     table.add_column("What It Does")
     table.add_row("/help", "Show shell commands.")
     table.add_row("/list", "List existing chat sessions.")
     table.add_row("/new", "Create a new session and switch into it.")
     table.add_row("/switch <session_id>", "Switch to another session.")
     table.add_row("/show", "Show the full transcript for the current session.")
-    table.add_row("/mode", "Show current mode, participants, and session info.")
+    table.add_row("/mode [mode]", "Show or switch mode (single, round_robin, parallel).")
+    table.add_row("/swap", "Swap the response order of participants (e.g. claude,codex → codex,claude).")
+    table.add_row("/mute <name>", "Mute an agent for the next turn only. Toggle: run again to unmute.")
     table.add_row("/memory [id|kind]", "Show recent project memory, one memory by id, or filter by memory kind.")
     table.add_row("/think <question>", "Ask the next turn with the highest reasoning effort, while keeping the normal chat context shape.")
     table.add_row("/long-term-memory <question>", "Run a deep long-term memory search for this turn, then answer from the richer retrieved context.")
     table.add_row("/think-long-term <question>", "Run the next turn with both deep long-term memory search and the highest reasoning effort.")
-    table.add_row("Ctrl-V", "Attach one image from the clipboard to the current turn.")
     table.add_row("/paste-image [question]", "Read one image from the system clipboard, save it under .labit/, and send it as this turn's image input.")
     table.add_row("/idea [text]", "Save a lightweight project idea. With no text, show saved ideas.")
     table.add_row("/note [text]", "Save a lightweight project note. With no text, show saved notes.")
     table.add_row("/todo [text]", "Save an actionable project todo. With no text, show saved todos.")
+    table.add_row("/doc start <title>", "Enter document mode and write a design doc to docs/designs/.")
+    table.add_row("/doc open <doc_id>", "Re-open an existing document for editing.")
+    table.add_row("/doc status|done", "Show or leave the active document editing session.")
+    table.add_row("/doc publish <doc_id>", "Promote a document from draft to active.")
+    table.add_row("/doc list", "List all documents in the current project.")
     table.add_row("/synthesize [hint]", "Distill the current discussion into consensus, disagreements, and follow-ups.")
     table.add_row("/investigate <topic>", "Investigate a topic from the current session and write a report.")
-    table.add_row("/hypothesis [idea]", "Draft and create a structured hypothesis from the current session.")
-    table.add_row("/launch-exp <hypothesis_id>", "Draft a simple experiment from a hypothesis, freeze a launch artifact, and submit it over SSH.")
+    table.add_row("/hypothesis [idea]", "Draft a hypothesis and enter editing mode for iterative refinement.")
+    table.add_row("/hypothesis open <id>", "Re-open an existing hypothesis for editing.")
+    table.add_row("/hypothesis status", "Show current hypothesis being edited.")
+    table.add_row("/hypothesis done", "Leave hypothesis editing mode.")
+    table.add_row("/launch-exp <hypothesis_id>", "Start interactive experiment planning from a hypothesis.")
+    table.add_row("/launch-exp resume <experiment_id>", "Resume a failed/existing experiment for revision or resubmission.")
+    table.add_row("/launch-exp approve-tasks", "Approve the current task breakdown and move to detailed planning.")
+    table.add_row("/launch-exp approve-task <id>", "Approve a specific task's detailed plan.")
+    table.add_row("/launch-exp reopen-task <id>", "Reopen a previously approved task for re-planning.")
+    table.add_row("/launch-exp generate-script", "Generate run.sh from approved task plans.")
+    table.add_row("/launch-exp status", "Show current experiment planning status.")
+    table.add_row("/launch-exp done", "Finalize the experiment and exit planning mode.")
     table.add_row("/debrief", "Inspect active experiment launches and show their latest runtime state.")
     table.add_row("/review-results <hypothesis_id>", "Summarize experiments linked to a hypothesis, suggest a resolution, and optionally write the decision back.")
     table.add_row("/exit", "Leave the chat shell.")
-    console.print(Panel(table, title="LABIT Chat Commands", border_style="magenta"))
+    console.print(Panel(table, title="LABIT Chat Commands", border_style=_COMMAND_COLOR))
 
 
 def _confirm_in_shell(prompt: str, *, default: bool = True) -> bool:
@@ -557,6 +671,362 @@ def _render_idea_preview(draft) -> None:
                 f"[bold]Key question[/bold]: {draft.key_question}"
             ),
             title=f"[bold green]Idea Draft · {draft.title}[/bold green]",
+            border_style="green",
+        )
+    )
+
+
+def _print_hypothesis_mode_hints(console: Console, session, hypothesis_id: str) -> None:
+    """Print helpful hints when entering hypothesis editing mode."""
+    lines = [
+        f"[dim]──── Hypothesis Mode · {hypothesis_id} ────[/dim]",
+        "[dim]  Type feedback to revise the hypothesis (agent updates files, not chat).[/dim]",
+        "[dim]  /hypothesis status  — show current hypothesis info[/dim]",
+        "[dim]  /hypothesis done    — leave hypothesis editing mode[/dim]",
+        "[dim]  Ctrl+C              — interrupt current revision[/dim]",
+    ]
+    if session.mode == ChatMode.ROUND_ROBIN and len(session.participants) >= 2:
+        author = session.participants[0].name
+        reviewer = session.participants[1].name
+        lines.append(f"[dim]  Round-robin: {author} revises → {reviewer} reviews[/dim]")
+    console.print("\n".join(lines))
+    console.print("")
+
+
+def _print_doc_mode_hints(console: Console, session) -> None:
+    """Print helpful hints when entering document editing mode."""
+    lines = [
+        "[dim]──── Document Mode ────[/dim]",
+        "[dim]  Type feedback to revise the document (agent writes to file, not chat).[/dim]",
+        "[dim]  /doc status   — show current document info[/dim]",
+        "[dim]  /doc auto [N] — auto-iterate N rounds (default 5, max 10); Ctrl+C to stop[/dim]",
+        "[dim]  /doc done     — leave document mode (status unchanged)[/dim]",
+        "[dim]  /doc publish   — mark document as active (usable after /doc done)[/dim]",
+        "[dim]  Ctrl+C        — interrupt current revision[/dim]",
+    ]
+    if session.mode == ChatMode.ROUND_ROBIN and len(session.participants) >= 2:
+        author = session.participants[0].name
+        reviewer = session.participants[1].name
+        lines.append(f"[dim]  Round-robin: {author} revises → {reviewer} reviews (review blocks in doc)[/dim]")
+    console.print("\n".join(lines))
+    console.print("")
+
+
+def _submit_and_monitor(
+    *,
+    console: Console,
+    experiment_service: ExperimentService,
+    active_launch_exp: LaunchExpSession,
+    current_session,
+    service: ChatService,
+    planner: ExperimentPlanner,
+    _hypothesis_service,
+    first_participant,
+    max_retries: int = 3,
+    stabilize_seconds: int = 90,
+    poll_interval: int = 15,
+) -> bool:
+    """Submit experiment, monitor for early failures, auto-fix and resubmit.
+
+    After submission, polls the remote log for *stabilize_seconds*. If the
+    process dies early, shows the error log and lets the agent revise run.sh,
+    then resubmits. Gives up after *max_retries* total attempts.
+    """
+    from labit.paths import RepoPaths
+
+    executor = SSHExecutor(RepoPaths.discover())
+    attempt = 0
+
+    while attempt < max_retries:
+        attempt += 1
+        console.print(f"[dim]Submitting experiment (attempt {attempt}/{max_retries})...[/dim]")
+        try:
+            receipt = experiment_service.submit_experiment(active_launch_exp)
+        except Exception as submit_exc:
+            console.print(f"[bold red]Submission error:[/bold red] {submit_exc}")
+            console.print("[dim]Experiment finalized but not submitted.[/dim]")
+            return False
+
+        if not receipt.accepted:
+            console.print(
+                Panel(
+                    f"[bold]Error[/bold]: {receipt.stderr_tail}",
+                    title="[bold red]Submission Failed[/bold red]",
+                    border_style="red",
+                )
+            )
+            return False
+
+        console.print(
+            Panel(
+                f"[bold]PID[/bold]: {receipt.pid}\n"
+                f"[bold]Log[/bold]: {receipt.log_path}\n"
+                f"[bold]Host[/bold]: {receipt.remote_host}",
+                title=f"[bold green]Submitted (attempt {attempt})[/bold green]",
+                border_style="green",
+            )
+        )
+
+        # ── Monitor phase: poll for early crash ──
+        console.print(f"[dim]Monitoring for early failures ({stabilize_seconds}s)... Ctrl+C to skip.[/dim]")
+        # Build a minimal artifact for polling
+        from labit.experiments.models import (
+            ExecutionBackend,
+            FrozenLaunchSpec,
+            LaunchArtifact,
+        )
+
+        exec_profile = experiment_service.build_default_execution_profile(active_launch_exp.project)
+        poll_artifact = LaunchArtifact(
+            launch_id=receipt.remote_job_id or "",
+            task_id="experiment",
+            experiment_id=active_launch_exp.experiment_id,
+            project=active_launch_exp.project,
+            executor=ExecutionBackend.SSH,
+            remote_user=exec_profile.user,
+            remote_host=exec_profile.host,
+            remote_port=exec_profile.port,
+            ssh_key=exec_profile.ssh_key,
+            frozen_spec=FrozenLaunchSpec(
+                command=active_launch_exp.run_sh_content or "#!/bin/bash\ntrue",
+                workdir=exec_profile.workdir,
+                output_dir=f"outputs/experiments/{active_launch_exp.experiment_id}",
+                env={},
+            ),
+            submission=receipt,
+        )
+
+        elapsed = 0
+        crashed = False
+        crash_log = ""
+        try:
+            while elapsed < stabilize_seconds:
+                time.sleep(poll_interval)
+                elapsed += poll_interval
+                try:
+                    poll_result = executor.poll(poll_artifact)
+                except Exception:
+                    continue
+                status = poll_result.get("status", "unknown")
+                if status == "running":
+                    remaining = stabilize_seconds - elapsed
+                    console.print(f"[dim]  [{elapsed}s] Running... ({remaining}s to stable)[/dim]")
+                elif status == "stopped":
+                    # Process died — check if it's a crash or normal completion
+                    try:
+                        collected = executor.collect(poll_artifact)
+                    except Exception:
+                        collected = {}
+                    log_tail = str(collected.get("log_tail", poll_result.get("stdout", "")))
+                    # If stopped very early, likely a crash
+                    if elapsed <= stabilize_seconds:
+                        crashed = True
+                        crash_log = log_tail
+                        console.print(f"[bold red]  [{elapsed}s] Process stopped early![/bold red]")
+                    break
+                else:
+                    console.print(f"[dim]  [{elapsed}s] Status: {status}[/dim]")
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Monitoring skipped.[/yellow]")
+            return False
+
+        if not crashed:
+            console.print(
+                Panel(
+                    f"Experiment running for {elapsed}s without errors.",
+                    title="[bold green]Experiment Stable[/bold green]",
+                    border_style="green",
+                )
+            )
+            return True
+
+        # ── Crash detected: show error and auto-fix ──
+        console.print(
+            Panel(
+                crash_log[-2000:] if crash_log else "(no log captured)",
+                title="[bold red]Early Crash Detected[/bold red]",
+                border_style="red",
+            )
+        )
+
+        if attempt >= max_retries:
+            console.print(f"[bold red]Exhausted {max_retries} retries. Giving up.[/bold red]")
+            console.print("[dim]Use /launch-exp resume to manually fix and resubmit.[/dim]")
+            return False
+
+        # Auto-fix: have the agent revise run.sh based on the error
+        console.print(f"[dim]Auto-fixing run.sh based on error log (attempt {attempt + 1}/{max_retries})...[/dim]")
+        try:
+            hyp_detail = _hypothesis_service().load_hypothesis(
+                current_session.project, active_launch_exp.hypothesis_id
+            )
+            code_context = experiment_service.get_code_context(current_session.project)
+            tasks_json = json.dumps([t.model_dump() for t in active_launch_exp.task_plans], indent=2)
+            try:
+                workdir = exec_profile.workdir or ""
+                setup_summary = exec_profile.setup_script or ""
+            except Exception:
+                workdir = ""
+                setup_summary = ""
+
+            provider = first_participant.provider if first_participant else None
+            fix_instruction = (
+                f"The experiment crashed immediately after submission. "
+                f"Here is the error log from the remote:\n\n"
+                f"```\n{crash_log[-3000:]}\n```\n\n"
+                f"Fix the run.sh to address this error. Common issues: "
+                f"wrong paths, missing dependencies, incorrect CLI arguments, "
+                f"environment assumptions."
+            )
+
+            with console.status("[bold cyan]Agent fixing run.sh...[/bold cyan]"):
+                result = planner.revise_run_sh(
+                    current_run_sh=active_launch_exp.run_sh_content,
+                    current_config_yaml=active_launch_exp.config_yaml_content,
+                    tasks_json=tasks_json,
+                    user_instruction=fix_instruction,
+                    code_tree=code_context,
+                    workdir=workdir,
+                    setup_script_summary=setup_summary,
+                    provider=provider,
+                )
+            active_launch_exp = experiment_service.save_script(
+                active_launch_exp,
+                result["run_sh"],
+                result["config_yaml"],
+            )
+            console.print(
+                Panel(
+                    f"[bold]Fix summary[/bold]: {result['summary']}\n"
+                    f"[bold]run.sh[/bold] ({len(result['run_sh'].splitlines())} lines)",
+                    title="[bold yellow]Script Revised[/bold yellow]",
+                    border_style="yellow",
+                )
+            )
+        except Exception as fix_exc:
+            console.print(f"[bold red]Auto-fix failed:[/bold red] {fix_exc}")
+            console.print("[dim]Use /launch-exp resume to manually fix and resubmit.[/dim]")
+            return False
+
+    console.print(f"[bold red]Exhausted {max_retries} retries.[/bold red]")
+    return False
+
+
+def _print_launch_exp_hints(console: Console, session: LaunchExpSession) -> None:
+    phase_label = {
+        LaunchExpPhase.TASK_BREAKDOWN: "Task Breakdown",
+        LaunchExpPhase.TASK_PLANNING: "Task Planning",
+        LaunchExpPhase.SCRIPT_GENERATION: "Script Generation",
+    }.get(session.phase, session.phase.value)
+    lines = [
+        f"[dim]──── Experiment Planning Mode ({phase_label}) ────[/dim]",
+        "[dim]  Type feedback to iterate on the current phase.[/dim]",
+    ]
+    if session.phase == LaunchExpPhase.TASK_BREAKDOWN:
+        lines.append("[dim]  /launch-exp approve-tasks   — approve task list, move to detailed planning[/dim]")
+    elif session.phase == LaunchExpPhase.TASK_PLANNING:
+        ct = session.current_task
+        if ct:
+            lines.append(f"[dim]  Current task: {ct.id} — {ct.name}[/dim]")
+        lines.append("[dim]  /launch-exp approve-task     — approve current task's detail[/dim]")
+        lines.append("[dim]  /launch-exp reopen-task <id> — reopen a previously approved task[/dim]")
+    elif session.phase == LaunchExpPhase.SCRIPT_GENERATION:
+        lines.append("[dim]  /launch-exp generate-script  — generate run.sh[/dim]")
+        if session.run_sh_content:
+            lines.append("[dim]  /launch-exp done              — finalize and exit planning mode[/dim]")
+        else:
+            lines.append("[dim]  Generate script first, then /launch-exp done to finalize.[/dim]")
+    lines.append("[dim]  /launch-exp status            — show planning progress[/dim]")
+    lines.append("[dim]  Ctrl+C                        — interrupt current operation[/dim]")
+    console.print("\n".join(lines))
+    console.print("")
+
+
+def _render_task_breakdown(session: LaunchExpSession) -> None:
+    table = Table(title="Task Breakdown", show_header=True, border_style="blue")
+    table.add_column("ID", style="bold")
+    table.add_column("Name")
+    table.add_column("Goal")
+    table.add_column("Depends On")
+    table.add_column("Status")
+    for t in session.task_plans:
+        status = "[green]approved[/green]" if t.approved else "[dim]pending[/dim]"
+        deps = ", ".join(t.depends_on) if t.depends_on else "-"
+        table.add_row(t.id, t.name, t.goal[:80] if t.goal else "-", deps, status)
+    console.print(table)
+    console.print("")
+
+
+def _render_task_detail(task: ExperimentTaskPlan) -> None:
+    parts = [
+        f"[bold]ID[/bold]: {task.id}",
+        f"[bold]Name[/bold]: {task.name}",
+        f"[bold]Goal[/bold]: {task.goal}",
+    ]
+    if task.depends_on:
+        parts.append(f"[bold]Depends on[/bold]: {', '.join(task.depends_on)}")
+    if task.entry_hint:
+        parts.append(f"[bold]Entry hint[/bold]: {task.entry_hint}")
+    if task.inputs:
+        parts.append(f"[bold]Inputs[/bold]: {task.inputs}")
+    if task.outputs:
+        parts.append(f"[bold]Outputs[/bold]: {task.outputs}")
+    if task.checkpoint:
+        parts.append(f"[bold]Checkpoint[/bold]: {task.checkpoint}")
+    if task.failure_modes:
+        parts.append(f"[bold]Failure modes[/bold]: {task.failure_modes}")
+    console.print(
+        Panel(
+            "\n".join(parts),
+            title=f"[bold cyan]Task Detail: {task.id}[/bold cyan]",
+            border_style="cyan",
+        )
+    )
+
+
+def _render_launch_exp_status(session: LaunchExpSession) -> None:
+    phase_label = {
+        LaunchExpPhase.TASK_BREAKDOWN: "Task Breakdown",
+        LaunchExpPhase.TASK_PLANNING: "Task Planning",
+        LaunchExpPhase.SCRIPT_GENERATION: "Script Generation",
+    }.get(session.phase, session.phase.value)
+    approved = sum(1 for t in session.task_plans if t.approved)
+    total = len(session.task_plans)
+    parts = [
+        f"[bold]Hypothesis[/bold]: {session.hypothesis_id}",
+        f"[bold]Experiment[/bold]: {session.experiment_id}",
+        f"[bold]Phase[/bold]: {phase_label}",
+        f"[bold]Tasks[/bold]: {approved}/{total} approved",
+    ]
+    if session.phase == LaunchExpPhase.TASK_PLANNING:
+        ct = session.current_task
+        if ct:
+            parts.append(f"[bold]Current task[/bold]: {ct.id}: {ct.name}")
+    if session.run_sh_content:
+        parts.append(f"[bold]run.sh[/bold]: {len(session.run_sh_content.splitlines())} lines")
+    console.print(
+        Panel(
+            "\n".join(parts),
+            title="[bold blue]Experiment Planning Status[/bold blue]",
+            border_style="blue",
+        )
+    )
+
+
+def _render_doc_status(doc_session: DocSession) -> None:
+    console.print(
+        Panel(
+            (
+                f"[bold]ID[/bold]: {doc_session.doc_id}\n"
+                f"[bold]Title[/bold]: {doc_session.title}\n"
+                f"[bold]Status[/bold]: {doc_session.status.value}\n"
+                f"[bold]Project[/bold]: {doc_session.project}\n"
+                f"[bold]Document[/bold]: {doc_session.document_path}\n"
+                f"[bold]Interaction log[/bold]: {doc_session.log_path}\n"
+                f"[bold]Iterations[/bold]: {doc_session.iteration}\n"
+                f"[bold]Updated[/bold]: {doc_session.updated_at}"
+            ),
+            title="[bold green]Active Document Session[/bold green]",
             border_style="green",
         )
     )
@@ -671,10 +1141,12 @@ def _render_experiment_launch_preview(
         f"[bold]GPU[/bold]: {defaults.get('gpu') or '(blank)'}\n"
         f"[bold]Output dir[/bold]: {defaults.get('output_dir') or '(blank)'}\n"
         f"[bold]Command[/bold]: {defaults.get('command') or '(blank)'}\n\n"
+        f"[bold]Compute[/bold]: {execution.profile}\n"
         f"[bold]Backend[/bold]: {execution.backend.value}\n"
+        f"[bold]User[/bold]: {execution.user or '(blank)'}\n"
         f"[bold]Host[/bold]: {execution.host or '(blank)'}\n"
         f"[bold]Workdir[/bold]: {execution.workdir or '(blank)'}\n"
-        f"[bold]Runtime[/bold]: {execution.runtime.value}"
+        f"[bold]Setup[/bold]: {'configured' if execution.setup_script else '(blank)'}"
     )
     console.print(Panel(body, title="[bold green]Launch Experiment Preview[/bold green]", border_style="green"))
 
@@ -721,9 +1193,11 @@ def _launch_markdown(
         f"- Task: {task_id}",
         f"- Launch: {launch_id}",
         f"- Accepted: {'yes' if receipt.accepted else 'no'}",
+        f"- Compute: {execution.profile}",
         f"- Backend: {execution.backend.value}",
+        f"- User: {execution.user or '(blank)'}",
         f"- Host: {receipt.remote_host or execution.host or '(blank)'}",
-        f"- Runtime: {execution.runtime.value}",
+        f"- Setup: {'configured' if execution.setup_script else '(blank)'}",
         f"- Branch: {defaults.get('branch') or '(blank)'}",
         f"- Config: {defaults.get('config_ref') or '(blank)'}",
         f"- GPU: {defaults.get('gpu') or '(blank)'}",
@@ -897,32 +1371,86 @@ def _run_streaming_turn(
     attachments: list | None = None,
     force_deep_context: bool = False,
     reasoning_effort: str | None = None,
+    skip_participants: set[str] | None = None,
 ) -> object | None:
     _render_user_shell_message(query, attachments=attachments)
-    participant_panels: dict[str, str] = {}
+    # Temporarily filter out muted participants for this turn
+    effective_session = session
+    if skip_participants:
+        filtered = [p for p in session.participants if p.name not in skip_participants]
+        if filtered:
+            effective_session = session.model_copy(update={"participants": filtered})
+    participant_state = {
+        participant.name: {
+            "provider": participant.provider.value,
+            "content": "",
+            "status": "queued",
+            "started_at": None,
+            "thinking": None,
+        }
+        for participant in effective_session.participants
+    }
+    state_lock = threading.Lock()
+    live_lock = threading.Lock()
+    cancel_event = threading.Event()
 
-    def _render_live() -> list[Panel]:
+    def _render_live() -> Group:
         panels: list[Panel] = []
-        for participant in session.participants:
-            provider_name = participant.provider.value
-            content = participant_panels.get(participant.name, "")
-            panels.append(_agent_panel(participant.name, provider_name, content))
-        return panels
+        with state_lock:
+            snapshot = {
+                name: dict(values)
+                for name, values in participant_state.items()
+            }
+        for participant in effective_session.participants:
+            state = snapshot[participant.name]
+            status = state["status"]
+            if status == "queued":
+                continue
+            started_at = state["started_at"]
+            status_text = status
+            if started_at is not None and status in {"thinking", "streaming"}:
+                status_text = f"{status} · {time.monotonic() - started_at:.1f}s"
+            panels.append(
+                _agent_panel(
+                    participant.name,
+                    state["provider"],
+                    state["content"],
+                    thinking=state["thinking"],
+                    status_text=status_text,
+                )
+            )
+        return Group(*panels)
+
+    def _refresh_live() -> None:
+        with live_lock:
+            live.update(_render_live(), refresh=True)
 
     def _on_reply_start(participant) -> None:
-        participant_panels[participant.name] = ""
+        with state_lock:
+            participant_state[participant.name]["content"] = ""
+            participant_state[participant.name]["status"] = "thinking"
+            participant_state[participant.name]["started_at"] = time.monotonic()
+            participant_state[participant.name]["thinking"] = _ThinkingIndicator()
+        _refresh_live()
 
     def _on_reply_delta(participant, content: str) -> None:
-        participant_panels[participant.name] = content
-        live.update(_render_live(), refresh=True)
+        with state_lock:
+            participant_state[participant.name]["content"] = content
+            participant_state[participant.name]["status"] = "streaming" if content.strip() else "thinking"
+        _refresh_live()
 
     def _on_reply_complete(participant, content: str) -> None:
-        participant_panels[participant.name] = content
-        live.update(_render_live(), refresh=True)
+        with state_lock:
+            participant_state[participant.name]["content"] = content
+            participant_state[participant.name]["status"] = "done"
+            participant_state[participant.name]["thinking"] = None
+        _refresh_live()
 
-    with Live(_render_live(), console=console, refresh_per_second=8, transient=False) as live:
+    cancelled = False
+    result = None
+    with Live(_render_live(), console=console, refresh_per_second=8, transient=True) as live:
         try:
-            return service.ask_stream(
+            result = service.ask_stream(
                 session_id=session.session_id,
                 content=query,
                 attachments=attachments,
@@ -931,10 +1459,36 @@ def _run_streaming_turn(
                 on_reply_start=_on_reply_start,
                 on_reply_delta=_on_reply_delta,
                 on_reply_complete=_on_reply_complete,
+                cancel_event=cancel_event,
+                skip_participants=skip_participants,
             )
+        except KeyboardInterrupt:
+            cancel_event.set()
+            cancelled = True
         except Exception as exc:
             console.print(f"[bold red]Error:[/bold red] {exc}")
             return None
+
+    if result is not None and result.replies:
+        for reply in result.replies:
+            console.print(
+                _agent_panel(
+                    reply.participant.name,
+                    reply.participant.provider.value,
+                    reply.message.content,
+                    turn_index=reply.message.turn_index,
+                )
+            )
+            console.print("")
+
+    if cancelled:
+        with state_lock:
+            for state in participant_state.values():
+                if state["status"] in {"thinking", "streaming"}:
+                    state["status"] = "interrupted"
+                    state["thinking"] = None
+        console.print("[dim italic]Interrupted.[/dim italic]")
+    return result
 
 
 def run_chat_shell(
@@ -949,8 +1503,17 @@ def run_chat_shell(
     console.print("")
 
     current_session = session
+    active_doc: DocSession | None = None
+    # Hypothesis editing mode state: (hypothesis_id, project, current_draft)
+    active_hypothesis: tuple[str, str, HypothesisDraft] | None = None
+    active_launch_exp: LaunchExpSession | None = None
+    muted_next_turn: set[str] = set()  # agent names to skip on next turn only
     while True:
-        composer_result = _prompt_in_box(current_session)
+        try:
+            composer_result = _prompt_in_box(current_session)
+        except KeyboardInterrupt:
+            console.print("\n[dim]Leaving chat shell.[/dim]")
+            return
         raw = composer_result.text.strip()
         attachments = composer_result.attachments
         if not raw:
@@ -975,7 +1538,59 @@ def run_chat_shell(
                 _render_transcript(service.transcript(current_session.session_id))
                 continue
             if command == "/mode":
-                _render_session_summary(current_session)
+                if not argument:
+                    _render_session_summary(current_session)
+                    continue
+                mode_str = argument.strip().lower()
+                try:
+                    new_mode = ChatMode(mode_str)
+                except ValueError:
+                    console.print(f"[bold red]Invalid mode:[/bold red] {mode_str}. Use single, round_robin, or parallel.")
+                    continue
+                if new_mode == current_session.mode:
+                    console.print(f"[dim]Already in {new_mode.value} mode.[/dim]")
+                    continue
+                current_session = service.update_mode(current_session.session_id, new_mode)
+                console.print(f"[bold #0080ff]Switched to {new_mode.value} mode.[/bold #0080ff]")
+                if new_mode != ChatMode.SINGLE:
+                    names = ", ".join(p.name for p in current_session.participants)
+                    console.print(f"[dim]Participants: {names}[/dim]")
+                continue
+            if command == "/swap":
+                if len(current_session.participants) < 2:
+                    console.print("[dim]Need at least 2 participants to swap.[/dim]")
+                    continue
+                old_order = ", ".join(p.name for p in current_session.participants)
+                current_session = service.swap_participants(current_session.session_id)
+                new_order = ", ".join(p.name for p in current_session.participants)
+                console.print(f"[bold #0080ff]Swapped participant order:[/bold #0080ff] {old_order} → {new_order}")
+                continue
+            if command == "/mute":
+                if not argument:
+                    if muted_next_turn:
+                        console.print(f"[dim]Muted for next turn: {', '.join(muted_next_turn)}[/dim]")
+                    else:
+                        names = ", ".join(p.name for p in current_session.participants)
+                        console.print(f"[dim]Usage: /mute <agent_name>  (participants: {names})[/dim]")
+                    continue
+                target = argument.strip().lower()
+                matched = [p for p in current_session.participants if p.name.lower() == target]
+                if not matched:
+                    names = ", ".join(p.name for p in current_session.participants)
+                    console.print(f"[bold red]Unknown agent:[/bold red] {target}. Participants: {names}")
+                    continue
+                agent_name = matched[0].name
+                if agent_name in muted_next_turn:
+                    muted_next_turn.discard(agent_name)
+                    console.print(f"[bold #0080ff]Unmuted {agent_name}.[/bold #0080ff]")
+                else:
+                    # Don't allow muting all participants
+                    active_count = len([p for p in current_session.participants if p.name not in muted_next_turn])
+                    if active_count <= 1:
+                        console.print("[bold red]Error:[/bold red] Cannot mute all participants.")
+                        continue
+                    muted_next_turn.add(agent_name)
+                    console.print(f"[bold #0080ff]{agent_name} muted for next turn.[/bold #0080ff] (auto-unmutes after one turn)")
                 continue
             if command == "/memory":
                 if not current_session.project:
@@ -1001,6 +1616,312 @@ def run_chat_shell(
                     console.print(f"[bold red]Error:[/bold red] {exc}")
                     continue
                 _render_memory_detail(record)
+                continue
+            if command == "/doc":
+                doc_parts = argument.split(maxsplit=1)
+                doc_action = doc_parts[0].strip().lower() if doc_parts else "status"
+                doc_argument = doc_parts[1].strip() if len(doc_parts) > 1 else ""
+                if doc_action in {"status", ""}:
+                    if active_doc is None:
+                        console.print("[dim]No active document session. Use /doc start <title> or /doc open <id>.[/dim]")
+                    else:
+                        _render_doc_status(active_doc)
+                    continue
+                if doc_action == "done":
+                    if active_doc is None:
+                        console.print("[dim]No active document session.[/dim]")
+                    else:
+                        try:
+                            _document_service().end_session(active_doc)
+                        except Exception:
+                            pass
+                        console.print(
+                            f"[green]Document session closed.[/green] "
+                            f"[dim]{active_doc.doc_id} · {active_doc.document_path} ({active_doc.status.value})[/dim]"
+                        )
+                        active_doc = None
+                    continue
+                if doc_action == "publish":
+                    publish_target = doc_argument.strip()
+                    if not publish_target:
+                        if active_doc is None:
+                            console.print("[bold red]Usage:[/bold red] /doc publish <doc_id>")
+                            continue
+                        publish_target = active_doc.doc_id
+                    if not current_session.project:
+                        console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
+                        continue
+                    try:
+                        published_doc = _document_service().publish_document(
+                            project=current_session.project,
+                            doc_id=publish_target,
+                            source_session=current_session,
+                        )
+                        if active_doc is not None and active_doc.doc_id == published_doc.doc_id:
+                            active_doc = published_doc
+                        console.print(f"[green]Document published.[/green] [dim]{published_doc.doc_id} → active[/dim]")
+                    except Exception as exc:
+                        console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+                if doc_action == "list":
+                    if not current_session.project:
+                        console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
+                        continue
+                    try:
+                        docs = _document_service().list_documents(current_session.project)
+                    except Exception as exc:
+                        console.print(f"[bold red]Error:[/bold red] {exc}")
+                        continue
+                    if not docs:
+                        console.print("[dim]No documents found.[/dim]")
+                    else:
+                        from rich.table import Table as RichTable
+
+                        t = RichTable(title="Documents", border_style="dim")
+                        t.add_column("ID", style="bold")
+                        t.add_column("Title")
+                        t.add_column("Status")
+                        t.add_column("Updated")
+                        for d in docs:
+                            t.add_row(
+                                d.get("doc_id", "?"),
+                                d.get("title", "?"),
+                                d.get("status", "?"),
+                                d.get("updated_at", "?"),
+                            )
+                        console.print(t)
+                    continue
+                if doc_action == "open":
+                    doc_id = doc_argument.strip()
+                    if not doc_id:
+                        console.print("[bold red]Usage:[/bold red] /doc open <doc_id>")
+                        continue
+                    if not current_session.project:
+                        console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
+                        continue
+                    if active_doc is not None:
+                        console.print("[bold red]Error:[/bold red] A document session is already active. Use /doc done first.")
+                        continue
+                    try:
+                        active_doc = _document_service().open_document(
+                            project=current_session.project,
+                            doc_id=doc_id,
+                            session=current_session,
+                        )
+                    except Exception as exc:
+                        console.print(f"[bold red]Error:[/bold red] {exc}")
+                        continue
+                    status_note = ""
+                    if active_doc.status == DocStatus.DRAFT:
+                        status_note = " (demoted to draft for editing)"
+                    console.print(
+                        Panel(
+                            (
+                                f"[bold]ID[/bold]: {active_doc.doc_id}\n"
+                                f"[bold]Title[/bold]: {active_doc.title}\n"
+                                f"[bold]Status[/bold]: {active_doc.status.value}{status_note}\n"
+                                f"[bold]Document[/bold]: {active_doc.document_path}\n\n"
+                                    ),
+                            title="[bold green]Document opened[/bold green]",
+                            border_style="green",
+                        )
+                    )
+                    _print_doc_mode_hints(console, current_session)
+                    continue
+                if doc_action == "auto":
+                    if active_doc is None:
+                        console.print("[bold red]Error:[/bold red] No active document. Use /doc start or /doc open first.")
+                        continue
+                    # Parse round count
+                    max_rounds = 5
+                    if doc_argument.strip():
+                        try:
+                            max_rounds = int(doc_argument.strip())
+                        except ValueError:
+                            console.print("[bold red]Usage:[/bold red] /doc auto [N]  (N = number of rounds, default 5, max 10)")
+                            continue
+                    max_rounds = min(max(max_rounds, 1), 10)
+
+                    doc_service = _document_service()
+                    drafter = _doc_drafter()
+                    author = current_session.participants[0]
+                    reviewer = (
+                        current_session.participants[1]
+                        if current_session.mode == ChatMode.ROUND_ROBIN and len(current_session.participants) >= 2
+                        else None
+                    )
+
+                    console.print(f"[bold yellow]Auto-iteration starting: up to {max_rounds} rounds. Ctrl+C to stop.[/bold yellow]")
+                    # Initial instruction for first round: use reviewer's last review or generic
+                    auto_instruction = "Review the document and improve it. Fix any issues, improve clarity, and strengthen the content."
+
+                    interrupted = False
+                    for round_num in range(1, max_rounds + 1):
+                        console.print(f"\n[bold]── Round {round_num}/{max_rounds} ──[/bold]")
+                        try:
+                            old_markdown = doc_service.read_document(active_doc)
+
+                            # Author revises
+                            with console.status(f"[bold blue]{author.name} revising (round {round_num})...[/bold blue]"):
+                                update = drafter.revise_document(
+                                    session=current_session,
+                                    transcript=service.transcript(current_session.session_id),
+                                    context_snapshot=service.context_snapshot(current_session.session_id),
+                                    doc_title=active_doc.title,
+                                    current_markdown=old_markdown,
+                                    user_instruction=auto_instruction,
+                                    interaction_log=doc_service.interaction_excerpt(active_doc),
+                                    author_name=author.name,
+                                    provider=author.provider,
+                                )
+                                active_doc = doc_service.revise_document(
+                                    doc_session=active_doc,
+                                    update=update,
+                                    user_instruction=auto_instruction,
+                                )
+                            console.print(
+                                Panel(
+                                    f"[bold]Iteration[/bold]: {active_doc.iteration}\n[bold]Summary[/bold]: {update.summary}",
+                                    title=f"[bold green]{author.name} · Round {round_num}[/bold green]",
+                                    border_style="green",
+                                )
+                            )
+
+                            # Reviewer reviews (round-robin) or self-review (single)
+                            if reviewer is not None:
+                                from labit.documents.drafter import compute_changed_sections
+
+                                new_markdown = doc_service.read_document(active_doc)
+                                changed_sections = compute_changed_sections(old_markdown, new_markdown)
+
+                                with console.status(f"[bold cyan]{reviewer.name} reviewing (round {round_num})...[/bold cyan]"):
+                                    review_update = drafter.review_document(
+                                        current_markdown=new_markdown,
+                                        revision_summary=update.summary,
+                                        user_instruction=auto_instruction,
+                                        reviewer_name=reviewer.name,
+                                        changed_sections=changed_sections,
+                                        provider=reviewer.provider,
+                                    )
+                                    active_doc = doc_service.record_review(
+                                        doc_session=active_doc,
+                                        update=review_update,
+                                        reviewer_name=reviewer.name,
+                                    )
+                                console.print(
+                                    Panel(
+                                        f"[bold]Review[/bold]: {review_update.summary}",
+                                        title=f"[bold cyan]{reviewer.name} · Review[/bold cyan]",
+                                        border_style="cyan",
+                                    )
+                                )
+                                # Use reviewer feedback as next round's instruction
+                                auto_instruction = review_update.summary
+                            else:
+                                # Single agent: use own revision summary as next instruction
+                                auto_instruction = f"Continue improving. Previous changes: {update.summary}"
+
+                            # Convergence check: all review blocks closed + no new open reviews
+                            from labit.documents.drafter import count_open_reviews
+
+                            current_md = doc_service.read_document(active_doc)
+                            open_count = count_open_reviews(current_md)
+                            if open_count == 0:
+                                console.print(f"[bold green]Converged at round {round_num} — all review blocks resolved, no open issues remaining.[/bold green]")
+                                break
+                            else:
+                                console.print(f"[dim]  {open_count} open review(s) remaining[/dim]")
+
+                        except KeyboardInterrupt:
+                            console.print(f"\n[bold yellow]Auto-iteration interrupted at round {round_num}.[/bold yellow]")
+                            interrupted = True
+                            break
+                        except Exception as exc:
+                            console.print(f"[bold red]Error in round {round_num}:[/bold red] {exc}")
+                            break
+
+                    if not interrupted:
+                        console.print(f"[bold green]Auto-iteration complete. {active_doc.iteration} total iterations.[/bold green]")
+                    _print_doc_mode_hints(console, current_session)
+                    try:
+                        service.record_session_event(
+                            session_id=current_session.session_id,
+                            kind=SessionEventKind.ARTIFACT_DOCUMENT_UPDATED,
+                            actor="labit",
+                            summary=f"Document auto-iterated: {active_doc.title}",
+                            payload={
+                                "doc_id": active_doc.doc_id,
+                                "title": active_doc.title,
+                                "iteration": active_doc.iteration,
+                            },
+                            evidence_refs=_session_evidence_refs(current_session) + [f"document:{active_doc.document_path}"],
+                        )
+                    except Exception:
+                        pass
+                    continue
+                if doc_action != "start":
+                    console.print("[bold red]Usage:[/bold red] /doc start <title> | /doc open <id> | /doc auto [N] | /doc status | /doc done | /doc publish <id> | /doc list")
+                    continue
+                title = doc_argument
+                if not title:
+                    console.print("[bold red]Usage:[/bold red] /doc start <title>")
+                    continue
+                if not current_session.project:
+                    console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
+                    continue
+                if active_doc is not None:
+                    console.print("[bold red]Error:[/bold red] A document session is already active. Use /doc done first.")
+                    continue
+
+                doc_service = _document_service()
+                try:
+                    with console.status(f"[bold blue]{current_session.participants[0].name} writing document draft...[/bold blue]"):
+                        update = _doc_drafter().draft_from_session(
+                            session=current_session,
+                            transcript=service.transcript(current_session.session_id),
+                            context_snapshot=service.context_snapshot(current_session.session_id),
+                            title=title,
+                            provider=current_session.participants[0].provider,
+                        )
+                        active_doc = doc_service.start_document(
+                            project=current_session.project,
+                            title=title,
+                            update=update,
+                            session=current_session,
+                        )
+                except Exception as exc:
+                    console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                console.print(
+                    Panel(
+                        (
+                            f"[bold]ID[/bold]: {active_doc.doc_id}\n"
+                            f"[bold]Document[/bold]: {active_doc.document_path}\n"
+                            f"[bold]Interaction log[/bold]: {active_doc.log_path}\n"
+                            f"[bold]Summary[/bold]: {update.summary}\n\n"
+                            ),
+                        title="[bold green]Document draft saved[/bold green]",
+                        border_style="green",
+                    )
+                )
+                _print_doc_mode_hints(console, current_session)
+                try:
+                    service.record_session_event(
+                        session_id=current_session.session_id,
+                        kind=SessionEventKind.ARTIFACT_DOCUMENT_CREATED,
+                        actor="labit",
+                        summary=f"Document draft created: {update.title}",
+                        payload={
+                            "doc_id": active_doc.doc_id,
+                            "title": update.title,
+                            "document_path": active_doc.document_path,
+                            "log_path": active_doc.log_path,
+                        },
+                        evidence_refs=_session_evidence_refs(current_session) + [f"document:{active_doc.document_path}"],
+                    )
+                except Exception:
+                    pass
                 continue
             if command in {"/paste-image", "/image"}:
                 query = argument.strip() or "Please inspect the attached image and describe anything important."
@@ -1305,55 +2226,140 @@ def run_chat_shell(
                     pass
                 continue
             if command == "/hypothesis":
-                user_intent = argument
+                sub = argument.strip()
+                if not current_session.project:
+                    console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
+                    continue
+
+                # ── /hypothesis status ──
+                if sub == "status":
+                    if active_hypothesis is None:
+                        console.print("[dim]Not in hypothesis editing mode.[/dim]")
+                    else:
+                        h_id, h_proj, h_draft = active_hypothesis
+                        console.print(Panel(
+                            f"[bold]ID[/bold]: {h_id}\n"
+                            f"[bold]Title[/bold]: {h_draft.title}\n"
+                            f"[bold]Claim[/bold]: {h_draft.claim}",
+                            title=f"[bold green]Editing hypothesis · {h_id}[/bold green]",
+                            border_style="green",
+                        ))
+                    continue
+
+                # ── /hypothesis done ──
+                if sub == "done":
+                    if active_hypothesis is None:
+                        console.print("[dim]Not in hypothesis editing mode.[/dim]")
+                        continue
+                    h_id, h_proj, h_draft = active_hypothesis
+                    hyp_svc = _hypothesis_service()
+                    hyp_svc.log_event(h_proj, h_id, "session_ended")
+                    console.print(f"[dim]Left hypothesis editing mode. {h_id} saved.[/dim]")
+                    active_hypothesis = None
+                    continue
+
+                # ── /hypothesis open <id> ──
+                if sub.startswith("open "):
+                    h_id = sub[5:].strip()
+                    if not h_id:
+                        console.print("[bold red]Usage:[/bold red] /hypothesis open <hypothesis_id>")
+                        continue
+                    if active_hypothesis is not None:
+                        console.print("[bold red]Error:[/bold red] Already editing a hypothesis. Use /hypothesis done first.")
+                        continue
+                    try:
+                        hyp_svc = _hypothesis_service()
+                        detail = hyp_svc.load_hypothesis(current_session.project, h_id)
+                        # Reconstruct draft from detail
+                        h_draft = HypothesisDraft(
+                            title=detail.record.title,
+                            claim=detail.record.claim,
+                            motivation=detail.record.motivation,
+                            independent_variable=detail.record.independent_variable,
+                            dependent_variable=detail.record.dependent_variable,
+                            success_criteria=detail.record.success_criteria,
+                            failure_criteria=detail.record.failure_criteria,
+                            rationale_markdown=detail.rationale_markdown,
+                            experiment_plan_markdown=detail.experiment_plan_markdown,
+                            source_paper_ids=detail.record.source_paper_ids,
+                        )
+                        active_hypothesis = (h_id, current_session.project, h_draft)
+                        hyp_svc.log_event(current_session.project, h_id, "session_started")
+                    except Exception as exc:
+                        console.print(f"[bold red]Error:[/bold red] {exc}")
+                        continue
+                    console.print("")
+                    _render_hypothesis_preview(h_draft, project=current_session.project)
+                    _print_hypothesis_mode_hints(console, current_session, h_id)
+                    continue
+
+                # ── /hypothesis [idea] — draft new hypothesis ──
+                if active_hypothesis is not None:
+                    console.print("[bold red]Error:[/bold red] Already editing a hypothesis. Use /hypothesis done first.")
+                    continue
+                user_intent = sub
                 if user_intent == "new":
                     user_intent = ""
                 elif user_intent.startswith("new "):
                     user_intent = user_intent[4:].strip()
-                if not current_session.project:
-                    console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
-                    continue
                 try:
-                    with console.status("[bold blue]Drafting hypothesis from current session...[/bold blue]"):
-                        draft = _hypothesis_drafter().draft_from_session(
+                    drafter = _hypothesis_drafter()
+                    transcript_msgs = service.transcript(current_session.session_id)
+                    ctx_snap = service.context_snapshot(current_session.session_id)
+                    with console.status(f"[bold blue]{current_session.participants[0].name} drafting hypothesis...[/bold blue]"):
+                        draft = drafter.draft_from_session(
                             session=current_session,
-                            transcript=service.transcript(current_session.session_id),
-                            context_snapshot=service.context_snapshot(current_session.session_id),
+                            transcript=transcript_msgs,
+                            context_snapshot=ctx_snap,
                             user_intent=user_intent,
                             provider=current_session.participants[0].provider,
                         )
+                    use_round_robin = (
+                        current_session.mode == ChatMode.ROUND_ROBIN
+                        and len(current_session.participants) >= 2
+                    )
+                    if use_round_robin:
+                        reviewer = current_session.participants[1]
+                        with console.status(f"[bold blue]{reviewer.name} reviewing and refining...[/bold blue]"):
+                            draft = drafter.refine_draft(
+                                draft=draft,
+                                session=current_session,
+                                transcript=transcript_msgs,
+                                context_snapshot=ctx_snap,
+                                user_intent=user_intent,
+                                provider=reviewer.provider,
+                            )
+                except Exception as exc:
+                    console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                # Create hypothesis immediately and enter editing mode
+                try:
+                    hyp_svc = _hypothesis_service()
+                    detail = hyp_svc.create_hypothesis(
+                        project=current_session.project,
+                        draft=draft,
+                        source_session_id=current_session.session_id,
+                    )
+                    hyp_svc.log_event(current_session.project, detail.record.hypothesis_id, "session_started")
+                    active_hypothesis = (detail.record.hypothesis_id, current_session.project, draft)
                 except Exception as exc:
                     console.print(f"[bold red]Error:[/bold red] {exc}")
                     continue
 
                 console.print("")
                 _render_hypothesis_preview(draft, project=current_session.project)
-                if not _confirm_in_shell("Create this hypothesis?", default=True):
-                    console.print("[dim]Cancelled hypothesis creation.[/dim]")
-                    continue
-
-                try:
-                    detail = _hypothesis_service().create_hypothesis(
-                        project=current_session.project,
-                        draft=draft,
-                        source_session_id=current_session.session_id,
-                    )
-                except Exception as exc:
-                    console.print(f"[bold red]Error:[/bold red] {exc}")
-                    continue
-
-                console.print("")
                 console.print(
                     Panel(
                         (
                             f"[bold]Created[/bold]: {detail.record.hypothesis_id}\n"
-                            f"[bold]Path[/bold]: {detail.path}\n"
-                            f"[bold]Next[/bold]: labit hypothesis show {detail.record.hypothesis_id}"
+                            f"[bold]Path[/bold]: {detail.path}"
                         ),
                         title=f"[bold green]{detail.record.title}[/bold green]",
                         border_style="green",
                     )
                 )
+                _print_hypothesis_mode_hints(console, current_session, detail.record.hypothesis_id)
                 try:
                     service.record_session_event(
                         session_id=current_session.session_id,
@@ -1388,170 +2394,275 @@ def run_chat_shell(
                     pass
                 continue
             if command == "/launch-exp":
-                hypothesis_id = argument.strip()
-                if not hypothesis_id:
-                    console.print("[bold red]Usage:[/bold red] /launch-exp <hypothesis_id>")
-                    continue
+                sub_arg = argument.strip()
                 if not current_session.project:
                     console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
                     continue
 
                 experiment_service = _experiment_service()
-                try:
-                    execution = experiment_service.build_default_execution_profile(current_session.project)
-                    defaults = experiment_service.suggest_task_defaults(
-                        project=current_session.project,
-                        hypothesis_id=hypothesis_id,
-                    )
-                except Exception as exc:
-                    console.print(f"[bold red]Error:[/bold red] {exc}")
+
+                # ── Sub-commands when in planning mode ──
+                if sub_arg == "status":
+                    if active_launch_exp is None:
+                        console.print("[dim]Not in experiment planning mode.[/dim]")
+                    else:
+                        _render_launch_exp_status(active_launch_exp)
                     continue
 
-                console.print("")
-                _render_experiment_launch_preview(
-                    hypothesis_id=hypothesis_id,
-                    defaults=defaults,
-                    execution=execution,
-                )
-
-                if not defaults.get("command"):
-                    console.print("[yellow]No runnable command was inferred from the hypothesis. Fill it in before launch.[/yellow]")
-                    defaults["command"] = _prompt_text("Command")
-                elif _confirm_in_shell("Edit launch fields before submitting?", default=False):
-                    defaults["command"] = _prompt_optional("Command", default=defaults.get("command", ""))
-                    defaults["branch"] = _prompt_optional("Branch", default=defaults.get("branch", ""))
-                    defaults["config_ref"] = _prompt_optional("Config", default=defaults.get("config_ref", ""))
-                    defaults["gpu"] = _prompt_optional("GPU", default=defaults.get("gpu", ""))
-                    defaults["output_dir"] = _prompt_optional("Output dir", default=defaults.get("output_dir", ""))
-
-                if not defaults.get("command", "").strip():
-                    console.print("[bold red]Error:[/bold red] Launch command cannot be empty.")
-                    continue
-
-                try:
-                    draft = ExperimentDraft(
-                        title=defaults["title"],
-                        objective=defaults["objective"],
-                        execution=execution,
-                        source_session_id=current_session.session_id,
-                        source_paper_ids=[item for item in defaults.get("source_paper_ids", "").split(",") if item],
-                        tasks=[
-                            TaskDraft(
-                                title=defaults["title"],
-                                task_kind=TaskKind(defaults.get("task_kind", TaskKind.CUSTOM.value)),
-                                research_role=ResearchRole.EVIDENCE,
-                                spec=TaskSpec(
-                                    branch=defaults.get("branch", ""),
-                                    config_ref=defaults.get("config_ref", ""),
-                                    command=defaults.get("command", ""),
-                                    output_dir=defaults.get("output_dir", ""),
-                                ),
-                                resources=TaskResources(profile="default", gpu=defaults.get("gpu", "")),
-                            )
-                        ],
-                    )
-                except Exception as exc:
-                    console.print(f"[bold red]Error:[/bold red] {exc}")
-                    continue
-
-                if not _confirm_in_shell("Create experiment and submit the first task?", default=True):
-                    console.print("[dim]Cancelled launch.[/dim]")
-                    continue
-
-                try:
-                    detail = experiment_service.create_experiment(
-                        project=current_session.project,
-                        hypothesis_id=hypothesis_id,
-                        draft=draft,
-                    )
-                    first_task_id = detail.tasks[0].task_id
-                    artifact = experiment_service.materialize_launch_artifact(
-                        project=current_session.project,
-                        experiment_id=detail.record.experiment_id,
-                        task_id=first_task_id,
-                    )
-                    receipt = SSHExecutor(RepoPaths.discover()).submit(artifact)
-                    artifact = experiment_service.record_submission_receipt(
-                        project=current_session.project,
-                        experiment_id=detail.record.experiment_id,
-                        launch_id=artifact.launch_id,
-                        receipt=receipt,
-                    )
-                    experiment_service.write_launch_markdown(
-                        project=current_session.project,
-                        experiment_id=detail.record.experiment_id,
-                        content=_launch_markdown(
-                            hypothesis_id=hypothesis_id,
-                            experiment_id=detail.record.experiment_id,
-                            task_id=first_task_id,
-                            launch_id=artifact.launch_id,
-                            defaults=defaults,
-                            execution=execution,
-                            receipt=receipt,
-                        ),
-                    )
-                except Exception as exc:
-                    console.print(f"[bold red]Error:[/bold red] {exc}")
-                    continue
-
-                console.print(
-                    Panel(
-                        (
-                            f"[bold]Experiment[/bold]: {detail.record.experiment_id}\n"
-                            f"[bold]Task[/bold]: {first_task_id}\n"
-                            f"[bold]Launch[/bold]: {artifact.launch_id}\n"
-                            f"[bold]Accepted[/bold]: {receipt.accepted}\n"
-                            f"[bold]Host[/bold]: {receipt.remote_host or '(blank)'}\n"
-                            f"[bold]PID[/bold]: {receipt.pid or '(none)'}\n"
-                            f"[bold]Log[/bold]: {receipt.log_path or '(none)'}\n"
-                            f"[bold]stderr[/bold]: {receipt.stderr_tail or '(blank)'}\n"
-                            f"[bold]Path[/bold]: vault/projects/{current_session.project}/experiments/{detail.record.experiment_id}"
-                        ),
-                        title="[bold green]Experiment launch[/bold green]" if receipt.accepted else "[bold red]Experiment launch failed[/bold red]",
-                        border_style="green" if receipt.accepted else "red",
-                    )
-                )
-                try:
-                    service.record_session_event(
-                        session_id=current_session.session_id,
-                        kind=SessionEventKind.ARTIFACT_EXPERIMENT_CREATED,
-                        actor="labit",
-                        summary=f"Experiment created: {detail.record.experiment_id} for {hypothesis_id}",
-                        payload={
-                            "experiment_id": detail.record.experiment_id,
-                            "hypothesis_id": hypothesis_id,
-                            "task_id": first_task_id,
-                            "launch_id": artifact.launch_id,
-                            "accepted": receipt.accepted,
-                            "remote_host": receipt.remote_host,
-                            "pid": receipt.pid,
-                            "log_path": receipt.log_path,
-                        },
-                        evidence_refs=_session_evidence_refs(current_session)
-                        + [f"hypothesis:{hypothesis_id}", f"experiment:{detail.record.experiment_id}"],
-                    )
-                except Exception:
-                    pass
-                if receipt.accepted:
-                    try:
-                        service.record_session_event(
-                            session_id=current_session.session_id,
-                            kind=SessionEventKind.ARTIFACT_TASK_LAUNCHED,
-                            actor="labit",
-                            summary=f"Task launched: {detail.record.experiment_id}/{first_task_id}/{artifact.launch_id}",
-                            payload={
-                                "experiment_id": detail.record.experiment_id,
-                                "task_id": first_task_id,
-                                "launch_id": artifact.launch_id,
-                                "remote_host": receipt.remote_host,
-                                "pid": receipt.pid,
-                                "log_path": receipt.log_path,
-                            },
-                            evidence_refs=_session_evidence_refs(current_session)
-                            + [f"experiment:{detail.record.experiment_id}", f"launch:{artifact.launch_id}"],
+                if sub_arg == "approve-tasks":
+                    if active_launch_exp is None or active_launch_exp.phase != LaunchExpPhase.TASK_BREAKDOWN:
+                        console.print("[bold red]Error:[/bold red] Not in task breakdown phase.")
+                        continue
+                    if not active_launch_exp.task_plans:
+                        console.print("[bold red]Error:[/bold red] No tasks to approve.")
+                        continue
+                    dep_err = experiment_service.validate_dependency_graph(active_launch_exp.task_plans)
+                    if dep_err:
+                        console.print(f"[bold red]Dependency error:[/bold red] {dep_err}")
+                        continue
+                    active_launch_exp = experiment_service.approve_task_list(active_launch_exp)
+                    ct = active_launch_exp.current_task
+                    console.print(
+                        Panel(
+                            f"Task list approved ({len(active_launch_exp.task_plans)} tasks).\n"
+                            f"Now planning task details. Starting with: [bold]{ct.id}: {ct.name}[/bold]" if ct else "All tasks already approved.",
+                            title="[bold green]Phase: Task Planning[/bold green]",
+                            border_style="green",
                         )
-                    except Exception:
-                        pass
+                    )
+                    _print_launch_exp_hints(console, active_launch_exp)
+                    continue
+
+                if sub_arg.startswith("approve-task"):
+                    task_id = sub_arg.replace("approve-task", "").strip()
+                    if active_launch_exp is None or active_launch_exp.phase != LaunchExpPhase.TASK_PLANNING:
+                        console.print("[bold red]Error:[/bold red] Not in task planning phase.")
+                        continue
+                    if not task_id:
+                        ct = active_launch_exp.current_task
+                        task_id = ct.id if ct else ""
+                    if not task_id:
+                        console.print("[bold red]Error:[/bold red] No task to approve.")
+                        continue
+                    active_launch_exp = experiment_service.approve_task(active_launch_exp, task_id)
+                    if active_launch_exp.phase == LaunchExpPhase.SCRIPT_GENERATION:
+                        console.print(
+                            Panel(
+                                "All tasks approved! Ready to generate run.sh.\n"
+                                "Type feedback or use [bold]/launch-exp generate-script[/bold] to generate.",
+                                title="[bold green]Phase: Script Generation[/bold green]",
+                                border_style="green",
+                            )
+                        )
+                        _print_launch_exp_hints(console, active_launch_exp)
+                    else:
+                        ct = active_launch_exp.current_task
+                        console.print(f"[green]Task {task_id} approved.[/green] Next: [bold]{ct.id}: {ct.name}[/bold]" if ct else f"[green]Task {task_id} approved.[/green]")
+                        _print_launch_exp_hints(console, active_launch_exp)
+                    continue
+
+                if sub_arg.startswith("reopen-task"):
+                    task_id = sub_arg.replace("reopen-task", "").strip()
+                    if active_launch_exp is None:
+                        console.print("[bold red]Error:[/bold red] Not in experiment planning mode.")
+                        continue
+                    if not task_id:
+                        console.print("[bold red]Usage:[/bold red] /launch-exp reopen-task <task_id>")
+                        continue
+                    try:
+                        active_launch_exp = experiment_service.reopen_task(active_launch_exp, task_id)
+                        console.print(f"[yellow]Task {task_id} reopened.[/yellow] Now re-planning it.")
+                    except ValueError as exc:
+                        console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                if sub_arg == "generate-script":
+                    if active_launch_exp is None or active_launch_exp.phase != LaunchExpPhase.SCRIPT_GENERATION:
+                        console.print("[bold red]Error:[/bold red] Not in script generation phase. Approve all tasks first.")
+                        continue
+                    try:
+                        hyp_detail = _hypothesis_service().load_hypothesis(current_session.project, active_launch_exp.hypothesis_id)
+                        code_context = experiment_service.get_code_context(current_session.project)
+                        planner = ExperimentPlanner(RepoPaths.discover())
+                        first_participant = current_session.participants[0] if current_session.participants else None
+                        provider = first_participant.provider if first_participant else None
+                        # Get runtime context for the script prompt
+                        try:
+                            exec_profile = experiment_service.build_default_execution_profile(current_session.project)
+                            workdir = exec_profile.workdir or ""
+                            setup_summary = exec_profile.setup_script or ""
+                        except Exception:
+                            workdir = ""
+                            setup_summary = ""
+                        with console.status("[bold cyan]Generating run.sh...[/bold cyan]"):
+                            result = planner.generate_run_sh(
+                                session=active_launch_exp,
+                                hypothesis_title=hyp_detail.record.title,
+                                hypothesis_claim=hyp_detail.record.claim,
+                                code_tree=code_context,
+                                workdir=workdir,
+                                setup_script_summary=setup_summary,
+                                provider=provider,
+                            )
+                        active_launch_exp = experiment_service.save_script(
+                            active_launch_exp,
+                            result["run_sh"],
+                            result["config_yaml"],
+                        )
+                        console.print(
+                            Panel(
+                                f"[bold]Summary[/bold]: {result['summary']}\n\n"
+                                f"[bold]run.sh[/bold] ({len(result['run_sh'].splitlines())} lines)\n"
+                                + ("" if not result["config_yaml"] else f"[bold]config.yaml[/bold] generated\n")
+                                + "\nType feedback to revise, or [bold]/launch-exp done[/bold] to finalize.",
+                                title="[bold green]Script Generated[/bold green]",
+                                border_style="green",
+                            )
+                        )
+                        _print_launch_exp_hints(console, active_launch_exp)
+                    except Exception as exc:
+                        console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                if sub_arg == "done":
+                    if active_launch_exp is None:
+                        console.print("[dim]Not in experiment planning mode.[/dim]")
+                        continue
+                    if active_launch_exp.phase != LaunchExpPhase.SCRIPT_GENERATION:
+                        console.print("[yellow]Warning:[/yellow] Not all phases completed. Exiting anyway.")
+                    submit_ok = False
+                    if active_launch_exp.run_sh_content:
+                        try:
+                            detail = experiment_service.finalize_experiment(active_launch_exp)
+                            console.print(
+                                Panel(
+                                    f"[bold]Experiment[/bold]: {detail.record.experiment_id}\n"
+                                    f"[bold]Hypothesis[/bold]: {active_launch_exp.hypothesis_id}\n"
+                                    f"[bold]Tasks[/bold]: {len(detail.tasks)}\n"
+                                    f"[bold]Path[/bold]: {detail.path}",
+                                    title="[bold green]Experiment Finalized[/bold green]",
+                                    border_style="green",
+                                )
+                            )
+                            # Submit + monitor loop
+                            submit_ok = _submit_and_monitor(
+                                console=console,
+                                experiment_service=experiment_service,
+                                active_launch_exp=active_launch_exp,
+                                current_session=current_session,
+                                service=service,
+                                planner=ExperimentPlanner(RepoPaths.discover()),
+                                _hypothesis_service=_hypothesis_service,
+                                first_participant=current_session.participants[0] if current_session.participants else None,
+                            )
+                            try:
+                                summary = (
+                                    f"Experiment planned and submitted: {detail.record.experiment_id} "
+                                    f"for {active_launch_exp.hypothesis_id}"
+                                    if submit_ok
+                                    else f"Experiment planned (submission pending): {detail.record.experiment_id} "
+                                         f"for {active_launch_exp.hypothesis_id}"
+                                )
+                                service.record_session_event(
+                                    session_id=current_session.session_id,
+                                    kind=SessionEventKind.ARTIFACT_EXPERIMENT_CREATED,
+                                    actor="labit",
+                                    summary=summary,
+                                    payload={
+                                        "experiment_id": detail.record.experiment_id,
+                                        "hypothesis_id": active_launch_exp.hypothesis_id,
+                                        "task_count": len(detail.tasks),
+                                        "submitted": submit_ok,
+                                    },
+                                    evidence_refs=_session_evidence_refs(current_session)
+                                    + [f"hypothesis:{active_launch_exp.hypothesis_id}", f"experiment:{detail.record.experiment_id}"],
+                                )
+                            except Exception:
+                                pass
+                        except Exception as exc:
+                            console.print(f"[bold red]Error finalizing:[/bold red] {exc}")
+                    else:
+                        console.print("[dim]No script generated. Experiment not finalized.[/dim]")
+                    if submit_ok:
+                        active_launch_exp = None
+                    continue
+
+                # ── Resume existing experiment ──
+                if sub_arg.startswith("resume"):
+                    exp_id = sub_arg.replace("resume", "").strip()
+                    if not exp_id:
+                        console.print("[bold red]Usage:[/bold red] /launch-exp resume <experiment_id>")
+                        continue
+                    if active_launch_exp is not None:
+                        console.print(f"[bold red]Error:[/bold red] Already planning experiment for {active_launch_exp.hypothesis_id}. Use /launch-exp done first.")
+                        continue
+                    try:
+                        active_launch_exp = experiment_service.resume_launch_exp_session(
+                            project=current_session.project,
+                            experiment_id=exp_id,
+                        )
+                        phase_label = active_launch_exp.phase.value.replace("_", " ").title()
+                        console.print(
+                            Panel(
+                                f"[bold]Experiment[/bold]: {exp_id}\n"
+                                f"[bold]Hypothesis[/bold]: {active_launch_exp.hypothesis_id}\n"
+                                f"[bold]Tasks[/bold]: {len(active_launch_exp.task_plans)}\n"
+                                f"[bold]Phase[/bold]: {phase_label}\n"
+                                f"[bold]Has run.sh[/bold]: {'yes' if active_launch_exp.run_sh_content else 'no'}",
+                                title="[bold cyan]Experiment Resumed[/bold cyan]",
+                                border_style="cyan",
+                            )
+                        )
+                        _print_launch_exp_hints(console, active_launch_exp)
+                    except Exception as exc:
+                        console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                # ── Start new planning session ──
+                hypothesis_id = sub_arg
+                if not hypothesis_id:
+                    console.print("[bold red]Usage:[/bold red] /launch-exp <hypothesis_id>")
+                    continue
+                if active_launch_exp is not None:
+                    console.print(f"[bold red]Error:[/bold red] Already planning experiment for {active_launch_exp.hypothesis_id}. Use /launch-exp done first.")
+                    continue
+
+                try:
+                    hyp_detail = _hypothesis_service().load_hypothesis(current_session.project, hypothesis_id)
+                    active_launch_exp = experiment_service.start_launch_exp_session(
+                        project=current_session.project,
+                        hypothesis_id=hypothesis_id,
+                    )
+                    code_tree = experiment_service.get_code_tree(current_session.project)
+                except Exception as exc:
+                    console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                # Draft initial task breakdown
+                try:
+                    planner = ExperimentPlanner(RepoPaths.discover())
+                    first_participant = current_session.participants[0] if current_session.participants else None
+                    provider = first_participant.provider if first_participant else None
+                    with console.status("[bold cyan]Drafting task breakdown...[/bold cyan]"):
+                        tasks = planner.draft_task_breakdown(
+                            session=current_session,
+                            transcript=service.transcript(current_session.session_id),
+                            context_snapshot=service.context_snapshot(current_session.session_id),
+                            hypothesis_title=hyp_detail.record.title,
+                            hypothesis_claim=hyp_detail.record.claim,
+                            experiment_plan_md=hyp_detail.experiment_plan_markdown,
+                            code_tree=code_tree,
+                            provider=provider,
+                        )
+                    active_launch_exp = experiment_service.save_task_plans(active_launch_exp, tasks)
+                except Exception as exc:
+                    console.print(f"[bold red]Error drafting tasks:[/bold red] {exc}")
+                    active_launch_exp = None
+                    continue
+
+                # Display task breakdown
+                _render_task_breakdown(active_launch_exp)
+                _print_launch_exp_hints(console, active_launch_exp)
                 continue
             if command == "/debrief":
                 if not current_session.project:
@@ -1567,10 +2678,66 @@ def run_chat_shell(
                 rows: list[str] = []
                 rows_by_experiment: dict[str, list[str]] = {}
                 executor = SSHExecutor(RepoPaths.discover())
+                seen_launch_ids: set[str] = set()
+                max_rows = 10
                 for summary in experiments:
                     detail = experiment_service.load_experiment(current_session.project, summary.experiment_id)
+
+                    if len(rows) >= max_rows:
+                        break
+
+                    # ── Scan experiment-level launches (only latest per experiment) ──
+                    has_experiment_launch = False
+                    launches_dir = experiment_service.tasks_dir(
+                        current_session.project, detail.record.experiment_id
+                    ) / "launches"
+                    if launches_dir.is_dir():
+                        # Only show the most recent launch (sorted reverse = newest first)
+                        for launch_subdir in sorted(launches_dir.iterdir(), reverse=True):
+                            launch_yaml = launch_subdir / "launch.yaml"
+                            if not launch_yaml.exists():
+                                continue
+                            try:
+                                artifact = experiment_service.load_launch_artifact(
+                                    current_session.project,
+                                    detail.record.experiment_id,
+                                    launch_subdir.name,
+                                )
+                            except Exception:
+                                continue
+                            if not artifact.submission or not artifact.submission.accepted:
+                                continue
+                            seen_launch_ids.add(artifact.launch_id)
+                            try:
+                                collected = executor.collect(artifact)
+                            except Exception:
+                                collected = {}
+                            collected_status = str(collected.get("status", "unknown")).strip() or "unknown"
+                            log_tail = str(collected.get("log_tail", ""))[:500]
+                            status_label = collected_status
+                            if collected_status == "stopped":
+                                has_output = collected.get("output_dir_exists") or collected.get("artifact_refs")
+                                status_label = "completed" if has_output else "failed"
+
+                            row = (
+                                f"- {detail.record.experiment_id}/{artifact.launch_id} · "
+                                f"{status_label}"
+                            )
+                            if log_tail:
+                                last_line = log_tail.strip().rsplit("\n", 1)[-1][:120]
+                                row += f" · {last_line}"
+                            rows.append(f"[bold]{row.split(' · ', 1)[0]}[/bold] · {row.split(' · ', 1)[1]}")
+                            rows_by_experiment.setdefault(detail.record.experiment_id, []).append(row)
+                            has_experiment_launch = True
+                            break  # only show latest launch per experiment
+
+                    # ── Scan task-level launches ──
+                    if has_experiment_launch or len(rows) >= max_rows:
+                        continue
                     for task in detail.tasks:
                         if not task.latest_launch_id:
+                            continue
+                        if task.latest_launch_id in seen_launch_ids:
                             continue
                         task_record = experiment_service.load_task(
                             current_session.project,
@@ -1635,6 +2802,8 @@ def run_chat_shell(
                         )
                         rows.append(f"[bold]{row.split(' · ', 1)[0]}[/bold] · {row.split(' · ', 1)[1]}")
                         rows_by_experiment.setdefault(detail.record.experiment_id, []).append(row)
+                        if len(rows) >= max_rows:
+                            break
 
                 console.print("[bold]Debrief[/bold]")
                 if not rows:
@@ -1789,6 +2958,9 @@ def run_chat_shell(
                         second_provider=second_provider,
                         project=_project_service().active_project_name(),
                     )
+                    active_doc = None
+                    active_hypothesis = None
+                    active_launch_exp = None
                 except Exception as exc:
                     console.print(f"[bold red]Error:[/bold red] {exc}")
                     continue
@@ -1801,6 +2973,9 @@ def run_chat_shell(
                     continue
                 try:
                     current_session = service.load_session(argument)
+                    active_doc = None
+                    active_hypothesis = None
+                    active_launch_exp = None
                 except Exception as exc:
                     console.print(f"[bold red]Error:[/bold red] {exc}")
                     continue
@@ -1813,65 +2988,324 @@ def run_chat_shell(
             console.print(f"[bold red]Unknown command:[/bold red] {command}")
             continue
 
-        current_live: Live | None = None
-        current_stream_participant: str | None = None
-        current_thinking: _ThinkingIndicator | None = None
+        # ── Launch-exp planning mode ──
+        if active_launch_exp is not None:
+            if attachments:
+                console.print("[bold red]Error:[/bold red] Experiment planning mode does not support image attachments yet.")
+                continue
+            exp_service = _experiment_service()
+            planner = ExperimentPlanner(RepoPaths.discover())
+            first_participant = current_session.participants[0] if current_session.participants else None
+            provider = first_participant.provider if first_participant else None
+            phase = active_launch_exp.phase
 
-        def _on_reply_start(participant) -> None:
-            nonlocal current_live, current_stream_participant, current_thinking
-            current_stream_participant = participant.name
-            current_thinking = _ThinkingIndicator()
-            console.print("")
-            current_live = Live(
-                _agent_panel(participant.name, participant.provider.value, "", thinking=current_thinking),
-                console=console,
-                refresh_per_second=12,
-                transient=False,
-            )
-            current_live.start()
+            try:
+                exp_service.log_user_instruction(active_launch_exp, raw)
 
-        def _on_reply_delta(participant, content: str) -> None:
-            nonlocal current_thinking
-            if current_live is None or current_stream_participant != participant.name:
-                _on_reply_start(participant)
-            assert current_live is not None
-            if content.strip():
-                current_thinking = None
-            current_live.update(
-                _agent_panel(participant.name, participant.provider.value, content, thinking=current_thinking)
-            )
+                if phase == LaunchExpPhase.TASK_BREAKDOWN:
+                    # User is iterating on task list
+                    hyp_detail = _hypothesis_service().load_hypothesis(current_session.project, active_launch_exp.hypothesis_id)
+                    with console.status("[bold blue]Revising task breakdown...[/bold blue]"):
+                        revised_tasks = planner.revise_task_breakdown(
+                            current_tasks=active_launch_exp.task_plans,
+                            user_instruction=raw,
+                            hypothesis_title=hyp_detail.record.title,
+                            hypothesis_claim=hyp_detail.record.claim,
+                            interaction_log=exp_service.planning_interaction_excerpt(active_launch_exp),
+                            provider=provider,
+                        )
+                    dep_err = exp_service.validate_dependency_graph(revised_tasks)
+                    if dep_err:
+                        console.print(f"[yellow]Warning:[/yellow] {dep_err}")
+                    active_launch_exp = exp_service.save_task_plans(active_launch_exp, revised_tasks)
+                    exp_service.log_agent_revision(active_launch_exp, f"Revised task breakdown: {len(revised_tasks)} tasks", first_participant.name if first_participant else "")
+                    _render_task_breakdown(active_launch_exp)
 
-        def _on_reply_complete(participant, content: str) -> None:
-            nonlocal current_live, current_stream_participant, current_thinking
-            current_thinking = None
-            if current_live is None:
-                console.print("")
-                console.print(_agent_panel(participant.name, participant.provider.value, content))
-                console.print("")
-                return
-            current_live.update(_agent_panel(participant.name, participant.provider.value, content))
-            current_live.stop()
-            current_live = None
-            current_stream_participant = None
-            console.print("")
+                elif phase == LaunchExpPhase.TASK_PLANNING:
+                    # User is iterating on current task's detail
+                    ct = active_launch_exp.current_task
+                    if ct is None:
+                        console.print("[dim]No task to plan. Use /launch-exp approve-tasks or /launch-exp done.[/dim]")
+                        continue
+                    hyp_detail = _hypothesis_service().load_hypothesis(current_session.project, active_launch_exp.hypothesis_id)
+                    code_tree = exp_service.get_code_tree(current_session.project)
+                    with console.status(f"[bold blue]Planning {ct.id}: {ct.name}...[/bold blue]"):
+                        detailed_task = planner.plan_task_detail(
+                            task=ct,
+                            all_tasks=active_launch_exp.task_plans,
+                            hypothesis_title=hyp_detail.record.title,
+                            hypothesis_claim=hyp_detail.record.claim,
+                            code_tree=code_tree,
+                            user_instruction=raw,
+                            interaction_log=exp_service.planning_interaction_excerpt(active_launch_exp),
+                            provider=provider,
+                        )
+                    active_launch_exp = exp_service.update_task_detail(active_launch_exp, detailed_task)
+                    exp_service.log_agent_revision(active_launch_exp, f"Planned {ct.id}: {ct.name}", first_participant.name if first_participant else "")
+                    _render_task_detail(detailed_task)
 
-        console.print("")
-        _render_user_shell_message(raw, attachments=attachments)
-        try:
-            result = service.ask_stream(
-                session_id=current_session.session_id,
-                content=raw,
-                attachments=attachments,
-                on_reply_start=_on_reply_start,
-                on_reply_delta=_on_reply_delta,
-                on_reply_complete=_on_reply_complete,
-            )
-        except Exception as exc:
-            if current_live is not None:
-                current_live.stop()
-            console.print(f"[bold red]Error:[/bold red] {exc}")
+                elif phase == LaunchExpPhase.SCRIPT_GENERATION:
+                    # User is iterating on run.sh
+                    hyp_detail = _hypothesis_service().load_hypothesis(current_session.project, active_launch_exp.hypothesis_id)
+                    code_tree = exp_service.get_code_context(current_session.project)
+                    tasks_json = json.dumps([t.model_dump() for t in active_launch_exp.task_plans], indent=2)
+                    # Get runtime context for revision prompt
+                    try:
+                        exec_profile = exp_service.build_default_execution_profile(current_session.project)
+                        workdir = exec_profile.workdir or ""
+                        setup_summary = exec_profile.setup_script or ""
+                    except Exception:
+                        workdir = ""
+                        setup_summary = ""
+                    with console.status("[bold blue]Revising run.sh...[/bold blue]"):
+                        result = planner.revise_run_sh(
+                            current_run_sh=active_launch_exp.run_sh_content,
+                            current_config_yaml=active_launch_exp.config_yaml_content,
+                            tasks_json=tasks_json,
+                            user_instruction=raw,
+                            code_tree=code_tree,
+                            workdir=workdir,
+                            setup_script_summary=setup_summary,
+                            provider=provider,
+                        )
+                    active_launch_exp = exp_service.save_script(
+                        active_launch_exp,
+                        result["run_sh"],
+                        result["config_yaml"],
+                    )
+                    exp_service.log_agent_revision(active_launch_exp, result["summary"], first_participant.name if first_participant else "")
+                    console.print(
+                        Panel(
+                            f"[bold]Summary[/bold]: {result['summary']}\n"
+                            f"[bold]run.sh[/bold]: {len(result['run_sh'].splitlines())} lines",
+                            title="[bold green]Script Revised[/bold green]",
+                            border_style="green",
+                        )
+                    )
+
+            except KeyboardInterrupt:
+                console.print("[dim italic]Interrupted.[/dim italic]")
+            except Exception as exc:
+                console.print(f"[bold red]Error:[/bold red] {exc}")
             continue
-        current_session = result.session
+
+        # ── Hypothesis editing mode ──
+        if active_hypothesis is not None:
+            if attachments:
+                console.print("[bold red]Error:[/bold red] Hypothesis mode does not support image attachments yet.")
+                continue
+            h_id, h_proj, h_draft = active_hypothesis
+            hyp_drafter = _hypothesis_drafter()
+            hyp_svc = _hypothesis_service()
+            author = current_session.participants[0]
+            try:
+                # Log user instruction
+                hyp_svc.log_event(h_proj, h_id, "user_instruction", content=raw)
+
+                # Step 1: Author revises hypothesis
+                with console.status(f"[bold blue]{author.name} revising hypothesis...[/bold blue]"):
+                    revised_draft = hyp_drafter.revise_hypothesis(
+                        current_draft=h_draft,
+                        session=current_session,
+                        transcript=service.transcript(current_session.session_id),
+                        context_snapshot=service.context_snapshot(current_session.session_id),
+                        user_instruction=raw,
+                        interaction_log=hyp_svc.interaction_excerpt(h_proj, h_id),
+                        provider=author.provider,
+                    )
+                    detail = hyp_svc.revise_hypothesis_files(
+                        project=h_proj,
+                        hypothesis_id=h_id,
+                        draft=revised_draft,
+                        user_instruction=raw,
+                        agent_name=author.name,
+                    )
+
+                # Update active state
+                active_hypothesis = (h_id, h_proj, revised_draft)
+
+                # Show revision summary
+                console.print(
+                    Panel(
+                        (
+                            f"[bold]ID[/bold]: {h_id}\n"
+                            f"[bold]Title[/bold]: {revised_draft.title}\n"
+                            f"[bold]Claim[/bold]: {revised_draft.claim}\n"
+                            f"[bold]Success criteria[/bold]: {revised_draft.success_criteria or '(blank)'}\n"
+                            f"[bold]Failure criteria[/bold]: {revised_draft.failure_criteria or '(blank)'}"
+                        ),
+                        title=f"[bold green]{author.name} · Hypothesis revised[/bold green]",
+                        border_style="green",
+                    )
+                )
+
+                # Step 2: Reviewer refines (round-robin only)
+                if (
+                    current_session.mode == ChatMode.ROUND_ROBIN
+                    and len(current_session.participants) >= 2
+                ):
+                    reviewer = current_session.participants[1]
+                    with console.status(f"[bold cyan]{reviewer.name} reviewing hypothesis...[/bold cyan]"):
+                        refined_draft = hyp_drafter.refine_draft(
+                            draft=revised_draft,
+                            session=current_session,
+                            transcript=service.transcript(current_session.session_id),
+                            context_snapshot=service.context_snapshot(current_session.session_id),
+                            user_intent=raw,
+                            provider=reviewer.provider,
+                        )
+                        hyp_svc.revise_hypothesis_files(
+                            project=h_proj,
+                            hypothesis_id=h_id,
+                            draft=refined_draft,
+                            user_instruction=f"Review refinement based on: {raw}",
+                            agent_name=reviewer.name,
+                        )
+                    active_hypothesis = (h_id, h_proj, refined_draft)
+
+                    # Show what changed
+                    changes: list[str] = []
+                    if refined_draft.claim != revised_draft.claim:
+                        changes.append(f"Claim: {refined_draft.claim}")
+                    if refined_draft.success_criteria != revised_draft.success_criteria:
+                        changes.append(f"Success criteria: {refined_draft.success_criteria}")
+                    if refined_draft.failure_criteria != revised_draft.failure_criteria:
+                        changes.append(f"Failure criteria: {refined_draft.failure_criteria}")
+                    change_text = "\n".join(changes) if changes else "Minor refinements only."
+                    console.print(
+                        Panel(
+                            change_text,
+                            title=f"[bold cyan]{reviewer.name} · Review refinement[/bold cyan]",
+                            border_style="cyan",
+                        )
+                    )
+            except Exception as exc:
+                console.print(f"[bold red]Error:[/bold red] {exc}")
+                continue
+            try:
+                service.record_session_event(
+                    session_id=current_session.session_id,
+                    kind=SessionEventKind.ARTIFACT_HYPOTHESIS_UPDATED,
+                    actor="labit",
+                    summary=f"Hypothesis revised: {h_id}",
+                    payload={"hypothesis_id": h_id},
+                    evidence_refs=_session_evidence_refs(current_session) + [f"hypothesis:{h_id}"],
+                )
+            except Exception:
+                pass
+            continue
+
+        if active_doc is not None:
+            if attachments:
+                console.print("[bold red]Error:[/bold red] Document mode does not support image attachments yet.")
+                continue
+            doc_service = _document_service()
+            drafter = _doc_drafter()
+            author = current_session.participants[0]
+            # Round-robin: second participant is reviewer
+            reviewer = (
+                current_session.participants[1]
+                if current_session.mode == ChatMode.ROUND_ROBIN and len(current_session.participants) >= 2
+                else None
+            )
+            try:
+                # Capture pre-revision markdown for diff
+                old_markdown = doc_service.read_document(active_doc)
+
+                # Step 1: Author revises
+                with console.status(f"[bold blue]{author.name} updating document...[/bold blue]"):
+                    update = drafter.revise_document(
+                        session=current_session,
+                        transcript=service.transcript(current_session.session_id),
+                        context_snapshot=service.context_snapshot(current_session.session_id),
+                        doc_title=active_doc.title,
+                        current_markdown=old_markdown,
+                        user_instruction=raw,
+                        interaction_log=doc_service.interaction_excerpt(active_doc),
+                        author_name=author.name,
+                        provider=author.provider,
+                    )
+                    active_doc = doc_service.revise_document(
+                        doc_session=active_doc,
+                        update=update,
+                        user_instruction=raw,
+                    )
+
+                console.print(
+                    Panel(
+                        (
+                            f"[bold]ID[/bold]: {active_doc.doc_id}\n"
+                            f"[bold]Document[/bold]: {active_doc.document_path}\n"
+                            f"[bold]Iteration[/bold]: {active_doc.iteration}\n"
+                            f"[bold]Summary[/bold]: {update.summary}"
+                        ),
+                        title=f"[bold green]{author.name} · Document updated[/bold green]",
+                        border_style="green",
+                    )
+                )
+
+                # Step 2: Reviewer adds inline review blocks (round-robin only)
+                if reviewer is not None:
+                    from labit.documents.drafter import compute_changed_sections
+
+                    new_markdown = doc_service.read_document(active_doc)
+                    changed_sections = compute_changed_sections(old_markdown, new_markdown)
+
+                    with console.status(f"[bold cyan]{reviewer.name} reviewing document...[/bold cyan]"):
+                        review_update = drafter.review_document(
+                            current_markdown=new_markdown,
+                            revision_summary=update.summary,
+                            user_instruction=raw,
+                            reviewer_name=reviewer.name,
+                            changed_sections=changed_sections,
+                            provider=reviewer.provider,
+                        )
+                        active_doc = doc_service.record_review(
+                            doc_session=active_doc,
+                            update=review_update,
+                            reviewer_name=reviewer.name,
+                        )
+                    console.print(
+                        Panel(
+                            f"[bold]Review[/bold]: {review_update.summary}",
+                            title=f"[bold cyan]{reviewer.name} · Review[/bold cyan]",
+                            border_style="cyan",
+                        )
+                    )
+            except Exception as exc:
+                console.print(f"[bold red]Error:[/bold red] {exc}")
+                continue
+            try:
+                service.record_session_event(
+                    session_id=current_session.session_id,
+                    kind=SessionEventKind.ARTIFACT_DOCUMENT_UPDATED,
+                    actor="labit",
+                    summary=f"Document updated: {active_doc.title}",
+                    payload={
+                        "doc_id": active_doc.doc_id,
+                        "title": active_doc.title,
+                        "document_path": active_doc.document_path,
+                        "log_path": active_doc.log_path,
+                        "iteration": active_doc.iteration,
+                        "agent_summary": update.summary,
+                    },
+                    evidence_refs=_session_evidence_refs(current_session) + [f"document:{active_doc.document_path}"],
+                )
+            except Exception:
+                pass
+            continue
+
+        result = _run_streaming_turn(
+            service=service,
+            session=current_session,
+            query=raw,
+            attachments=attachments,
+            skip_participants=muted_next_turn if muted_next_turn else None,
+        )
+        if muted_next_turn:
+            muted_next_turn.clear()
+        if result is not None:
+            current_session = result.session
 
 
 @chat_app.callback()
@@ -1934,6 +3368,7 @@ def open_chat(
         _emit(session.model_dump(mode="json"), as_json=True)
         return
     _render_session_summary(session)
+    run_chat_shell(session=session, service=service)
 
 
 @chat_app.command("list")
@@ -1947,7 +3382,7 @@ def list_chats(
     if not sessions:
         console.print("[dim]No chat sessions yet.[/dim]")
         return
-    table = Table(title="Chat Sessions", show_header=True, header_style="bold magenta")
+    table = Table(title="Chat Sessions", show_header=True, header_style=f"bold {_COMMAND_COLOR}")
     table.add_column("Session")
     table.add_column("Title")
     table.add_column("Mode")
@@ -2058,23 +3493,5 @@ def resume_chat(
         )
         return
 
-    _render_session_summary(session)
-    console.print("")
-    _render_transcript(transcript[-8:])
-    next_message = _prompt_optional("Next message", default="")
-    if not next_message:
-        console.print("[dim]No new message sent.[/dim]")
-        return
-
-    try:
-        result = service.ask(session_id=session_id, content=next_message)
-    except Exception as exc:
-        raise typer.Exit(code=_fail(str(exc), as_json=False))
-
-    console.print(f"[bold][turn {result.user_message.turn_index}] user[/bold]")
-    console.print(result.user_message.content)
-    console.print("")
-    for reply in result.replies:
-        console.print(f"[cyan][turn {reply.message.turn_index}] {reply.participant.name}[/cyan]")
-        console.print(_md(reply.message.content))
-        console.print("")
+    console.print(f"[dim]Resuming chat session {session_id}.[/dim]")
+    run_chat_shell(session=session, service=service)

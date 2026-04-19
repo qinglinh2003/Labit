@@ -13,7 +13,6 @@ import yaml
 from labit.experiments.models import (
     CodeSnapshot,
     ExecutionBackend,
-    ExecutionRuntime,
     ExperimentDetail,
     ExperimentDraft,
     ExperimentAssessment,
@@ -22,10 +21,13 @@ from labit.experiments.models import (
     ExperimentParentType,
     ExperimentRecord,
     ExperimentSummary,
+    ExperimentTaskPlan,
     FrozenLaunchSpec,
     HypothesisReviewSuggestion,
     HypothesisSnapshot,
     LaunchArtifact,
+    LaunchExpPhase,
+    LaunchExpSession,
     LaunchStatus,
     ResearchRole,
     SubmissionReceipt,
@@ -38,9 +40,9 @@ from labit.experiments.models import (
     TaskSummary,
     utc_now_iso,
 )
-from labit.models import ComputeBackend, RuntimeKind
 from labit.hypotheses.service import HypothesisService
 from labit.paths import RepoPaths
+from labit.services.compute_service import ComputeService
 from labit.services.project_service import ProjectService
 
 
@@ -50,10 +52,12 @@ class ExperimentService:
         paths: RepoPaths,
         *,
         project_service: ProjectService | None = None,
+        compute_service: ComputeService | None = None,
         hypothesis_service: HypothesisService | None = None,
     ):
         self.paths = paths
         self.project_service = project_service or ProjectService(paths)
+        self.compute_service = compute_service or ComputeService(paths)
         self.hypothesis_service = hypothesis_service or HypothesisService(paths)
 
     def list_experiments(self, project: str) -> list[ExperimentSummary]:
@@ -79,7 +83,7 @@ class ExperimentService:
                     path=detail.path,
                 )
             )
-        return sorted(summaries, key=lambda item: self._experiment_sort_key(item.experiment_id), reverse=True)
+        return sorted(summaries, key=lambda item: (item.updated_at, item.experiment_id), reverse=True)
 
     def load_experiment(self, project: str, experiment_id: str) -> ExperimentDetail:
         resolved = self._require_project(project)
@@ -89,16 +93,17 @@ class ExperimentService:
         return self._load_detail(experiment_dir)
 
     def next_experiment_id(self, project: str) -> str:
-        resolved = self._require_project(project)
-        experiments_dir = self.experiments_dir(resolved)
-        highest = 0
-        if experiments_dir.exists():
-            for path in experiments_dir.iterdir():
-                match = re.fullmatch(r"e(\d+)", path.name)
-                if not match:
-                    continue
-                highest = max(highest, int(match.group(1)))
-        return f"e{highest + 1:03d}"
+        self._require_project(project)
+        from labit.utils.ids import generate_unique_id
+
+        return generate_unique_id("e", self._experiment_id_exists_anywhere)
+
+    def _experiment_id_exists_anywhere(self, experiment_id: str) -> bool:
+        for project_name in self.project_service.list_project_names():
+            experiments_dir = self.experiments_dir(project_name)
+            if (experiments_dir / experiment_id).exists():
+                return True
+        return False
 
     def next_task_id(self, project: str, experiment_id: str) -> str:
         resolved = self._require_project(project)
@@ -353,7 +358,10 @@ class ExperimentService:
             experiment_id=experiment_id,
             project=resolved,
             executor=detail.record.execution.backend,
+            remote_user=detail.record.execution.user,
             remote_host=detail.record.execution.host,
+            remote_port=detail.record.execution.port,
+            ssh_key=detail.record.execution.ssh_key,
             frozen_spec=frozen_spec,
             code_snapshot=snapshot,
             submission=receipt,
@@ -503,30 +511,22 @@ class ExperimentService:
     def build_default_execution_profile(self, project: str) -> ExperimentExecutionProfile:
         resolved = self._require_project(project)
         spec = self.project_service.load_project(resolved)
-        compute = spec.compute
-        if compute.backend == ComputeBackend.NONE:
+        compute_name = spec.compute_profile.strip()
+        if not compute_name:
             raise ValueError(
-                f"Project '{resolved}' does not declare a compute backend. Configure compute before using experiment execution."
+                f"Project '{resolved}' is not connected to a compute profile. Run 'labit project edit {resolved}' to attach one."
             )
-        if compute.backend != ComputeBackend.SSH:
-            raise ValueError(
-                f"Project '{resolved}' uses unsupported compute backend '{compute.backend.value}' for experiment v1."
-            )
-        runtime_map = {
-            RuntimeKind.PLAIN: ExecutionRuntime.PLAIN,
-            RuntimeKind.CONDA: ExecutionRuntime.CONDA,
-            RuntimeKind.UV: ExecutionRuntime.UV,
-        }
+        compute = self.compute_service.load_compute(compute_name)
         return ExperimentExecutionProfile(
             backend=ExecutionBackend.SSH,
-            profile="default",
-            host=compute.host or "",
-            workdir=compute.workdir or "",
-            datadir=compute.datadir or "",
-            runtime=runtime_map.get(compute.runtime, ExecutionRuntime.PLAIN),
-            conda_env=compute.conda_env or "",
-            conda_init=compute.conda_init or "",
-            uv_project=compute.uv_project or "",
+            profile=compute.name,
+            user=compute.connection.user,
+            host=compute.connection.host,
+            port=compute.connection.port,
+            ssh_key=compute.connection.ssh_key or "",
+            workdir=compute.workspace.workdir,
+            datadir=compute.workspace.datadir or "",
+            setup_script=compute.setup.script,
         )
 
     def build_code_snapshot(self, project: str, *, branch_hint: str = "") -> CodeSnapshot:
@@ -544,6 +544,599 @@ class ExperimentService:
             dirty = bool(self._git_output(code_dir, ["status", "--porcelain"]))
 
         return CodeSnapshot(repo=repo, branch=branch, commit=commit, dirty=dirty)
+
+    def resume_launch_exp_session(
+        self,
+        *,
+        project: str,
+        experiment_id: str,
+    ) -> LaunchExpSession:
+        """Reconstruct a LaunchExpSession from an existing experiment's saved artifacts.
+
+        This allows resubmitting a failed experiment or revising its run.sh
+        without redoing the entire planning process.
+        """
+        resolved = self._require_project(project)
+        detail = self.load_experiment(resolved, experiment_id)
+        record = detail.record
+
+        plan_path = self.experiment_dir(resolved, experiment_id) / "experiment_plan.md"
+        plan_tasks = self._parse_experiment_plan(plan_path) if plan_path.exists() else {}
+
+        # Reconstruct task plans from experiment_plan.md (fallback to task records)
+        task_plans: list[ExperimentTaskPlan] = []
+        for task_summary in detail.tasks:
+            task_record = self.load_task(resolved, experiment_id, task_summary.task_id)
+            if task_record.task_id in plan_tasks:
+                plan = plan_tasks[task_record.task_id]
+                task_plans.append(plan.model_copy(update={
+                    "approved": True,
+                }))
+            else:
+                task_plans.append(ExperimentTaskPlan(
+                    id=task_record.task_id,
+                    name=task_record.title,
+                    goal="",
+                    depends_on=task_record.depends_on,
+                    entry_hint=task_record.spec.entrypoint,
+                    approved=True,
+                ))
+
+        # Read existing run.sh if present
+        run_sh_path = self.experiment_dir(resolved, experiment_id) / "run.sh"
+        run_sh_content = run_sh_path.read_text(encoding="utf-8") if run_sh_path.exists() else ""
+
+        # Read existing config.yaml if present
+        config_yaml_path = self.experiment_dir(resolved, experiment_id) / "config.yaml"
+        config_yaml_content = config_yaml_path.read_text(encoding="utf-8") if config_yaml_path.exists() else ""
+
+        # Determine the phase based on what already exists
+        if run_sh_content:
+            phase = LaunchExpPhase.SCRIPT_GENERATION
+        elif task_plans:
+            phase = LaunchExpPhase.SCRIPT_GENERATION if all(t.approved for t in task_plans) else LaunchExpPhase.TASK_PLANNING
+        else:
+            phase = LaunchExpPhase.TASK_BREAKDOWN
+
+        log_dir = self.experiment_dir(resolved, experiment_id) / ".sessions"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = str((log_dir / "planning.jsonl").relative_to(self.paths.root))
+
+        session = LaunchExpSession(
+            hypothesis_id=record.parent_id,
+            project=resolved,
+            experiment_id=experiment_id,
+            phase=phase,
+            task_plans=task_plans,
+            current_task_index=0,
+            run_sh_content=run_sh_content,
+            config_yaml_content=config_yaml_content,
+            log_path=log_path,
+        )
+        self._log_planning_event(session, "session_resumed", {
+            "experiment_id": experiment_id,
+            "phase": phase.value,
+            "task_count": len(task_plans),
+            "has_run_sh": bool(run_sh_content),
+        })
+        return session
+
+    def _parse_experiment_plan(self, path: Path) -> dict[str, ExperimentTaskPlan]:
+        """Parse experiment_plan.md into task plans."""
+        content = path.read_text(encoding="utf-8")
+        tasks: dict[str, ExperimentTaskPlan] = {}
+        current: dict[str, str] = {}
+
+        def _flush_current() -> None:
+            if not current.get("id"):
+                return
+            task_id = current["id"]
+            tasks[task_id] = ExperimentTaskPlan(
+                id=task_id,
+                name=current.get("name", ""),
+                goal=current.get("goal", ""),
+                depends_on=[t.strip() for t in current.get("depends_on", "").split(",") if t.strip()],
+                entry_hint=current.get("entry", ""),
+                inputs=current.get("inputs", ""),
+                outputs=current.get("outputs", ""),
+                checkpoint=current.get("checkpoint", ""),
+                failure_modes=current.get("failure_modes", ""),
+                approved=True,
+            )
+
+        header_re = re.compile(r"^##\s+(?P<id>\w+):\s+(?P<name>.+)\s*$")
+        field_re = re.compile(r"^\*\*(?P<field>[^*]+)\*\*:\s*(?P<value>.*)\s*$")
+
+        for raw in content.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            header = header_re.match(line)
+            if header:
+                _flush_current()
+                current = {
+                    "id": header.group("id"),
+                    "name": header.group("name"),
+                }
+                continue
+            field = field_re.match(line)
+            if field and current.get("id"):
+                key = field.group("field").strip().lower()
+                value = field.group("value").strip()
+                if key == "goal":
+                    current["goal"] = value
+                elif key == "depends on":
+                    current["depends_on"] = value
+                elif key == "entry":
+                    current["entry"] = value
+                elif key == "inputs":
+                    current["inputs"] = value
+                elif key == "outputs":
+                    current["outputs"] = value
+                elif key == "checkpoint":
+                    current["checkpoint"] = value
+                elif key == "failure modes":
+                    current["failure_modes"] = value
+
+        _flush_current()
+        return tasks
+
+    # ── Launch-exp planning session ──
+
+    def start_launch_exp_session(
+        self,
+        *,
+        project: str,
+        hypothesis_id: str,
+    ) -> LaunchExpSession:
+        resolved = self._require_project(project)
+        # Verify hypothesis exists
+        self.hypothesis_service.load_hypothesis(resolved, hypothesis_id)
+
+        experiment_id = self.next_experiment_id(resolved)
+        experiment_dir = self.experiment_dir(resolved, experiment_id)
+        experiment_dir.mkdir(parents=True, exist_ok=True)
+
+        log_dir = experiment_dir / ".sessions"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = str((log_dir / "planning.jsonl").relative_to(self.paths.root))
+
+        session = LaunchExpSession(
+            hypothesis_id=hypothesis_id,
+            project=resolved,
+            experiment_id=experiment_id,
+            log_path=log_path,
+        )
+        self._log_planning_event(session, "session_started", {
+            "hypothesis_id": hypothesis_id,
+            "experiment_id": experiment_id,
+        })
+        return session
+
+    def save_task_plans(self, session: LaunchExpSession, tasks: list[ExperimentTaskPlan]) -> LaunchExpSession:
+        session = session.model_copy(update={"task_plans": tasks})
+        self._log_planning_event(session, "task_breakdown_updated", {
+            "task_count": len(tasks),
+            "tasks": [{"id": t.id, "name": t.name} for t in tasks],
+        })
+        return session
+
+    def approve_task_list(self, session: LaunchExpSession) -> LaunchExpSession:
+        """Move from task_breakdown to task_planning phase."""
+        first_idx = session.next_unapproved_task_index()
+        session = session.model_copy(update={
+            "phase": LaunchExpPhase.TASK_PLANNING,
+            "current_task_index": first_idx if first_idx is not None else 0,
+        })
+        self._log_planning_event(session, "task_list_approved", {
+            "task_count": len(session.task_plans),
+        })
+        return session
+
+    def update_task_detail(self, session: LaunchExpSession, task: ExperimentTaskPlan) -> LaunchExpSession:
+        tasks = list(session.task_plans)
+        for i, t in enumerate(tasks):
+            if t.id == task.id:
+                tasks[i] = task
+                break
+        return session.model_copy(update={"task_plans": tasks})
+
+    def approve_task(self, session: LaunchExpSession, task_id: str) -> LaunchExpSession:
+        tasks = list(session.task_plans)
+        for i, t in enumerate(tasks):
+            if t.id == task_id:
+                tasks[i] = t.model_copy(update={"approved": True})
+                break
+        session = session.model_copy(update={"task_plans": tasks})
+
+        self._log_planning_event(session, "task_approved", {"task_id": task_id})
+
+        # Advance to next unapproved task, or move to script generation
+        next_idx = session.next_unapproved_task_index()
+        if next_idx is not None:
+            session = session.model_copy(update={"current_task_index": next_idx})
+        elif session.all_tasks_approved:
+            session = session.model_copy(update={
+                "phase": LaunchExpPhase.SCRIPT_GENERATION,
+            })
+            self._log_planning_event(session, "all_tasks_approved", {})
+        return session
+
+    def reopen_task(self, session: LaunchExpSession, task_id: str) -> LaunchExpSession:
+        tasks = list(session.task_plans)
+        for i, t in enumerate(tasks):
+            if t.id == task_id:
+                tasks[i] = t.model_copy(update={"approved": False})
+                session = session.model_copy(update={
+                    "task_plans": tasks,
+                    "phase": LaunchExpPhase.TASK_PLANNING,
+                    "current_task_index": i,
+                })
+                self._log_planning_event(session, "task_reopened", {"task_id": task_id})
+                return session
+        raise ValueError(f"Task '{task_id}' not found in session.")
+
+    def save_script(self, session: LaunchExpSession, run_sh: str, config_yaml: str) -> LaunchExpSession:
+        resolved = session.project
+        experiment_dir = self.experiment_dir(resolved, session.experiment_id)
+
+        # Write run.sh
+        run_sh_path = experiment_dir / "run.sh"
+        self._atomic_write_text(run_sh_path, run_sh)
+
+        # Write config.yaml if provided
+        if config_yaml.strip():
+            self._atomic_write_text(experiment_dir / "config.yaml", config_yaml)
+
+        session = session.model_copy(update={
+            "run_sh_content": run_sh,
+            "config_yaml_content": config_yaml,
+        })
+        self._log_planning_event(session, "script_generated", {
+            "run_sh_lines": len(run_sh.splitlines()),
+        })
+        return session
+
+    def finalize_experiment(self, session: LaunchExpSession) -> ExperimentDetail:
+        """Create the experiment record and task records from the planning session."""
+        resolved = session.project
+        hypothesis = self.hypothesis_service.load_hypothesis(resolved, session.hypothesis_id).record
+        experiment_id = session.experiment_id
+        experiment_dir = self.experiment_dir(resolved, experiment_id)
+        (experiment_dir / "tasks").mkdir(parents=True, exist_ok=True)
+
+        record = ExperimentRecord(
+            experiment_id=experiment_id,
+            project=resolved,
+            parent_type=ExperimentParentType.HYPOTHESIS,
+            parent_id=hypothesis.hypothesis_id,
+            title=hypothesis.title,
+            objective=hypothesis.claim,
+            hypothesis_snapshot=HypothesisSnapshot(
+                hypothesis_id=hypothesis.hypothesis_id,
+                title=hypothesis.title,
+                claim=hypothesis.claim,
+                success_criteria=hypothesis.success_criteria,
+                failure_criteria=hypothesis.failure_criteria,
+            ),
+            execution=self.build_default_execution_profile(resolved),
+        )
+
+        evidence_task_ids: list[str] = []
+        for task_plan in session.task_plans:
+            task_record = TaskRecord(
+                task_id=task_plan.id,
+                experiment_id=experiment_id,
+                project=resolved,
+                title=task_plan.name,
+                task_kind=TaskKind.CUSTOM,
+                research_role=ResearchRole.EVIDENCE,
+                depends_on=task_plan.depends_on,
+                spec=TaskSpec(
+                    command=f"# See run.sh — task {task_plan.id}: {task_plan.name}",
+                    entrypoint=task_plan.entry_hint,
+                ),
+            )
+            self._atomic_write_yaml(
+                self.task_path(resolved, experiment_id, task_plan.id),
+                task_record.model_dump(mode="json"),
+            )
+            evidence_task_ids.append(task_plan.id)
+
+        record = record.model_copy(update={
+            "evidence_task_ids": evidence_task_ids,
+            "updated_at": utc_now_iso(),
+        })
+        self._atomic_write_yaml(experiment_dir / "experiment.yaml", record.model_dump(mode="json"))
+
+        # Write experiment_plan.md from task plans
+        plan_lines = [f"# Experiment Plan: {hypothesis.title}\n"]
+        for t in session.task_plans:
+            plan_lines.append(f"## {t.id}: {t.name}")
+            plan_lines.append(f"**Goal**: {t.goal}")
+            if t.depends_on:
+                plan_lines.append(f"**Depends on**: {', '.join(t.depends_on)}")
+            if t.entry_hint:
+                plan_lines.append(f"**Entry**: {t.entry_hint}")
+            if t.inputs:
+                plan_lines.append(f"**Inputs**: {t.inputs}")
+            if t.outputs:
+                plan_lines.append(f"**Outputs**: {t.outputs}")
+            if t.checkpoint:
+                plan_lines.append(f"**Checkpoint**: {t.checkpoint}")
+            if t.failure_modes:
+                plan_lines.append(f"**Failure modes**: {t.failure_modes}")
+            plan_lines.append("")
+        self._atomic_write_text(experiment_dir / "experiment_plan.md", "\n".join(plan_lines))
+        self._atomic_write_text(experiment_dir / "launch.md", "")
+        self._atomic_write_text(experiment_dir / "debrief.md", "")
+        self._atomic_write_text(experiment_dir / "review.md", "")
+
+        self._log_planning_event(session, "experiment_finalized", {
+            "experiment_id": experiment_id,
+        })
+        self._refresh_index(resolved)
+        return self.load_experiment(resolved, experiment_id)
+
+    def submit_experiment(self, session: LaunchExpSession) -> SubmissionReceipt:
+        """Submit the experiment-level run.sh via SSH."""
+        from labit.experiments.executors.ssh import SSHExecutor
+
+        resolved = session.project
+        experiment_id = session.experiment_id
+        experiment_dir = self.experiment_dir(resolved, experiment_id)
+        run_sh_path = experiment_dir / "run.sh"
+
+        if not run_sh_path.exists():
+            return SubmissionReceipt(
+                accepted=False,
+                phase=SubmissionPhase.SUBMIT,
+                backend=ExecutionBackend.SSH,
+                stderr_tail="run.sh not found in experiment directory.",
+                error_kind=SubmissionErrorKind.TASK_SPEC_ERROR,
+            )
+
+        execution = self.build_default_execution_profile(resolved)
+        code_snapshot = self.build_code_snapshot(resolved)
+
+        # Create a launch directory for this submission
+        launch_id = self._next_launch_id(resolved, experiment_id)
+        launch_dir = self.launch_dir(resolved, experiment_id, launch_id)
+        launch_dir.mkdir(parents=True, exist_ok=True)
+
+        # Wrap the experiment's run.sh with the compute profile's setup
+        # script so that venv, git pull, and cd workdir happen first.
+        raw_command = run_sh_path.read_text(encoding="utf-8")
+        frozen_spec = FrozenLaunchSpec(
+            command=raw_command,
+            workdir=execution.workdir,
+            output_dir=f"outputs/experiments/{experiment_id}",
+            env={},
+        )
+        wrapped_run_sh = self._render_run_sh(frozen_spec, execution)
+        wrapped_path = launch_dir / "run.sh"
+        wrapped_path.write_text(wrapped_run_sh, encoding="utf-8")
+
+        artifact = LaunchArtifact(
+            launch_id=launch_id,
+            task_id="experiment",
+            experiment_id=experiment_id,
+            project=resolved,
+            executor=execution.backend,
+            remote_user=execution.user,
+            remote_host=execution.host,
+            remote_port=execution.port,
+            ssh_key=execution.ssh_key,
+            frozen_spec=frozen_spec,
+            code_snapshot=code_snapshot,
+            run_sh_path=str(wrapped_path.relative_to(self.paths.root)),
+        )
+
+        executor = SSHExecutor(self.paths)
+        receipt = executor.submit(artifact)
+
+        # Save launch artifact with receipt
+        artifact = artifact.model_copy(update={
+            "submission": receipt,
+            "status": LaunchStatus.SUBMITTED if receipt.accepted else LaunchStatus.REJECTED,
+        })
+        self._atomic_write_yaml(launch_dir / "launch.yaml", artifact.model_dump(mode="json"))
+        if receipt is not None:
+            self._atomic_write_yaml(launch_dir / "receipt.yaml", receipt.model_dump(mode="json"))
+
+        # Update experiment status
+        detail = self.load_experiment(resolved, experiment_id)
+        updated_record = detail.record.model_copy(update={
+            "status": ExperimentStatus.QUEUED if receipt.accepted else ExperimentStatus.PLANNED,
+            "updated_at": utc_now_iso(),
+        })
+        self._atomic_write_yaml(
+            self.experiment_dir(resolved, experiment_id) / "experiment.yaml",
+            updated_record.model_dump(mode="json"),
+        )
+
+        self._log_planning_event(session, "experiment_submitted", {
+            "experiment_id": experiment_id,
+            "launch_id": launch_id,
+            "accepted": receipt.accepted,
+            "remote_host": execution.host,
+            "pid": receipt.pid,
+        })
+        return receipt
+
+    def validate_dependency_graph(self, tasks: list[ExperimentTaskPlan]) -> str | None:
+        """Check for circular dependencies. Returns error message or None."""
+        task_ids = {t.id for t in tasks}
+        # Check for unknown dependencies
+        for t in tasks:
+            for dep in t.depends_on:
+                if dep not in task_ids:
+                    return f"Task '{t.id}' depends on unknown task '{dep}'."
+        # Topological sort to detect cycles
+        visited: set[str] = set()
+        in_stack: set[str] = set()
+        deps_map = {t.id: t.depends_on for t in tasks}
+
+        def dfs(node: str) -> str | None:
+            if node in in_stack:
+                return f"Circular dependency detected involving task '{node}'."
+            if node in visited:
+                return None
+            in_stack.add(node)
+            for dep in deps_map.get(node, []):
+                err = dfs(dep)
+                if err:
+                    return err
+            in_stack.discard(node)
+            visited.add(node)
+            return None
+
+        for tid in task_ids:
+            err = dfs(tid)
+            if err:
+                return err
+        return None
+
+    def planning_interaction_excerpt(self, session: LaunchExpSession, last_n: int = 10) -> str:
+        log_path = self.paths.root / session.log_path
+        if not log_path.exists():
+            return "(no interaction log)"
+        lines: list[str] = []
+        for raw_line in log_path.read_text(encoding="utf-8").strip().splitlines():
+            try:
+                event = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            lines.append(f"[{event.get('type', '?')}] {event.get('summary', json.dumps(event.get('payload', {})))}")
+        return "\n".join(lines[-last_n:]) if lines else "(empty)"
+
+    def get_code_tree(self, project: str, max_depth: int = 3) -> str:
+        resolved = self._require_project(project)
+        code_dir = self.paths.vault_projects_dir / resolved / "code"
+        if not code_dir.exists():
+            return "(no code directory found)"
+        lines: list[str] = []
+        self._tree(code_dir, code_dir, lines, depth=0, max_depth=max_depth)
+        return "\n".join(lines) if lines else "(empty code directory)"
+
+    def get_code_context(self, project: str, *, max_total_chars: int = 40_000) -> str:
+        """Return code tree + contents of key source files for script generation.
+
+        Reads .py, .sh, .yaml config files from the project's code directory,
+        prioritising entry points (main, train, run, eval, scripts/) and smaller files.
+        Truncates to *max_total_chars* so it fits in an LLM prompt.
+        """
+        resolved = self._require_project(project)
+        code_dir = self.paths.vault_projects_dir / resolved / "code"
+        if not code_dir.exists():
+            return "(no code directory found)"
+
+        # 1) Tree listing (always included)
+        tree_lines: list[str] = []
+        self._tree(code_dir, code_dir, tree_lines, depth=0, max_depth=4)
+        tree_text = "\n".join(tree_lines) or "(empty)"
+
+        # 2) Collect candidate source files
+        EXTENSIONS = {".py", ".sh", ".bash", ".yaml", ".yml", ".toml", ".cfg", ".json"}
+        SKIP_DIRS = {"__pycache__", ".git", "node_modules", ".venv", "venv", "wandb", "outputs", "checkpoints"}
+        candidates: list[tuple[int, Path]] = []  # (priority, path)
+
+        for f in code_dir.rglob("*"):
+            if not f.is_file():
+                continue
+            if f.suffix not in EXTENSIONS:
+                continue
+            if any(part in SKIP_DIRS for part in f.parts):
+                continue
+            try:
+                size = f.stat().st_size
+            except OSError:
+                continue
+            if size > 100_000 or size == 0:  # skip huge / empty
+                continue
+            # Priority: lower = more important
+            name_lower = f.stem.lower()
+            rel_str = str(f.relative_to(code_dir)).lower()
+            priority = 50
+            if any(kw in name_lower for kw in ("main", "train", "run", "eval", "test", "extract")):
+                priority = 10
+            elif "script" in rel_str or "bin/" in rel_str:
+                priority = 15
+            elif name_lower in ("config", "setup", "pyproject"):
+                priority = 20
+            elif f.suffix == ".sh":
+                priority = 25
+            candidates.append((priority, f))
+
+        candidates.sort(key=lambda x: (x[0], x[1].stat().st_size))
+
+        # 3) Read files until budget
+        parts = [f"## Code tree\n```\n{tree_text}\n```\n"]
+        budget = max_total_chars - len(parts[0])
+
+        for _prio, fpath in candidates:
+            if budget <= 0:
+                break
+            rel = fpath.relative_to(code_dir)
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            header = f"\n## {rel}\n```{fpath.suffix.lstrip('.')}\n"
+            footer = "\n```\n"
+            overhead = len(header) + len(footer)
+            if overhead >= budget:
+                break
+            available = budget - overhead
+            if len(content) > available:
+                content = content[:available] + "\n... (truncated)"
+            chunk = header + content + footer
+            parts.append(chunk)
+            budget -= len(chunk)
+
+        return "".join(parts)
+
+    def _tree(self, base: Path, current: Path, lines: list[str], depth: int, max_depth: int) -> None:
+        if depth >= max_depth:
+            return
+        try:
+            entries = sorted(current.iterdir(), key=lambda p: (not p.is_dir(), p.name))
+        except PermissionError:
+            return
+        for entry in entries:
+            if entry.name.startswith(".") or entry.name == "__pycache__":
+                continue
+            rel = entry.relative_to(base)
+            indent = "  " * depth
+            if entry.is_dir():
+                lines.append(f"{indent}{rel}/")
+                self._tree(base, entry, lines, depth + 1, max_depth)
+            else:
+                lines.append(f"{indent}{rel}")
+
+    def _log_planning_event(self, session: LaunchExpSession, event_type: str, payload: dict) -> None:
+        log_path = self.paths.root / session.log_path
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "type": event_type,
+            "timestamp": utc_now_iso(),
+            "payload": payload,
+        }
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def log_user_instruction(self, session: LaunchExpSession, instruction: str) -> None:
+        self._log_planning_event(session, "user_instruction", {
+            "content": instruction,
+            "phase": session.phase.value,
+        })
+
+    def log_agent_revision(self, session: LaunchExpSession, summary: str, provider: str = "") -> None:
+        self._log_planning_event(session, "agent_revision", {
+            "summary": summary,
+            "provider": provider,
+            "phase": session.phase.value,
+        })
 
     def _load_detail(self, experiment_dir: Path) -> ExperimentDetail:
         record = ExperimentRecord.model_validate(
@@ -700,14 +1293,10 @@ class ExperimentService:
 
     def _render_runtime_preamble(self, execution: ExperimentExecutionProfile) -> list[str]:
         lines: list[str] = []
-        if execution.runtime == ExecutionRuntime.CONDA and execution.conda_init and execution.conda_env:
-            lines.append(execution.conda_init)
-            lines.append(f"conda activate {execution.conda_env}")
-        target_dir = execution.workdir
-        if execution.runtime == ExecutionRuntime.UV and execution.uv_project:
-            target_dir = str(Path(execution.workdir) / execution.uv_project)
-        if target_dir:
-            lines.append(f'cd "{self._shell_path(target_dir)}"')
+        if execution.setup_script:
+            lines.extend(execution.setup_script.splitlines())
+        if execution.workdir:
+            lines.append(f'cd "{self._shell_path(execution.workdir)}"')
         if execution.datadir:
             escaped = self._shell_path(execution.datadir).replace('"', '\\"')
             lines.append(f'export LABIT_DATA_DIR="{escaped}"')

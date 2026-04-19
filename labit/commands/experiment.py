@@ -89,7 +89,7 @@ def list_experiments(
 
 @experiment_app.command("show", help="Show one experiment from the active project.")
 def show_experiment(
-    experiment_id: str = typer.Argument(..., help="Experiment id, for example e001."),
+    experiment_id: str = typer.Argument(..., help="Experiment id, for example e-1a2b3c4d."),
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
     project = _require_active_project(as_json=json_output)
@@ -109,8 +109,11 @@ def show_experiment(
         f"[bold]Status[/bold]: {record.status.value}\n"
         f"[bold]Assessment[/bold]: {record.assessment.value}\n"
         f"[bold]Objective[/bold]: {record.objective}\n"
-        f"[bold]Execution[/bold]: {record.execution.backend.value} / {record.execution.profile}\n"
+        f"[bold]Compute[/bold]: {record.execution.profile}\n"
+        f"[bold]Execution[/bold]: {record.execution.backend.value}\n"
+        f"[bold]User[/bold]: {record.execution.user or '(blank)'}\n"
         f"[bold]Host[/bold]: {record.execution.host or '(blank)'}\n"
+        f"[bold]Port[/bold]: {record.execution.port}\n"
         f"[bold]Workdir[/bold]: {record.execution.workdir or '(blank)'}\n"
         f"[bold]Result summary[/bold]: {record.result_summary or '(blank)'}\n"
         f"[bold]Decision rationale[/bold]: {record.decision_rationale or '(blank)'}\n"

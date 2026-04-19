@@ -73,7 +73,10 @@ class ResearchRollingCondenser(SessionCondenser):
             evidence_refs.extend(event.evidence_refs)
             if event.kind in {
                 SessionEventKind.ARTIFACT_HYPOTHESIS_CREATED,
+                SessionEventKind.ARTIFACT_HYPOTHESIS_UPDATED,
                 SessionEventKind.ARTIFACT_REPORT_CREATED,
+                SessionEventKind.ARTIFACT_DOCUMENT_CREATED,
+                SessionEventKind.ARTIFACT_DOCUMENT_UPDATED,
                 SessionEventKind.DISCUSSION_SYNTHESIS,
             }:
                 decisions.append(event.summary)
@@ -84,7 +87,10 @@ class ResearchRollingCondenser(SessionCondenser):
                     paper_id = str(config.get("paper_id", "")).strip()
                 if paper_id:
                     active_artifacts.append(f"paper:{paper_id}")
-            if event.kind == SessionEventKind.ARTIFACT_HYPOTHESIS_CREATED:
+            if event.kind in {
+                SessionEventKind.ARTIFACT_HYPOTHESIS_CREATED,
+                SessionEventKind.ARTIFACT_HYPOTHESIS_UPDATED,
+            }:
                 hypothesis_id = str(event.payload.get("hypothesis_id", "")).strip()
                 if hypothesis_id:
                     active_artifacts.append(f"hypothesis:{hypothesis_id}")
@@ -92,6 +98,15 @@ class ResearchRollingCondenser(SessionCondenser):
                 report_path = str(event.payload.get("report_path", "")).strip()
                 if report_path:
                     active_artifacts.append(f"report:{report_path}")
+            if event.kind in {
+                SessionEventKind.ARTIFACT_DOCUMENT_CREATED,
+                SessionEventKind.ARTIFACT_DOCUMENT_UPDATED,
+            }:
+                doc_path = ""
+                if isinstance(event.payload, dict):
+                    doc_path = str(event.payload.get("document_path", "")).strip()
+                if doc_path:
+                    active_artifacts.append(f"document:{doc_path}")
             if event.kind in {
                 SessionEventKind.ARTIFACT_TODO_CREATED,
                 SessionEventKind.ARTIFACT_NOTE_CREATED,

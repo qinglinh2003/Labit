@@ -21,6 +21,9 @@ dependencies = [
 dev = [
   "pytest>=8.0,<9",
 ]
+mempalace = [
+  "chromadb>=0.5.0,<0.7",
+]
 
 [project.scripts]
 labit = "labit.cli:app"

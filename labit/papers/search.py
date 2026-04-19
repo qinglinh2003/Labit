@@ -152,7 +152,6 @@ class PaperSearchService:
                     prompt=self._build_discovery_prompt(project=project, intent=intent),
                     output_schema=_discovery_schema(),
                     cwd=str(self.paths.root),
-                    timeout_seconds=60,
                     extra_args=self._search_agent_extra_args(provider_kind),
                 ),
             )
@@ -249,7 +248,6 @@ class PaperSearchService:
                     prompt=self._build_discovery_prompt(project=project, intent=intent),
                     output_schema=_discovery_schema(),
                     cwd=str(self.paths.root),
-                    timeout_seconds=60,
                     extra_args=self._search_agent_extra_args(scout_provider),
                 ),
             )
@@ -282,7 +280,6 @@ class PaperSearchService:
                     ),
                     output_schema=_discovery_schema(),
                     cwd=str(self.paths.root),
-                    timeout_seconds=60,
                     extra_args=self._search_agent_extra_args(normalizer_provider),
                 ),
             )
@@ -504,7 +501,6 @@ class PaperSearchService:
             prompt=self._build_ranking_prompt(project=project, intent=intent, candidates=candidates),
             output_schema=_ranking_schema(),
             cwd=str(self.paths.root),
-            timeout_seconds=60,
             extra_args=self._search_agent_extra_args(provider),
         )
         try:

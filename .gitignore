@@ -15,7 +15,9 @@ vault/
 experiments/
 !labit/experiments/
 !labit/experiments/**/*.py
-configs/active_project
-configs/projects/
+configs/*
+!configs/projects/
+configs/projects/*
+!configs/projects/.gitkeep
 scratch/
 .labit/
