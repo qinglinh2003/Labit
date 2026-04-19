@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import os
+import threading
 from dataclasses import dataclass
 from collections.abc import Callable
+from queue import Queue
 
+from labit.agents.adapters.base import StreamCancelled
 from labit.agents.models import AgentRequest, ProviderKind
 from labit.agents.orchestrator import ProviderRegistry
 from labit.agents.providers import discussion_provider_kinds, provider_available, resolve_provider_kind
@@ -28,7 +32,7 @@ from labit.context.condenser import ResearchRollingCondenser, SessionCondenser
 from labit.context.events import SessionEvent, SessionEventKind, WorkingMemorySnapshot
 from labit.context.maps import ContextMapBuilder
 from labit.context.store import SessionContextStore
-from labit.memory.retrievers import MemoryRetriever
+from labit.memory.retrievers import MemoryRetriever, MemPalaceRetriever
 from labit.memory.service import MemoryService
 from labit.memory.store import MemoryStore
 from labit.paths import RepoPaths
@@ -76,7 +80,16 @@ class ChatService:
         self.context_map_builder = context_map_builder or ContextMapBuilder(paths)
         self.memory_store = memory_store or MemoryStore(paths)
         self.memory_service = memory_service or MemoryService(paths, store=self.memory_store)
-        self.memory_retriever = memory_retriever or MemoryRetriever(self.memory_store)
+        if memory_retriever:
+            self.memory_retriever = memory_retriever
+        else:
+            legacy = MemoryRetriever(self.memory_store)
+            backend = os.getenv("LABIT_MEMORY_BACKEND", "palace").strip().lower()
+            if backend in {"legacy", "yaml", "memorystore"}:
+                self.memory_retriever = legacy
+            else:
+                palace_path = paths.palace_dir
+                self.memory_retriever = MemPalaceRetriever(palace_path, fallback=legacy)
 
     def open_session(
         self,
@@ -156,6 +169,9 @@ class ChatService:
         on_reply_start: Callable[[ChatParticipant], None] | None = None,
         on_reply_delta: Callable[[ChatParticipant, str], None] | None = None,
         on_reply_complete: Callable[[ChatParticipant, str], None] | None = None,
+        cancel_event: threading.Event | None = None,
+        skip_participants: set[str] | None = None,
+        cwd_override: str | None = None,
     ) -> ChatTurnResult:
         return self._ask_impl(
             session_id=session_id,
@@ -166,6 +182,9 @@ class ChatService:
             on_reply_start=on_reply_start,
             on_reply_delta=on_reply_delta,
             on_reply_complete=on_reply_complete,
+            cancel_event=cancel_event,
+            skip_participants=skip_participants,
+            cwd_override=cwd_override,
         )
 
     def _ask_impl(
@@ -179,6 +198,9 @@ class ChatService:
         on_reply_start: Callable[[ChatParticipant], None] | None = None,
         on_reply_delta: Callable[[ChatParticipant, str], None] | None = None,
         on_reply_complete: Callable[[ChatParticipant, str], None] | None = None,
+        cancel_event: threading.Event | None = None,
+        skip_participants: set[str] | None = None,
+        cwd_override: str | None = None,
     ) -> ChatTurnResult:
         session = self.load_session(session_id)
         if session.status != ChatStatus.ACTIVE:
@@ -206,14 +228,81 @@ class ChatService:
         )
         self.store.write_context_snapshot(session_id, snapshot)
 
+        # Filter out skipped participants for this turn
+        effective_participants = [
+            p for p in session.participants
+            if not skip_participants or p.name not in skip_participants
+        ]
+        if not effective_participants:
+            effective_participants = session.participants
+
         replies: list[ChatReply] = []
-        if session.mode == ChatMode.PARALLEL:
-            for participant in session.participants:
-                replies.append(
-                    self._generate_reply(
+        try:
+            if session.mode == ChatMode.PARALLEL:
+                reply_queue: Queue[tuple[int, ChatReply | Exception | None]] = Queue()
+                threads: list[threading.Thread] = []
+
+                def _parallel_worker(index: int, participant: ChatParticipant) -> None:
+                    try:
+                        reply = self._generate_reply(
+                            session=session,
+                            participant=participant,
+                            transcript=base_transcript,
+                            snapshot=snapshot,
+                            turn_index=turn_index,
+                            reply_to=user_message.message_id,
+                            force_deep_context=force_deep_context,
+                            reasoning_effort=reasoning_effort,
+                            on_reply_start=on_reply_start,
+                            on_reply_delta=on_reply_delta,
+                            on_reply_complete=on_reply_complete,
+                            cancel_event=cancel_event,
+                            persist=False,
+                            cwd_override=cwd_override,
+                        )
+                    except (StreamCancelled, KeyboardInterrupt):
+                        reply_queue.put((index, None))
+                    except Exception as exc:  # noqa: BLE001
+                        reply_queue.put((index, exc))
+                    else:
+                        reply_queue.put((index, reply))
+
+                for index, participant in enumerate(effective_participants):
+                    thread = threading.Thread(
+                        target=_parallel_worker,
+                        args=(index, participant),
+                        daemon=True,
+                    )
+                    thread.start()
+                    threads.append(thread)
+
+                ordered_replies: dict[int, ChatReply] = {}
+                parallel_errors: list[Exception] = []
+                for _ in effective_participants:
+                    index, payload = reply_queue.get()
+                    if isinstance(payload, ChatReply):
+                        ordered_replies[index] = payload
+                    elif isinstance(payload, Exception):
+                        parallel_errors.append(payload)
+
+                for thread in threads:
+                    thread.join()
+
+                replies.extend(ordered_replies[idx] for idx in sorted(ordered_replies))
+                for reply in replies:
+                    self.store.append_message(reply.message)
+                    self._append_message_event(session=session, message=reply.message)
+
+                if parallel_errors and not replies:
+                    raise parallel_errors[0]
+            else:
+                working_transcript = list(base_transcript)
+                participants = effective_participants[:1] if session.mode == ChatMode.SINGLE else effective_participants
+                for participant in participants:
+                    reply = self._generate_reply(
                         session=session,
                         participant=participant,
-                        transcript=base_transcript,
+                        transcript=working_transcript,
                         snapshot=snapshot,
                         turn_index=turn_index,
                         reply_to=user_message.message_id,
@@ -222,27 +311,13 @@ class ChatService:
                         on_reply_start=on_reply_start,
                         on_reply_delta=on_reply_delta,
                         on_reply_complete=on_reply_complete,
+                        cancel_event=cancel_event,
+                        cwd_override=cwd_override,
                     )
-                )
-        else:
-            working_transcript = list(base_transcript)
-            participants = session.participants[:1] if session.mode == ChatMode.SINGLE else session.participants
-            for participant in participants:
-                reply = self._generate_reply(
-                    session=session,
-                    participant=participant,
-                    transcript=working_transcript,
-                    snapshot=snapshot,
-                    turn_index=turn_index,
-                    reply_to=user_message.message_id,
-                    force_deep_context=force_deep_context,
-                    reasoning_effort=reasoning_effort,
-                    on_reply_start=on_reply_start,
-                    on_reply_delta=on_reply_delta,
-                    on_reply_complete=on_reply_complete,
-                )
-                replies.append(reply)
-                working_transcript.append(reply.message)
+                    replies.append(reply)
+                    working_transcript.append(reply.message)
+        except (StreamCancelled, KeyboardInterrupt):
+            pass  # stop generating, keep any replies already collected
 
         updated_session = session.model_copy(update={"updated_at": utc_now_iso()})
         self.store.write_session(updated_session)
@@ -261,6 +336,31 @@ class ChatService:
             replies=replies,
             context_snapshot=snapshot,
         )
+
+    def update_mode(self, session_id: str, mode: ChatMode) -> ChatSession:
+        session = self.load_session(session_id)
+        updates: dict = {"mode": mode, "updated_at": utc_now_iso()}
+        if mode != ChatMode.SINGLE and len(session.participants) < 2:
+            existing = session.participants[0] if session.participants else None
+            existing_kind = existing.provider if existing else None
+            second_kind = self._other_provider(existing_kind) if existing_kind else resolve_provider_kind(None)
+            second = ChatParticipant(name=second_kind.value, provider=second_kind)
+            updates["participants"] = list(session.participants) + [second]
+        updated = session.model_copy(update=updates)
+        self.store.write_session(updated)
+        return updated
+
+    def swap_participants(self, session_id: str) -> ChatSession:
+        """Reverse the order of participants."""
+        session = self.load_session(session_id)
+        if len(session.participants) < 2:
+            raise ValueError("Need at least 2 participants to swap.")
+        updated = session.model_copy(update={
+            "participants": list(reversed(session.participants)),
+            "updated_at": utc_now_iso(),
+        })
+        self.store.write_session(updated)
+        return updated
 
     def close(self, session_id: str) -> ChatSession:
         session = self.load_session(session_id)
@@ -342,6 +442,9 @@ class ChatService:
         on_reply_start: Callable[[ChatParticipant], None] | None = None,
         on_reply_delta: Callable[[ChatParticipant, str], None] | None = None,
         on_reply_complete: Callable[[ChatParticipant, str], None] | None = None,
+        cancel_event: threading.Event | None = None,
+        persist: bool = True,
+        cwd_override: str | None = None,
     ) -> ChatReply:
         adapter = self.registry.get(participant.provider)
         request = AgentRequest(
@@ -353,8 +456,7 @@ class ChatService:
                 snapshot=snapshot,
                 force_deep_context=force_deep_context,
             ),
-            cwd=str(self.paths.root),
-            timeout_seconds=120,
+            cwd=cwd_override or str(self.paths.root),
             image_paths=self._recent_image_paths(transcript),
             extra_args=self._conversation_extra_args(
                 participant.provider,
@@ -373,7 +475,7 @@ class ChatService:
             on_reply_start(participant)
 
         if on_reply_delta is not None or on_reply_start is not None or on_reply_complete is not None:
-            response = adapter.run_stream(request, on_text=_handle_delta)
+            response = adapter.run_stream(request, on_text=_handle_delta, cancel_event=cancel_event)
         else:
             response = adapter.run(request)
 
@@ -390,8 +492,9 @@ class ChatService:
             reply_to=reply_to,
             metadata={"command": response.command},
         )
-        self.store.append_message(message)
-        self._append_message_event(session=session, message=message)
+        if persist:
+            self.store.append_message(message)
+            self._append_message_event(session=session, message=message)
         return ChatReply(participant=participant, message=message)
 
     def _default_participants(
@@ -465,6 +568,8 @@ class ChatService:
             deep_memory=force_deep_context,
         )
 
+        platform_context = self._platform_context(session.project)
+
         return f"""You are `{participant.name}` in a LABIT shared conversation.
 
 Session:
@@ -472,6 +577,8 @@ Session:
 - Mode: {session.mode.value}
 - Project: {session.project or "(none)"}
 - Participants: {participants}
+
+{platform_context}
 
 Guidelines:
 - Continue the conversation naturally.
@@ -540,13 +647,25 @@ Reply as `{participant.name}` only. Use plain text or markdown.
                 evidence_refs=evidence_refs,
                 limit=12 if deep_memory else 6,
             )
+        wake_up_section = None
+        if session.project and isinstance(self.memory_retriever, MemPalaceRetriever):
+            wake_up_text = self.memory_retriever.wake_up(wing=session.project)
+            if wake_up_text:
+                from labit.context.assembler import ContextSection
+                wake_up_section = ContextSection(
+                    title="Long-term Memory",
+                    source="mempalace",
+                    priority=55,
+                    content=wake_up_text,
+                )
+        extra_sections = [wake_up_section] if wake_up_section else []
         assembled = self.assembler.assemble(
             task_header=task_header,
             bound_sections=bound_sections,
             recent_sections=recent_sections,
             working_memory=working_memory,
             memories=retrieved_memories,
-            map_sections=map_sections,
+            map_sections=map_sections + extra_sections,
         )
         return assembled.render()
 
@@ -648,11 +767,15 @@ Reply as `{participant.name}` only. Use plain text or markdown.
         project_label = session.project or "(none)"
         participants = ", ".join(item.name for item in session.participants)
         working_memory_text = self._render_compact_working_memory(working_memory)
+        platform_context = self._platform_context(session.project)
+
         return f"""You are `{participant.name}` in a LABIT research conversation.
 
 Project: {project_label}
 Mode: {session.mode.value}
 Participants: {participants}
+
+{platform_context}
 
 Guidelines:
 - Continue the conversation naturally.
@@ -699,6 +822,31 @@ Reply as `{participant.name}` only. Use plain text or markdown.
                 parts.extend(f"- {item}" for item in meaningful_refs[-6:])
         return "\n".join(parts) if parts else "(empty)"
 
+    def _platform_context(self, project: str | None) -> str:
+        """Build a static platform-awareness block that agents must always know."""
+        lines = [
+            "Platform (LABIT):",
+            "- LABIT is a research operating system that manages projects, hypotheses, experiments, documents, and remote compute.",
+            "- LABIT can manage remote compute via compute profiles and `/launch-exp` (SSH may still be relevant, but prefer Labit tooling by default).",
+            "- The LABIT codebase itself is a separate git repo. Do NOT commit, push, or modify LABIT source code from a project chat.",
+        ]
+        if project:
+            lines.extend([
+                f"- You are working on project '{project}'. This project has its own directory under vault/projects/{project}/.",
+                f"- You may read LABIT files for reference, but you should only create/modify files within vault/projects/{project}/ and its subdirectories.",
+                f"- Git operations (commit, push, branch) should only target the project's files, never LABIT's own source code.",
+            ])
+            try:
+                spec = self.project_service.load_project(project)
+                if spec.compute_profile:
+                    lines.append(f"- This project uses compute profile '{spec.compute_profile}'. Use `labit compute test {spec.compute_profile}` to verify connectivity, and `/launch-exp` to submit experiments.")
+                code_dir = self.project_service.project_code_dir(project)
+                if code_dir.exists():
+                    lines.append(f"- Project code directory: {code_dir.relative_to(self.paths.root)}")
+            except Exception:
+                pass
+        return "\n".join(lines)
+
     def _bound_paper_ids(self, session: ChatSession) -> list[str]:
         paper_ids: list[str] = []
         for binding in session.context_bindings:
@@ -717,7 +865,7 @@ Reply as `{participant.name}` only. Use plain text or markdown.
                 "--disable-slash-commands",
                 "--no-session-persistence",
                 "--tools",
-                "Read,LS,Glob,Grep",
+                "Read,LS,Glob,Grep,Edit,Write,Bash,WebFetch,WebSearch",
                 "--permission-mode",
                 "bypassPermissions",
             ]

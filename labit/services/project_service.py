@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 import yaml
+from pydantic import ValidationError
 
 from labit.models import ProjectDraft, ProjectSeed, ProjectSpec, ProjectSummary, SemanticBrief
 from labit.paths import RepoPaths
@@ -47,7 +48,12 @@ class ProjectService:
         # Existing repo configs may carry legacy metadata such as `docs`.
         # Ignore unknown fields when reading repo-owned config files so
         # inspection commands remain backward-compatible.
-        return ProjectSpec.model_validate(raw, extra="ignore")
+        try:
+            return ProjectSpec.model_validate(raw, extra="ignore")
+        except ValidationError as exc:
+            raise ValueError(
+                f"Project '{resolved}' uses an outdated config format. Recreate it under the new project-profile schema.\n{exc}"
+            ) from exc
 
     def load_project_seed(self, seed_path: Path) -> ProjectSeed:
         raw = yaml.safe_load(seed_path.read_text()) or {}
@@ -152,7 +158,13 @@ class ProjectService:
         )
 
     def list_project_summaries(self) -> list[ProjectSummary]:
-        return [self.get_project_summary(name) for name in self.list_project_names()]
+        summaries: list[ProjectSummary] = []
+        for name in self.list_project_names():
+            try:
+                summaries.append(self.get_project_summary(name))
+            except ValueError:
+                continue
+        return summaries
 
     def planned_create_actions(self, spec: ProjectSpec, *, set_active: bool = False) -> list[str]:
         actions = [
@@ -212,6 +224,14 @@ class ProjectService:
         return len(structured_ids | legacy_ids)
 
     def count_project_papers(self, name: str) -> int:
+        key_papers_index = self.paths.vault_projects_dir / name / "key_papers" / "index.yaml"
+        if key_papers_index.exists():
+            raw = yaml.safe_load(key_papers_index.read_text()) or {}
+            if isinstance(raw, dict):
+                papers = raw.get("papers")
+                if isinstance(papers, list):
+                    return len(papers)
+
         index_path = self.paths.vault_projects_dir / name / "papers.yaml"
         if index_path.exists():
             data = yaml.safe_load(index_path.read_text()) or []

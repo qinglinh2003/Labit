@@ -141,7 +141,6 @@ class DailySummaryService:
             prompt=self._build_prompt(inputs),
             cwd=str(self.paths.root),
             output_schema=self._draft_schema(),
-            timeout_seconds=120,
             extra_args=self._extra_args(provider_kind),
         )
         try:
@@ -661,7 +660,6 @@ class WeeklySummaryService(DailySummaryService):
             prompt=self._build_weekly_prompt(inputs),
             cwd=str(self.paths.root),
             output_schema=self._weekly_draft_schema(),
-            timeout_seconds=180,
             extra_args=self._extra_args(provider_kind),
         )
         try:

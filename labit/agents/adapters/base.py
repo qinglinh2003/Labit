@@ -16,6 +16,10 @@ class AgentAdapterError(RuntimeError):
     """Raised when an agent backend fails."""
 
 
+class StreamCancelled(Exception):
+    """Raised when a streaming operation is cancelled (e.g. user pressed ESC)."""
+
+
 class StreamProcessResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -31,6 +35,7 @@ def stream_subprocess_lines(
     timeout_seconds: int | None = None,
     input_text: str | None = None,
     on_stdout_line: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> StreamProcessResult:
     process = subprocess.Popen(
         cmd,
@@ -66,28 +71,40 @@ def stream_subprocess_lines(
     finished_streams: set[str] = set()
     deadline = time.monotonic() + timeout_seconds if timeout_seconds else None
 
-    while len(finished_streams) < 2:
-        if deadline is not None and time.monotonic() > deadline:
-            process.kill()
-            stdout_thread.join(timeout=0.2)
-            stderr_thread.join(timeout=0.2)
-            raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout_seconds)
+    try:
+        while len(finished_streams) < 2:
+            if cancel_event is not None and cancel_event.is_set():
+                process.kill()
+                stdout_thread.join(timeout=0.2)
+                stderr_thread.join(timeout=0.2)
+                raise StreamCancelled("Stream cancelled by user")
 
-        try:
-            stream_name, payload = queue.get(timeout=0.1)
-        except Empty:
-            continue
+            if deadline is not None and time.monotonic() > deadline:
+                process.kill()
+                stdout_thread.join(timeout=0.2)
+                stderr_thread.join(timeout=0.2)
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout_seconds)
 
-        if payload is None:
-            finished_streams.add(stream_name)
-            continue
+            try:
+                stream_name, payload = queue.get(timeout=0.1)
+            except Empty:
+                continue
 
-        if stream_name == "stdout":
-            stdout_lines.append(payload)
-            if on_stdout_line is not None:
-                on_stdout_line(payload)
-        else:
-            stderr_lines.append(payload)
+            if payload is None:
+                finished_streams.add(stream_name)
+                continue
+
+            if stream_name == "stdout":
+                stdout_lines.append(payload)
+                if on_stdout_line is not None:
+                    on_stdout_line(payload)
+            else:
+                stderr_lines.append(payload)
+    except KeyboardInterrupt:
+        process.kill()
+        stdout_thread.join(timeout=0.2)
+        stderr_thread.join(timeout=0.2)
+        raise StreamCancelled("Stream cancelled by user")
 
     returncode = process.wait()
     stdout_thread.join(timeout=0.2)
@@ -107,6 +124,7 @@ class AgentAdapter(ABC):
         request: AgentRequest,
         *,
         on_text: Callable[[str], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> AgentResponse:
         response = self.run(request)
         if on_text is not None and response.raw_output:

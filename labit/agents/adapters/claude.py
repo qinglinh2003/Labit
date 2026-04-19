@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from collections.abc import Callable
 
 from labit.agents.adapters.base import AgentAdapter, AgentAdapterError, stream_subprocess_lines
@@ -18,6 +19,7 @@ class ClaudeAdapter(AgentAdapter):
         try:
             result = subprocess.run(
                 cmd,
+                input=request.prompt,
                 capture_output=True,
                 text=True,
                 cwd=request.cwd,
@@ -38,6 +40,10 @@ class ClaudeAdapter(AgentAdapter):
         if request.output_schema:
             try:
                 parsed = json.loads(raw_output)
+                if isinstance(parsed, dict) and parsed.get("is_error"):
+                    raise AgentAdapterError(
+                        str(parsed.get("result", "Claude returned an error"))
+                    )
                 if isinstance(parsed, dict) and "structured_output" in parsed:
                     structured_output = parsed.get("structured_output")
                 else:
@@ -58,9 +64,10 @@ class ClaudeAdapter(AgentAdapter):
         request: AgentRequest,
         *,
         on_text: Callable[[str], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> AgentResponse:
         if request.output_schema:
-            return super().run_stream(request, on_text=on_text)
+            return super().run_stream(request, on_text=on_text, cancel_event=cancel_event)
 
         request = request.model_copy(update={"prompt": self._augment_prompt(request)})
         cmd = self._build_command(request, stream=True)
@@ -68,8 +75,10 @@ class ClaudeAdapter(AgentAdapter):
         streamed_parts: list[str] = []
         session_id = request.session_id
 
+        stream_error: str | None = None
+
         def _handle_stdout(line: str) -> None:
-            nonlocal final_text, session_id
+            nonlocal final_text, session_id, stream_error
             stripped = line.strip()
             if not stripped:
                 return
@@ -103,6 +112,8 @@ class ClaudeAdapter(AgentAdapter):
                 return
 
             if payload_type == "result":
+                if payload.get("is_error"):
+                    stream_error = str(payload.get("result", "Claude returned an error"))
                 final_text = str(payload.get("result", "")).strip() or final_text
 
         try:
@@ -110,12 +121,17 @@ class ClaudeAdapter(AgentAdapter):
                 cmd,
                 cwd=request.cwd,
                 timeout_seconds=request.timeout_seconds,
+                input_text=request.prompt,
                 on_stdout_line=_handle_stdout,
+                cancel_event=cancel_event,
             )
         except subprocess.TimeoutExpired as exc:
             raise AgentAdapterError(
                 f"Claude adapter timed out after {request.timeout_seconds}s."
             ) from exc
+
+        if stream_error:
+            raise AgentAdapterError(stream_error)
 
         if result.returncode != 0:
             detail = "".join(result.stderr_lines).strip() or "".join(result.stdout_lines).strip()
@@ -131,7 +147,7 @@ class ClaudeAdapter(AgentAdapter):
         )
 
     def _build_command(self, request: AgentRequest, *, stream: bool) -> list[str]:
-        cmd = ["claude", "-p", request.prompt]
+        cmd = ["claude", "-p", "--input-format", "text"]
 
         if request.system_prompt:
             cmd.extend(["--system-prompt", request.system_prompt])

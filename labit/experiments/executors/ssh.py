@@ -63,7 +63,7 @@ class SSHExecutor(ExperimentExecutor):
 
         try:
             result = subprocess.run(
-                ["ssh", artifact.remote_host, "bash", "-s"],
+                [*self._ssh_command(artifact), "bash", "-s"],
                 input=remote_script,
                 capture_output=True,
                 text=True,
@@ -151,7 +151,7 @@ fi
 """
         try:
             result = subprocess.run(
-                ["ssh", artifact.remote_host, "bash", "-s"],
+                [*self._ssh_command(artifact), "bash", "-s"],
                 input=remote_script,
                 capture_output=True,
                 text=True,
@@ -207,7 +207,7 @@ fi
         )
         try:
             result = subprocess.run(
-                ["ssh", artifact.remote_host, "bash", "-s"],
+                [*self._ssh_command(artifact), "bash", "-s"],
                 input=remote_script,
                 capture_output=True,
                 text=True,
@@ -243,7 +243,7 @@ fi
             }
         try:
             result = subprocess.run(
-                ["ssh", artifact.remote_host, "bash", "-lc", f"kill {artifact.submission.pid}"],
+                [*self._ssh_command(artifact), "bash", "-lc", f"kill {artifact.submission.pid}"],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -266,6 +266,15 @@ fi
     def _remote_launch_dir(self, artifact: LaunchArtifact) -> str:
         base = artifact.frozen_spec.workdir.rstrip("/") or "."
         return f"{base}/.labit/experiments/{artifact.experiment_id}/{artifact.task_id}/{artifact.launch_id}"
+
+    def _ssh_command(self, artifact: LaunchArtifact) -> list[str]:
+        command = ["ssh"]
+        if artifact.remote_port and artifact.remote_port != 22:
+            command.extend(["-p", str(artifact.remote_port)])
+        if artifact.ssh_key:
+            command.extend(["-i", artifact.ssh_key])
+        command.append(f"{artifact.remote_user}@{artifact.remote_host}")
+        return command
 
     def _remote_submit_script(self, *, remote_dir: str, remote_log_path: str, run_sh: str) -> str:
         marker = "__LABIT_RUN_SH__"
@@ -326,10 +335,17 @@ if [ -n "$LOG_PATH" ] && [ -f "$LOG_PATH" ]; then
   echo LOG_TAIL_END
 fi
 
+## Check for the standard Labit experiment results file first (written by run.sh)
+if [ -f "$WORKDIR/experiment_results.json" ]; then
+  echo FILE_BEGIN::$WORKDIR/experiment_results.json
+  cat "$WORKDIR/experiment_results.json"
+  echo FILE_END::$WORKDIR/experiment_results.json
+fi
+
 if [ -n "$OUTPUT_DIR" ] && [ -d "$OUTPUT_DIR" ]; then
   echo OUTPUT_DIR=$OUTPUT_DIR
   echo OUTPUT_DIR_EXISTS=1
-  for candidate in "$OUTPUT_DIR/summary.json" "$OUTPUT_DIR/train_results.json" "$OUTPUT_DIR/results.json" "$OUTPUT_DIR/metrics.json"; do
+  for candidate in "$OUTPUT_DIR/experiment_results.json" "$OUTPUT_DIR/summary.json" "$OUTPUT_DIR/train_results.json" "$OUTPUT_DIR/results.json" "$OUTPUT_DIR/metrics.json"; do
     if [ -f "$candidate" ]; then
       echo FILE_BEGIN::$candidate
       cat "$candidate"

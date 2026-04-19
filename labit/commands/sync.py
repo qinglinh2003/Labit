@@ -9,11 +9,12 @@ from rich.table import Table
 
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
+from labit.services.storage_service import StorageService
 from labit.sync.models import SyncTransferEntry
 from labit.sync.service import SyncService
 
 sync_app = typer.Typer(
-    help="Sync configured project directories between the compute node and object storage.",
+    help="Sync configured project directories between the compute node and the project's storage profile.",
     invoke_without_command=True,
 )
 console = Console()
@@ -29,6 +30,10 @@ def _project_service() -> ProjectService:
 
 def _sync_service() -> SyncService:
     return SyncService(_paths())
+
+
+def _storage_service() -> StorageService:
+    return StorageService(_paths())
 
 
 def _emit(data: object, *, as_json: bool) -> None:
@@ -70,13 +75,11 @@ def _format_bytes(value: int | None) -> str:
     return f"{size:.1f} {units[idx]}"
 
 
-def _render_status(project: str) -> None:
-    service = _sync_service()
-    entries = service.status(project)
+def _render_status(project: str, entries, *, storage_label: str) -> None:
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Dir", style="bold")
     table.add_column("Compute")
-    table.add_column("R2")
+    table.add_column(storage_label)
     for entry in entries:
         compute_text = (
             f"{_format_bytes(entry.compute.bytes)} · {entry.compute.count or 0} files"
@@ -116,7 +119,11 @@ def sync_root(
         return
     project = _require_active_project(as_json=json_output)
     service = _sync_service()
+    project_spec = _project_service().load_project(project)
+    storage = _storage_service().load_storage(project_spec.storage_profile)
     try:
+        project_spec = _project_service().load_project(project)
+        storage = _storage_service().load_storage(project_spec.storage_profile)
         entries = service.status(project)
     except Exception as exc:
         raise typer.Exit(code=_fail(str(exc), as_json=json_output))
@@ -125,16 +132,17 @@ def sync_root(
         _emit(
             {
                 "project": project,
-                "storage_backend": "r2",
+                "storage_profile": storage.name,
+                "storage_backend": storage.backend.value,
                 "entries": [item.model_dump(mode="json") for item in entries],
             },
             as_json=True,
         )
         return
-    _render_status(project)
+    _render_status(project, entries, storage_label=storage.name)
 
 
-@sync_app.command("push", help="Copy configured sync_dirs from compute to object storage.")
+@sync_app.command("push", help="Copy configured sync_dirs from compute to the project's storage profile.")
 def push(
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
@@ -157,7 +165,7 @@ def push(
     _render_transfer(project, entries, title="Sync Push")
 
 
-@sync_app.command("pull", help="Copy configured sync_dirs from object storage back to compute.")
+@sync_app.command("pull", help="Copy configured sync_dirs from the project's storage profile back to compute.")
 def pull(
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:

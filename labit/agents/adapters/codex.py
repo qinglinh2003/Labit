@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -29,7 +30,7 @@ class CodexAdapter(AgentAdapter):
                 "codex",
                 "exec",
                 "--sandbox",
-                "read-only",
+                "danger-full-access",
                 "--skip-git-repo-check",
                 "--color",
                 "never",
@@ -96,9 +97,10 @@ class CodexAdapter(AgentAdapter):
         request: AgentRequest,
         *,
         on_text: Callable[[str], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> AgentResponse:
         if request.output_schema:
-            return super().run_stream(request, on_text=on_text)
+            return super().run_stream(request, on_text=on_text, cancel_event=cancel_event)
 
         prompt = request.prompt
         if request.system_prompt:
@@ -108,7 +110,7 @@ class CodexAdapter(AgentAdapter):
             "codex",
             "exec",
             "--sandbox",
-            "read-only",
+            "danger-full-access",
             "--skip-git-repo-check",
             "--color",
             "never",
@@ -159,6 +161,7 @@ class CodexAdapter(AgentAdapter):
                 timeout_seconds=request.timeout_seconds,
                 input_text=prompt,
                 on_stdout_line=_handle_stdout,
+                cancel_event=cancel_event,
             )
         except subprocess.TimeoutExpired as exc:
             raise AgentAdapterError(
