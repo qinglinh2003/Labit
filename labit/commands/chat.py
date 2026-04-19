@@ -1478,8 +1478,9 @@ def _run_streaming_turn(
     reasoning_effort: str | None = None,
     skip_participants: set[str] | None = None,
     cwd_override: str | None = None,
+    display_query: str | None = None,
 ) -> object | None:
-    _render_user_shell_message(query, attachments=attachments)
+    _render_user_shell_message(display_query if display_query is not None else query, attachments=attachments)
     # Temporarily filter out muted participants for this turn
     effective_session = session
     if skip_participants:
@@ -1810,7 +1811,12 @@ def _create_dev_worktree(
     not switched; writer/reviewer turns run inside the returned worktree path.
     """
     paths = RepoPaths.discover()
-    original = _git_output("git", "rev-parse", "--abbrev-ref", "HEAD", cwd=git_root) or "main"
+    original = _git_output("git", "rev-parse", "--abbrev-ref", "HEAD", cwd=git_root)
+    if not original or original == "HEAD":
+        raise RuntimeError(
+            f"Cannot determine current branch in {git_root}. "
+            "Ensure you are on a named branch (not detached HEAD) before starting /dev."
+        )
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", task.lower())[:40].strip("-") or "task"
     timestamp = datetime.now().strftime("%m%d-%H%M%S")
     branch_name = f"labit-dev/{slug}-{timestamp}"
@@ -1957,9 +1963,26 @@ def _run_dev_loop(
         dev_session.current_round = round_num
         dev_round = DevRound(round_index=round_num)
 
-        console.print(f"\n[bold]── Dev Round {round_num}/{dev_session.max_rounds} ──[/bold]")
-
         # ── Writer turn ──
+        # Display parts (shown to user)
+        writer_display_parts = [f"[bold]Writer ({writer.name})[/bold] · Round {round_num}/{dev_session.max_rounds}"]
+        writer_display_parts.append(f"Task: {dev_session.task}")
+
+        if dev_session.user_decision:
+            writer_display_parts.append(f"User decided: {dev_session.user_decision}")
+
+        if dev_session.history:
+            last = dev_session.history[-1]
+            if last.findings:
+                writer_display_parts.append("Reviewer findings to address:")
+                for f in last.findings:
+                    writer_display_parts.append(f"  - {f}")
+            elif last.reviewer_summary:
+                writer_display_parts.append(f"Reviewer feedback: {last.reviewer_summary}")
+
+        writer_display = "\n".join(writer_display_parts)
+
+        # Full prompt (sent to agent, not shown to user)
         writer_query_parts = [f"[Dev Loop — Round {round_num}/{dev_session.max_rounds}]"]
         writer_query_parts.append(f"Task: {dev_session.task}")
         writer_query_parts.append(f"Scope: {scope_label}")
@@ -1970,13 +1993,11 @@ def _run_dev_loop(
                 "Use the editable workspace path above, not the original checkout, for all file edits and commands."
             )
 
-        # Include decision answer if pending
         if dev_session.user_decision:
             writer_query_parts.append(f"User decided: {dev_session.user_decision}")
             dev_session.user_decision = None
             dev_session.pending_decision = None
 
-        # Include previous reviewer findings
         if dev_session.history:
             last = dev_session.history[-1]
             if last.findings:
@@ -2001,6 +2022,7 @@ def _run_dev_loop(
                 service=service,
                 session=session,
                 query=writer_query,
+                display_query=writer_display,
                 skip_participants=skip_for_writer,
                 cwd_override=turn_cwd,
             )
@@ -2037,14 +2059,23 @@ def _run_dev_loop(
             return dev_session
 
         # ── Reviewer turn ──
-        console.print(f"\n[dim]── Reviewer ({reviewer.name}) ──[/dim]")
-
         # Use per-commit diff if we just committed, otherwise fall back to worktree diff
         if commit_hash:
             diff_text = _get_last_commit_diff(scope_git_root)
         else:
             diff_text = _get_scope_diff(scope_pathspecs, scope_git_root)
 
+        # Display parts (shown to user)
+        reviewer_display_parts = [f"[bold]Reviewer ({reviewer.name})[/bold] · Round {round_num}/{dev_session.max_rounds}"]
+        if dev_round.changed_files:
+            reviewer_display_parts.append(
+                "Files changed:\n" + "\n".join(f"  - {item}" for item in dev_round.changed_files[:10])
+            )
+        if not dev_round.changed_files:
+            reviewer_display_parts.append("[dim]No file changes detected this round.[/dim]")
+        reviewer_display = "\n".join(reviewer_display_parts)
+
+        # Full prompt (sent to agent, not shown to user)
         reviewer_query_parts = [f"[Dev Loop — Review Round {round_num}/{dev_session.max_rounds}]"]
         reviewer_query_parts.append(f"Task: {dev_session.task}")
         reviewer_query_parts.append(f"Scope: {scope_label}")
@@ -2080,6 +2111,7 @@ def _run_dev_loop(
                 service=service,
                 session=session,
                 query=reviewer_query,
+                display_query=reviewer_display,
                 skip_participants=skip_for_reviewer,
                 cwd_override=turn_cwd,
             )
@@ -4128,7 +4160,24 @@ def run_chat_shell(
                         continue
                     if choice == "1":
                         # Merge into original branch
-                        subprocess.run(["git", "checkout", active_dev.original_branch], capture_output=True, cwd=finish_cwd)
+                        if not active_dev.original_branch:
+                            console.print(
+                                "[bold red]Cannot merge:[/bold red] original branch is unknown "
+                                "(session may have been created with an older /dev version).\n"
+                                "Use [bold]/dev finish[/bold] → option 2 (keep) instead, then merge manually."
+                            )
+                            continue
+                        co_result = subprocess.run(
+                            ["git", "checkout", active_dev.original_branch],
+                            capture_output=True, text=True, cwd=finish_cwd,
+                        )
+                        if co_result.returncode != 0:
+                            console.print(
+                                f"[bold red]Cannot checkout '{active_dev.original_branch}':[/bold red] "
+                                f"{co_result.stderr.strip()}\n"
+                                "Use option 2 (keep) instead, then merge manually."
+                            )
+                            continue
                         result = subprocess.run(
                             ["git", "merge", active_dev.dev_branch, "--no-edit"],
                             capture_output=True, text=True, cwd=finish_cwd,
