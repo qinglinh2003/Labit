@@ -543,7 +543,7 @@ Return:
                         "type": "object",
                         "additionalProperties": False,
                         "properties": task_props,
-                        "required": ["id", "name", "goal", "depends_on"],
+                        "required": list(task_props.keys()),
                     },
                 },
             },
