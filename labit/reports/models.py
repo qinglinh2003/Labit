@@ -122,23 +122,20 @@ class DailySummaryInputs(BaseModel):
 class DailySummaryDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    what_moved_today: list[str] = Field(default_factory=list)
-    evidence_produced: list[str] = Field(default_factory=list)
-    hypothesis_state: list[str] = Field(default_factory=list)
-    papers_reports_and_captures: list[str] = Field(default_factory=list)
-    code_changes: list[str] = Field(default_factory=list)
-    open_loops: list[str] = Field(default_factory=list)
-    tomorrow_plan: list[str] = Field(default_factory=list)
-    free_write: str = ""
+    bottom_line: str = ""
+    evidence_gained: list[str] = Field(default_factory=list)
+    belief_updates: list[str] = Field(default_factory=list)
+    blockers: list[str] = Field(default_factory=list)
+    next_action: list[str] = Field(default_factory=list)
+    reflection: str = ""
+    infra_notes: list[str] = Field(default_factory=list)
 
     @field_validator(
-        "what_moved_today",
-        "evidence_produced",
-        "hypothesis_state",
-        "papers_reports_and_captures",
-        "code_changes",
-        "open_loops",
-        "tomorrow_plan",
+        "evidence_gained",
+        "belief_updates",
+        "blockers",
+        "next_action",
+        "infra_notes",
         mode="before",
     )
     @classmethod
@@ -156,9 +153,9 @@ class DailySummaryDraft(BaseModel):
                 cleaned.append(text)
         return cleaned
 
-    @field_validator("free_write", mode="before")
+    @field_validator("bottom_line", "reflection", mode="before")
     @classmethod
-    def strip_free_write(cls, value: object) -> str:
+    def strip_text(cls, value: object) -> str:
         if value is None:
             return ""
         return str(value).strip()

@@ -406,6 +406,41 @@ The script should:
 3. Print clear status messages for each task (e.g., "[t001] Running data preprocessing...")
 4. Skip tasks whose checkpoint already exists (with a message)
 5. Call code from the project's code directory — do NOT inline large implementations in the script
+6. At the very end, write a `$PWD/experiment_results.json` summarizing the run
+
+IMPORTANT — Resume/retry contract:
+The script MUST support task-level resume controls so failed experiments can reuse completed work:
+- `LABIT_ONLY_TASK=t004`: run only task `t004` after verifying its dependency checkpoints; skip all other tasks.
+- `LABIT_START_AT=t004`: skip tasks before `t004`; run `t004` and later tasks.
+- `LABIT_FORCE_TASK=t004`: rerun `t004` even if its checkpoint already exists.
+- `LABIT_FORCE_CLEAN=1`: only then remove existing output directories or expensive artifacts.
+
+Default behavior must be non-destructive. Do not `rm -rf` feature directories, probe directories, caches,
+or previous stage outputs unless `LABIT_FORCE_CLEAN=1` is set. Prefer per-task output files and checkpoint
+checks so rerunning after a late failure reuses earlier task outputs.
+
+Implement the resume controls in bash helpers near the top of the body, for example:
+- `task_index <task_id>` to compare task ordering
+- `should_run_task <task_id> <checkpoint_path>` to enforce ONLY_TASK/START_AT/FORCE_TASK/checkpoint logic
+- `require_checkpoint <task_id> <path>` to fail fast when a dependency output is missing
+
+IMPORTANT — Standard results file:
+Your script MUST end with a block that writes `$PWD/experiment_results.json`.
+This file is the contract between the experiment and Labit's review system.
+Format:
+```json
+{{
+  "status": "completed",
+  "metrics": {{"auroc": 0.72, "accuracy": 0.85}},
+  "conclusion": "one-sentence takeaway from the results",
+  "artifacts": ["relative/path/to/key/output1.json", "relative/path/to/output2.pt"]
+}}
+```
+- `status`: "completed" if all tasks succeeded, "failed" if any critical task failed
+- `metrics`: key numeric results (keep it flat, names should match the hypothesis criteria)
+- `conclusion`: one sentence summarizing whether the hypothesis is supported or not
+- `artifacts`: list of key output file paths (relative to $PWD)
+If the script fails midway, use a trap to still write the file with `"status": "failed"` and `"error": "<message>"`.
 
 Also generate a config.yaml if the experiment needs one (leave empty string if not needed).
 
@@ -452,6 +487,16 @@ Remember: your script is ONLY the body. Do NOT add shebang, `set -euo pipefail`,
 or `cd` to workdir. These are handled by the wrapper. Use `$PWD` for the project directory, never `dirname "$0"`.
 
 The user wants changes to the current script. Apply their feedback precisely.
+
+IMPORTANT: The script MUST still write `$PWD/experiment_results.json` at the end (see original generation rules).
+If the current script already does this, preserve it. If not, add it.
+
+IMPORTANT: The script MUST support task-level resume controls:
+- `LABIT_ONLY_TASK=t004`: run only task `t004` after verifying dependency checkpoints.
+- `LABIT_START_AT=t004`: skip tasks before `t004`; run `t004` and later tasks.
+- `LABIT_FORCE_TASK=t004`: rerun `t004` even if its checkpoint exists.
+- `LABIT_FORCE_CLEAN=1`: only then remove previous outputs.
+Default behavior must be non-destructive. Preserve completed expensive outputs unless explicitly forced.
 
 Approved task plans:
 {tasks_json}

@@ -4,12 +4,14 @@ import json
 import re
 import threading
 import time
+from datetime import datetime
 
 import typer
 from rich.console import Console, Group, RenderableType
 from rich.live import Live
 from labit.rendering import LaTeXMarkdown as Markdown
 from rich.panel import Panel
+from rich.prompt import Prompt
 from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
@@ -50,6 +52,10 @@ from labit.memory.models import MemoryKind
 from labit.memory.store import MemoryStore
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
+
+import subprocess
+from dataclasses import dataclass, field
+from pathlib import Path
 
 chat_app = typer.Typer(
     help="Shared free conversation sessions with one or more agent backends.",
@@ -131,10 +137,17 @@ _CHAT_SHELL_COMMANDS = (
     "/launch-exp approve-task",
     "/launch-exp reopen-task",
     "/launch-exp generate-script",
+    "/launch-exp run-task",
     "/launch-exp status",
     "/launch-exp done",
     "/debrief",
     "/review-results",
+    "/dev",
+    "/dev start",
+    "/dev status",
+    "/dev continue",
+    "/dev stop",
+    "/dev finish",
     "/new",
     "/switch",
     "/exit",
@@ -506,6 +519,7 @@ def _render_console_header(*, project: str, mode: str, participants: str) -> Non
                 _command_chip("/mode"),
                 _command_chip("/swap"),
                 _command_chip("/mute"),
+                _command_chip("/dev"),
             ]
         )
     )
@@ -628,10 +642,16 @@ def _shell_help() -> None:
     table.add_row("/launch-exp approve-task <id>", "Approve a specific task's detailed plan.")
     table.add_row("/launch-exp reopen-task <id>", "Reopen a previously approved task for re-planning.")
     table.add_row("/launch-exp generate-script", "Generate run.sh from approved task plans.")
+    table.add_row("/launch-exp run-task <id>", "Submit only one task from the run.sh, reusing earlier outputs.")
     table.add_row("/launch-exp status", "Show current experiment planning status.")
     table.add_row("/launch-exp done", "Finalize the experiment and exit planning mode.")
     table.add_row("/debrief", "Inspect active experiment launches and show their latest runtime state.")
     table.add_row("/review-results <hypothesis_id>", "Summarize experiments linked to a hypothesis, suggest a resolution, and optionally write the decision back.")
+    table.add_row("/dev start <task>", "Start autonomous dev loop in an isolated worktree (writer+reviewer auto-iterate).")
+    table.add_row("/dev status", "Show current dev loop status.")
+    table.add_row("/dev continue", "Resume dev loop after a decision point.")
+    table.add_row("/dev finish", "Merge, keep, or discard the dev worktree branch.")
+    table.add_row("/dev stop", "Stop the current dev loop.")
     table.add_row("/exit", "Leave the chat shell.")
     console.print(Panel(table, title="LABIT Chat Commands", border_style=_COMMAND_COLOR))
 
@@ -725,6 +745,7 @@ def _submit_and_monitor(
     max_retries: int = 3,
     stabilize_seconds: int = 90,
     poll_interval: int = 15,
+    env_overrides: dict[str, str] | None = None,
 ) -> bool:
     """Submit experiment, monitor for early failures, auto-fix and resubmit.
 
@@ -736,12 +757,13 @@ def _submit_and_monitor(
 
     executor = SSHExecutor(RepoPaths.discover())
     attempt = 0
+    launch_env = {str(k): str(v) for k, v in (env_overrides or {}).items() if str(v).strip()}
 
     while attempt < max_retries:
         attempt += 1
         console.print(f"[dim]Submitting experiment (attempt {attempt}/{max_retries})...[/dim]")
         try:
-            receipt = experiment_service.submit_experiment(active_launch_exp)
+            receipt = experiment_service.submit_experiment(active_launch_exp, env_overrides=launch_env)
         except Exception as submit_exc:
             console.print(f"[bold red]Submission error:[/bold red] {submit_exc}")
             console.print("[dim]Experiment finalized but not submitted.[/dim]")
@@ -761,7 +783,8 @@ def _submit_and_monitor(
             Panel(
                 f"[bold]PID[/bold]: {receipt.pid}\n"
                 f"[bold]Log[/bold]: {receipt.log_path}\n"
-                f"[bold]Host[/bold]: {receipt.remote_host}",
+                f"[bold]Host[/bold]: {receipt.remote_host}"
+                + ("" if not launch_env else "\n[bold]Env[/bold]: " + ", ".join(f"{k}={v}" for k, v in launch_env.items())),
                 title=f"[bold green]Submitted (attempt {attempt})[/bold green]",
                 border_style="green",
             )
@@ -791,7 +814,7 @@ def _submit_and_monitor(
                 command=active_launch_exp.run_sh_content or "#!/bin/bash\ntrue",
                 workdir=exec_profile.workdir,
                 output_dir=f"outputs/experiments/{active_launch_exp.experiment_id}",
-                env={},
+                env=launch_env,
             ),
             submission=receipt,
         )
@@ -878,6 +901,14 @@ def _submit_and_monitor(
                 f"wrong paths, missing dependencies, incorrect CLI arguments, "
                 f"environment assumptions."
             )
+            if launch_env:
+                fix_instruction += (
+                    "\n\nThis launch is a task-level retry with environment overrides: "
+                    + ", ".join(f"{k}={v}" for k, v in launch_env.items())
+                    + ". Preserve the LABIT_ONLY_TASK/LABIT_START_AT/LABIT_FORCE_TASK/"
+                    "LABIT_FORCE_CLEAN resume contract, should_run_task(), and "
+                    "require_checkpoint() while fixing the crash."
+                )
 
             with console.status("[bold cyan]Agent fixing run.sh...[/bold cyan]"):
                 result = planner.revise_run_sh(
@@ -895,6 +926,14 @@ def _submit_and_monitor(
                 result["run_sh"],
                 result["config_yaml"],
             )
+            if launch_env:
+                resume_issues = _run_sh_resume_contract_issues(active_launch_exp.run_sh_content)
+                if resume_issues:
+                    console.print(
+                        "[bold red]Auto-fix removed or failed to preserve task-level resume controls.[/bold red]\n"
+                        f"[dim]Issues: {', '.join(resume_issues)}[/dim]"
+                    )
+                    return False
             console.print(
                 Panel(
                     f"[bold]Fix summary[/bold]: {result['summary']}\n"
@@ -910,6 +949,52 @@ def _submit_and_monitor(
 
     console.print(f"[bold red]Exhausted {max_retries} retries.[/bold red]")
     return False
+
+
+def _run_sh_has_task_resume_contract(run_sh: str) -> bool:
+    return not _run_sh_resume_contract_issues(run_sh)
+
+
+def _run_sh_resume_contract_issues(run_sh: str) -> list[str]:
+    """Return missing pieces of the task-level resume contract.
+
+    This is intentionally heuristic: run.sh is arbitrary bash, but checking for
+    helpers in addition to env var names catches scripts that merely mention the
+    contract in comments without implementing it.
+    """
+    issues: list[str] = []
+    required_markers = (
+        "LABIT_ONLY_TASK",
+        "LABIT_START_AT",
+        "LABIT_FORCE_TASK",
+        "LABIT_FORCE_CLEAN",
+    )
+    for marker in required_markers:
+        if marker not in run_sh:
+            issues.append(f"missing {marker}")
+    if not re.search(r"(\bshould_run_task\s*\(\s*\)|\bfunction\s+should_run_task\b)", run_sh):
+        issues.append("missing should_run_task() helper")
+    if not re.search(r"(\brequire_checkpoint\s*\(\s*\)|\bfunction\s+require_checkpoint\b)", run_sh):
+        issues.append("missing require_checkpoint() helper")
+    destructive_lines: list[str] = []
+    lines = run_sh.splitlines()
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not re.search(r"\brm\s+(-[rfRF]+\s+)+", stripped) or stripped.startswith("#"):
+            continue
+        guard_context = "\n".join(
+            context_line
+            for context_line in lines[max(0, idx - 4): idx + 1]
+            if not context_line.strip().startswith("#")
+        )
+        if "LABIT_FORCE_CLEAN" not in guard_context:
+            destructive_lines.append(stripped)
+    if destructive_lines:
+        issues.append(
+            "contains cleanup not visibly guarded by LABIT_FORCE_CLEAN: "
+            + destructive_lines[0][:120]
+        )
+    return issues
 
 
 def _print_launch_exp_hints(console: Console, session: LaunchExpSession) -> None:
@@ -933,6 +1018,7 @@ def _print_launch_exp_hints(console: Console, session: LaunchExpSession) -> None
     elif session.phase == LaunchExpPhase.SCRIPT_GENERATION:
         lines.append("[dim]  /launch-exp generate-script  — generate run.sh[/dim]")
         if session.run_sh_content:
+            lines.append("[dim]  /launch-exp run-task <id>    — submit only one task, reusing prior outputs[/dim]")
             lines.append("[dim]  /launch-exp done              — finalize and exit planning mode[/dim]")
         else:
             lines.append("[dim]  Generate script first, then /launch-exp done to finalize.[/dim]")
@@ -1321,6 +1407,25 @@ def _task_error_from_collect(collected: dict) -> str:
     return ""
 
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _extract_log_hint(log_tail: str, *, max_len: int = 140) -> str:
+    if not log_tail:
+        return ""
+    lines: list[str] = []
+    for raw in log_tail.splitlines():
+        cleaned = _ANSI_ESCAPE_RE.sub("", raw).strip()
+        if cleaned:
+            lines.append(cleaned)
+    if not lines:
+        return ""
+    for candidate in reversed(lines):
+        if re.search(r"[A-Za-z0-9]", candidate):
+            return candidate[:max_len]
+    return lines[-1][:max_len]
+
+
 def _transcript_excerpt(messages, *, limit: int = 16, max_chars: int = 6000) -> str:
     if not messages:
         return ""
@@ -1372,6 +1477,7 @@ def _run_streaming_turn(
     force_deep_context: bool = False,
     reasoning_effort: str | None = None,
     skip_participants: set[str] | None = None,
+    cwd_override: str | None = None,
 ) -> object | None:
     _render_user_shell_message(query, attachments=attachments)
     # Temporarily filter out muted participants for this turn
@@ -1461,6 +1567,7 @@ def _run_streaming_turn(
                 on_reply_complete=_on_reply_complete,
                 cancel_event=cancel_event,
                 skip_participants=skip_participants,
+                cwd_override=cwd_override,
             )
         except KeyboardInterrupt:
             cancel_event.set()
@@ -1491,6 +1598,568 @@ def _run_streaming_turn(
     return result
 
 
+# ── /dev auto-development loop ────────────────────────────────────────
+
+
+@dataclass
+class DevDecision:
+    question: str
+    options: list[str]
+    recommended: int | None = None
+    rationale: str | None = None
+    asked_by: str = "writer"  # writer|reviewer
+
+
+@dataclass
+class DevRound:
+    round_index: int
+    writer_summary: str = ""
+    reviewer_summary: str = ""
+    findings: list[str] = field(default_factory=list)
+    changed_files: list[str] = field(default_factory=list)
+    status: str = "pending"  # pending|writer_done|approved|decision_needed
+
+
+@dataclass
+class DevLoopSession:
+    task: str
+    writer_name: str
+    reviewer_name: str
+    max_rounds: int = 6
+    test_mode: str = "auto"  # off|auto|on
+    current_round: int = 0
+    history: list[DevRound] = field(default_factory=list)
+    pending_decision: DevDecision | None = None
+    user_decision: str | None = None  # answer to pending decision
+    status: str = "active"  # active|waiting_decision|completed|stopped
+    scope_label: str = ""
+    scope_pathspecs: list[str] = field(default_factory=list)
+    scope_git_root: str = ""  # git root for the dev scope (may differ from RepoPaths.root for nested repos)
+    branch_repo_root: str = ""  # repo that owns dev_branch and worktree metadata
+    worktree_path: str = ""  # isolated worktree used by this dev loop, if any
+    initial_dirty_files: list[str] = field(default_factory=list)
+    dev_branch: str = ""  # branch created for this dev loop
+    original_branch: str = ""  # branch to return to after dev loop
+
+
+def _parse_dev_decision(text: str) -> DevDecision | None:
+    """Parse DECISION_NEEDED block from agent output."""
+    if "DECISION_NEEDED" not in text:
+        return None
+    lines = text[text.index("DECISION_NEEDED"):].splitlines()
+    question = ""
+    options: list[str] = []
+    recommended: int | None = None
+    rationale: str | None = None
+    for line in lines[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if low.startswith("question:"):
+            question = line.split(":", 1)[1].strip()
+        elif re.match(r"option_[a-z]:", low):
+            options.append(line.split(":", 1)[1].strip())
+        elif low.startswith("recommended:"):
+            letter = line.split(":", 1)[1].strip().lower()
+            idx = ord(letter[0]) - ord("a") if letter else None
+            recommended = idx
+        elif low.startswith("reason:"):
+            rationale = line.split(":", 1)[1].strip()
+    if not question and not options:
+        return None
+    return DevDecision(
+        question=question or "(agent requests a decision)",
+        options=options if options else ["(see agent output above)"],
+        recommended=recommended,
+        rationale=rationale,
+    )
+
+
+def _parse_review_findings(text: str) -> tuple[bool, list[str], str]:
+    """Parse reviewer output. Returns (is_approved, findings, summary)."""
+    lines = text.strip().splitlines()
+    findings: list[str] = []
+    summary_parts: list[str] = []
+    is_lgtm = False
+
+    for line in lines:
+        stripped = line.strip()
+        low = stripped.lower()
+        if low.startswith("lgtm"):
+            is_lgtm = True
+        elif low.startswith("finding:"):
+            findings.append(stripped.split(":", 1)[1].strip())
+        elif low.startswith("summary:"):
+            summary_parts.append(stripped.split(":", 1)[1].strip())
+
+    # Also detect LGTM in the middle of text
+    if not is_lgtm and re.search(r"\bLGTM\b", text):
+        is_lgtm = True
+
+    summary = " ".join(summary_parts) if summary_parts else text[:200]
+    approved = not findings and (is_lgtm or bool(text.strip()))
+    return approved, findings, summary
+
+
+def _normalize_git_remote(url: str) -> str:
+    value = url.strip()
+    if not value:
+        return ""
+    if value.startswith("git@"):
+        value = value[4:]
+        value = value.replace(":", "/", 1)
+    value = re.sub(r"^https?://", "", value)
+    value = value.removesuffix(".git")
+    return value.rstrip("/")
+
+
+def _git_output(*args: str, cwd: Path, timeout: int = 10) -> str:
+    result = subprocess.run(
+        list(args),
+        capture_output=True,
+        text=True,
+        cwd=str(cwd),
+        timeout=timeout,
+    )
+    return result.stdout.strip()
+
+
+def _resolve_dev_scope(session) -> tuple[str, list[str], Path]:
+    """Choose the git scope that /dev should review.
+
+    Returns (label, pathspecs, git_root).
+    git_root may point to a nested repo (e.g. vault/projects/X/code/.git)
+    rather than the outer Research-OS repo.
+    """
+    paths = RepoPaths.discover()
+    project = session.project or ""
+    if not project:
+        return ("repository", ["."], paths.root)
+
+    project_dir = paths.vault_projects_dir / project
+    if project_dir.exists():
+        # Check for nested git repo in project code dir
+        code_dir = project_dir / "code"
+        if code_dir.exists() and (code_dir / ".git").exists():
+            return (f"project code ({project})", ["."], code_dir)
+
+        try:
+            spec = ProjectService(paths).load_project(project)
+        except Exception:
+            spec = None
+        repo_root_remote = _normalize_git_remote(_git_output("git", "config", "--get", "remote.origin.url", cwd=paths.root))
+        spec_remote = _normalize_git_remote(spec.repo) if spec and spec.repo else ""
+        if spec_remote and repo_root_remote and spec_remote == repo_root_remote:
+            return (f"repository ({paths.root.name})", ["."], paths.root)
+        try:
+            project_pathspec = str(project_dir.relative_to(paths.root))
+        except ValueError:
+            project_pathspec = str(project_dir)
+        return (f"project ({project})", [project_pathspec], paths.root)
+    return ("repository", ["."], paths.root)
+
+
+def _list_scope_dirty_files(pathspecs: list[str], git_root: Path | None = None) -> list[str]:
+    cwd = str(git_root) if git_root else str(RepoPaths.discover().root)
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--", *pathspecs],
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            timeout=10,
+        )
+    except Exception:
+        return []
+    dirty: list[str] = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        candidate = line[3:].strip()
+        if " -> " in candidate:
+            candidate = candidate.split(" -> ", 1)[1].strip()
+        if candidate and candidate not in dirty:
+            dirty.append(candidate)
+    return dirty
+
+
+def _create_dev_branch(task: str, git_root: Path | None = None) -> tuple[str, str]:
+    """Create a dev branch and return (branch_name, original_branch)."""
+    cwd = git_root or RepoPaths.discover().root
+    original = _git_output("git", "rev-parse", "--abbrev-ref", "HEAD", cwd=cwd) or "main"
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", task.lower())[:40].strip("-")
+    timestamp = datetime.now().strftime("%m%d-%H%M")
+    branch_name = f"labit-dev/{slug}-{timestamp}"
+    subprocess.run(
+        ["git", "checkout", "-b", branch_name],
+        capture_output=True, text=True, cwd=str(cwd),
+    )
+    return branch_name, original
+
+
+def _create_dev_worktree(
+    *,
+    task: str,
+    git_root: Path,
+    project: str | None,
+) -> tuple[str, str, Path]:
+    """Create an isolated git worktree for a /dev run.
+
+    Returns (branch_name, original_branch, worktree_path). The original checkout is
+    not switched; writer/reviewer turns run inside the returned worktree path.
+    """
+    paths = RepoPaths.discover()
+    original = _git_output("git", "rev-parse", "--abbrev-ref", "HEAD", cwd=git_root) or "main"
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", task.lower())[:40].strip("-") or "task"
+    timestamp = datetime.now().strftime("%m%d-%H%M%S")
+    branch_name = f"labit-dev/{slug}-{timestamp}"
+    project_slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", project or git_root.name).strip("-") or "repo"
+    worktree_path = paths.root / ".labit" / "dev-worktrees" / project_slug / f"{slug}-{timestamp}"
+    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+
+    result = subprocess.run(
+        ["git", "worktree", "add", "-b", branch_name, str(worktree_path), "HEAD"],
+        capture_output=True,
+        text=True,
+        cwd=str(git_root),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "git worktree add failed")
+    return branch_name, original, worktree_path
+
+
+def _remove_dev_worktree(repo_root: Path, worktree_path: Path) -> tuple[bool, str]:
+    """Remove a /dev worktree. Returns (ok, message)."""
+    if not str(worktree_path):
+        return True, ""
+    result = subprocess.run(
+        ["git", "worktree", "remove", "--force", str(worktree_path)],
+        capture_output=True,
+        text=True,
+        cwd=str(repo_root),
+    )
+    subprocess.run(
+        ["git", "worktree", "prune"],
+        capture_output=True,
+        text=True,
+        cwd=str(repo_root),
+    )
+    if result.returncode != 0:
+        return False, result.stderr.strip() or result.stdout.strip()
+    return True, ""
+
+
+def _dev_auto_commit(round_num: int, pathspecs: list[str], task: str, git_root: Path | None = None) -> str | None:
+    """Stage and commit changes from a dev round. Returns commit hash or None."""
+    cwd = git_root or RepoPaths.discover().root
+    # Stage changes in scope
+    subprocess.run(
+        ["git", "add", "--", *pathspecs],
+        capture_output=True, text=True, cwd=str(cwd),
+    )
+    # Check if there's anything to commit
+    status = _git_output("git", "diff", "--cached", "--stat", cwd=cwd)
+    if not status:
+        return None
+    msg = f"dev(round {round_num}): {task[:60]}"
+    result = subprocess.run(
+        ["git", "commit", "-m", msg, "--no-verify"],
+        capture_output=True, text=True, cwd=str(cwd),
+    )
+    if result.returncode != 0:
+        return None
+    return _git_output("git", "rev-parse", "--short", "HEAD", cwd=cwd)
+
+
+def _get_last_commit_diff(git_root: Path | None = None) -> str:
+    """Get the diff of the most recent commit (for reviewer to review per-round changes)."""
+    cwd = git_root or RepoPaths.discover().root
+    try:
+        diff = _git_output("git", "diff", "HEAD~1..HEAD", cwd=cwd)
+        stat = _git_output("git", "diff", "--stat", "HEAD~1..HEAD", cwd=cwd)
+    except Exception:
+        return "(unable to get commit diff)"
+    parts = []
+    if stat:
+        parts.append(f"Diff stat:\n{stat}")
+    if diff:
+        if len(diff) > 8000:
+            diff = diff[:8000] + "\n... (truncated)"
+        parts.append(f"Full diff:\n{diff}")
+    return "\n\n".join(parts) if parts else "(no changes in last commit)"
+
+
+def _get_scope_diff(pathspecs: list[str], git_root: Path | None = None) -> str:
+    """Get git diff for the selected /dev scope."""
+    cwd = git_root or RepoPaths.discover().root
+    try:
+        stat = _git_output("git", "diff", "--stat", "--", *pathspecs, cwd=cwd)
+        diff = _git_output("git", "diff", "--", *pathspecs, cwd=cwd)
+        untracked = _git_output("git", "status", "--porcelain", "--", *pathspecs, cwd=cwd)
+    except Exception:
+        return "(unable to get diff)"
+    parts = []
+    if stat:
+        parts.append(f"Diff stat:\n{stat}")
+    if diff:
+        if len(diff) > 8000:
+            diff = diff[:8000] + "\n... (truncated)"
+        parts.append(f"Full diff:\n{diff}")
+    if untracked:
+        parts.append(f"Untracked/modified:\n{untracked}")
+    return "\n\n".join(parts) if parts else "(no changes detected)"
+
+
+def _render_dev_decision(dev_session: DevLoopSession) -> None:
+    """Render a decision prompt for the user."""
+    decision = dev_session.pending_decision
+    if not decision:
+        return
+    lines = [f"[bold]{decision.question}[/bold]\n"]
+    for i, opt in enumerate(decision.options):
+        letter = chr(ord("A") + i)
+        rec = " [bold green](recommended)[/bold green]" if decision.recommended == i else ""
+        lines.append(f"  [{letter}] {opt}{rec}")
+    if decision.rationale:
+        lines.append(f"\n[dim]Reason: {decision.rationale}[/dim]")
+    lines.append(f"\n[dim]Asked by: {decision.asked_by}[/dim]")
+    console.print(Panel(
+        "\n".join(lines),
+        title="[bold yellow]Decision needed[/bold yellow]",
+        border_style="yellow",
+    ))
+
+
+def _run_dev_loop(
+    *,
+    service: ChatService,
+    session,
+    dev_session: DevLoopSession,
+) -> DevLoopSession:
+    """Run the writer/reviewer auto-iteration loop."""
+    participants = session.participants
+    writer = next((p for p in participants if p.name == dev_session.writer_name), participants[0])
+    reviewer = next((p for p in participants if p.name == dev_session.reviewer_name), participants[-1])
+
+    # All participants except writer
+    skip_for_writer = {p.name for p in participants if p.name != writer.name}
+    # All participants except reviewer
+    skip_for_reviewer = {p.name for p in participants if p.name != reviewer.name}
+
+    project = session.project
+    scope_label = dev_session.scope_label or "repository"
+    scope_pathspecs = dev_session.scope_pathspecs or ["."]
+    scope_git_root = Path(dev_session.scope_git_root) if dev_session.scope_git_root else RepoPaths.discover().root
+    turn_cwd = str(scope_git_root)
+
+    for round_num in range(dev_session.current_round + 1, dev_session.max_rounds + 1):
+        dev_session.current_round = round_num
+        dev_round = DevRound(round_index=round_num)
+
+        console.print(f"\n[bold]── Dev Round {round_num}/{dev_session.max_rounds} ──[/bold]")
+
+        # ── Writer turn ──
+        writer_query_parts = [f"[Dev Loop — Round {round_num}/{dev_session.max_rounds}]"]
+        writer_query_parts.append(f"Task: {dev_session.task}")
+        writer_query_parts.append(f"Scope: {scope_label}")
+        writer_query_parts.append(f"Editable workspace: {turn_cwd}")
+        if dev_session.worktree_path:
+            writer_query_parts.append(
+                "This /dev loop is running in an isolated git worktree. "
+                "Use the editable workspace path above, not the original checkout, for all file edits and commands."
+            )
+
+        # Include decision answer if pending
+        if dev_session.user_decision:
+            writer_query_parts.append(f"User decided: {dev_session.user_decision}")
+            dev_session.user_decision = None
+            dev_session.pending_decision = None
+
+        # Include previous reviewer findings
+        if dev_session.history:
+            last = dev_session.history[-1]
+            if last.findings:
+                writer_query_parts.append("Reviewer findings from last round:")
+                for f in last.findings:
+                    writer_query_parts.append(f"- {f}")
+            elif last.reviewer_summary:
+                writer_query_parts.append(f"Reviewer feedback: {last.reviewer_summary}")
+
+        writer_query_parts.append(
+            "\nYou are the WRITER. Read the codebase, implement the change, and summarize what you did."
+            "\nFollow the session's project boundary rules from the system prompt."
+            f"\nWork only within this /dev scope: {scope_label}."
+            "\nIf you hit a genuine architecture/design fork requiring user input, output:\n"
+            "DECISION_NEEDED\nquestion: ...\noption_a: ...\noption_b: ...\nrecommended: a\nreason: ..."
+        )
+
+        writer_query = "\n".join(writer_query_parts)
+
+        try:
+            writer_result = _run_streaming_turn(
+                service=service,
+                session=session,
+                query=writer_query,
+                skip_participants=skip_for_writer,
+                cwd_override=turn_cwd,
+            )
+        except KeyboardInterrupt:
+            console.print(f"\n[bold yellow]Dev loop interrupted at round {round_num} (writer phase).[/bold yellow]")
+            dev_session.status = "stopped"
+            return dev_session
+
+        if writer_result is None or not writer_result.replies:
+            console.print("[bold red]Writer produced no output. Stopping dev loop.[/bold red]")
+            dev_session.status = "stopped"
+            return dev_session
+
+        writer_text = writer_result.replies[0].message.content
+        dev_round.writer_summary = writer_text[:500]
+        changed_files = _list_scope_dirty_files(scope_pathspecs, scope_git_root)
+        if dev_session.initial_dirty_files:
+            changed_files = [item for item in changed_files if item not in dev_session.initial_dirty_files] or changed_files
+        dev_round.changed_files = changed_files[:20]
+
+        # Auto-commit writer's changes to the dev branch
+        commit_hash = _dev_auto_commit(round_num, scope_pathspecs, dev_session.task, scope_git_root)
+        if commit_hash:
+            console.print(f"[dim]Auto-committed: {commit_hash}[/dim]")
+
+        # Check for decision needed
+        decision = _parse_dev_decision(writer_text)
+        if decision:
+            decision.asked_by = "writer"
+            dev_session.pending_decision = decision
+            dev_session.status = "waiting_decision"
+            dev_session.history.append(dev_round)
+            _render_dev_decision(dev_session)
+            return dev_session
+
+        # ── Reviewer turn ──
+        console.print(f"\n[dim]── Reviewer ({reviewer.name}) ──[/dim]")
+
+        # Use per-commit diff if we just committed, otherwise fall back to worktree diff
+        if commit_hash:
+            diff_text = _get_last_commit_diff(scope_git_root)
+        else:
+            diff_text = _get_scope_diff(scope_pathspecs, scope_git_root)
+
+        reviewer_query_parts = [f"[Dev Loop — Review Round {round_num}/{dev_session.max_rounds}]"]
+        reviewer_query_parts.append(f"Task: {dev_session.task}")
+        reviewer_query_parts.append(f"Scope: {scope_label}")
+        reviewer_query_parts.append(f"Editable workspace: {turn_cwd}")
+        if dev_round.changed_files:
+            reviewer_query_parts.append(
+                "Files changed this round:\n" + "\n".join(f"- {item}" for item in dev_round.changed_files[:20])
+            )
+        reviewer_query_parts.append(f"\nWriter's changes (this round only):\n{diff_text}")
+
+        if dev_session.test_mode == "on":
+            reviewer_query_parts.append(
+                "\nRun targeted tests relevant to the changes if test infrastructure exists."
+            )
+        elif dev_session.test_mode == "auto":
+            reviewer_query_parts.append(
+                "\nIf you see obvious test infrastructure (pytest, unittest), run a quick targeted check. "
+                "Otherwise skip testing and focus on code review."
+            )
+
+        reviewer_query_parts.append(
+            "\nYou are the REVIEWER. Review the diff above."
+            "\n- If the changes look correct and complete, output: LGTM\\nsummary: ..."
+            "\n- If there are issues, output: FINDING: <issue>\\n for each issue, then summary: ..."
+            "\n- If a real design fork needs user input, output DECISION_NEEDED (same format as writer)."
+            "\n- Be concrete and actionable. Don't nitpick style — focus on bugs, regressions, missing logic."
+        )
+
+        reviewer_query = "\n".join(reviewer_query_parts)
+
+        try:
+            reviewer_result = _run_streaming_turn(
+                service=service,
+                session=session,
+                query=reviewer_query,
+                skip_participants=skip_for_reviewer,
+                cwd_override=turn_cwd,
+            )
+        except KeyboardInterrupt:
+            console.print(f"\n[bold yellow]Dev loop interrupted at round {round_num} (reviewer phase).[/bold yellow]")
+            dev_session.status = "stopped"
+            dev_session.history.append(dev_round)
+            return dev_session
+
+        if reviewer_result is None or not reviewer_result.replies:
+            console.print("[bold red]Reviewer produced no output. Stopping dev loop.[/bold red]")
+            dev_session.status = "stopped"
+            dev_session.history.append(dev_round)
+            return dev_session
+
+        reviewer_text = reviewer_result.replies[0].message.content
+        dev_round.reviewer_summary = reviewer_text[:500]
+
+        # Check for decision needed from reviewer
+        decision = _parse_dev_decision(reviewer_text)
+        if decision:
+            decision.asked_by = "reviewer"
+            dev_session.pending_decision = decision
+            dev_session.status = "waiting_decision"
+            dev_session.history.append(dev_round)
+            _render_dev_decision(dev_session)
+            return dev_session
+
+        # Parse findings
+        approved, findings, summary = _parse_review_findings(reviewer_text)
+        dev_round.findings = findings
+        dev_round.reviewer_summary = summary
+        dev_round.status = "approved" if approved else "review_failed"
+        dev_session.history.append(dev_round)
+
+        if approved:
+            console.print(f"[bold green]Approved at round {round_num}. Dev loop complete.[/bold green]")
+            dev_session.status = "completed"
+            return dev_session
+
+        console.print(f"[dim]{len(findings)} finding(s) — continuing to next round[/dim]")
+
+    # Max rounds reached
+    console.print(f"[bold yellow]Reached max rounds ({dev_session.max_rounds}). Dev loop finished.[/bold yellow]")
+    dev_session.status = "completed"
+    return dev_session
+
+
+def _render_dev_status(dev_session: DevLoopSession) -> None:
+    """Render current dev loop status."""
+    lines = [
+        f"[bold]Task[/bold]: {dev_session.task}",
+        f"[bold]Writer[/bold]: {dev_session.writer_name}",
+        f"[bold]Reviewer[/bold]: {dev_session.reviewer_name}",
+        f"[bold]Round[/bold]: {dev_session.current_round}/{dev_session.max_rounds}",
+        f"[bold]Status[/bold]: {dev_session.status}",
+        f"[bold]Test mode[/bold]: {dev_session.test_mode}",
+        f"[bold]Scope[/bold]: {dev_session.scope_label or 'repository'}",
+        f"[bold]Git root[/bold]: {dev_session.scope_git_root or '(default)'}",
+        f"[bold]Branch repo[/bold]: {dev_session.branch_repo_root or dev_session.scope_git_root or '(default)'}",
+        f"[bold]Worktree[/bold]: {dev_session.worktree_path or '(none)'}",
+        f"[bold]Branch[/bold]: {dev_session.dev_branch or '(none)'}",
+    ]
+    if dev_session.history:
+        last = dev_session.history[-1]
+        if last.changed_files:
+            lines.append(f"\n[bold]Last changed files[/bold]:")
+            for path in last.changed_files[:8]:
+                lines.append(f"  - {path}")
+        if last.findings:
+            lines.append(f"\n[bold]Last findings[/bold]:")
+            for f in last.findings[:5]:
+                lines.append(f"  - {f}")
+    console.print(Panel(
+        "\n".join(lines),
+        title="[bold]Dev Loop Status[/bold]",
+        border_style=_COMMAND_COLOR,
+    ))
+
+
 def run_chat_shell(
     *,
     session,
@@ -1507,6 +2176,7 @@ def run_chat_shell(
     # Hypothesis editing mode state: (hypothesis_id, project, current_draft)
     active_hypothesis: tuple[str, str, HypothesisDraft] | None = None
     active_launch_exp: LaunchExpSession | None = None
+    active_dev: DevLoopSession | None = None
     muted_next_turn: set[str] = set()  # agent names to skip on next turn only
     while True:
         try:
@@ -2481,7 +3151,10 @@ def run_chat_shell(
                         console.print("[bold red]Error:[/bold red] Not in script generation phase. Approve all tasks first.")
                         continue
                     try:
-                        hyp_detail = _hypothesis_service().load_hypothesis(current_session.project, active_launch_exp.hypothesis_id)
+                        hyp_detail = _hypothesis_service().load_hypothesis(
+                            current_session.project,
+                            active_launch_exp.hypothesis_id,
+                        )
                         code_context = experiment_service.get_code_context(current_session.project)
                         planner = ExperimentPlanner(RepoPaths.discover())
                         first_participant = current_session.participants[0] if current_session.participants else None
@@ -2522,6 +3195,118 @@ def run_chat_shell(
                         _print_launch_exp_hints(console, active_launch_exp)
                     except Exception as exc:
                         console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                if sub_arg.startswith("run-task"):
+                    task_id = sub_arg.replace("run-task", "").strip()
+                    if active_launch_exp is None or active_launch_exp.phase != LaunchExpPhase.SCRIPT_GENERATION:
+                        console.print("[bold red]Error:[/bold red] Not in script generation phase. Use /launch-exp resume <experiment_id> first for an existing experiment.")
+                        continue
+                    if not task_id:
+                        console.print("[bold red]Usage:[/bold red] /launch-exp run-task <task_id>")
+                        continue
+                    known_task_ids = {t.id for t in active_launch_exp.task_plans}
+                    if known_task_ids and task_id not in known_task_ids:
+                        console.print(f"[bold red]Error:[/bold red] Unknown task '{task_id}'. Known tasks: {', '.join(sorted(known_task_ids))}")
+                        continue
+                    if not active_launch_exp.run_sh_content:
+                        console.print("[bold red]Error:[/bold red] No run.sh available. Use /launch-exp generate-script first.")
+                        continue
+
+                    try:
+                        hyp_detail = _hypothesis_service().load_hypothesis(current_session.project, active_launch_exp.hypothesis_id)
+                        code_context = experiment_service.get_code_context(current_session.project)
+                        planner = ExperimentPlanner(RepoPaths.discover())
+                        first_participant = current_session.participants[0] if current_session.participants else None
+                        provider = first_participant.provider if first_participant else None
+                        tasks_json = json.dumps([t.model_dump() for t in active_launch_exp.task_plans], indent=2)
+                        try:
+                            exec_profile = experiment_service.build_default_execution_profile(current_session.project)
+                            workdir = exec_profile.workdir or ""
+                            setup_summary = exec_profile.setup_script or ""
+                        except Exception:
+                            workdir = ""
+                            setup_summary = ""
+
+                        resume_issues = _run_sh_resume_contract_issues(active_launch_exp.run_sh_content)
+                        if resume_issues:
+                            console.print("[dim]run.sh does not expose task-level resume controls; asking agent to add them before submitting...[/dim]")
+                            instruction = (
+                                f"Revise this run.sh so it supports task-level resume/retry controls, then keep the existing experiment logic intact.\n"
+                                f"Required contract:\n"
+                                f"- LABIT_ONLY_TASK={task_id} runs only task {task_id} after verifying dependency checkpoints.\n"
+                                f"- LABIT_START_AT={task_id} skips tasks before {task_id}.\n"
+                                f"- LABIT_FORCE_TASK={task_id} reruns {task_id} even if its checkpoint exists.\n"
+                                f"- Default reruns must be non-destructive: do not delete prior outputs unless LABIT_FORCE_CLEAN=1.\n"
+                                f"- Add should_run_task() and require_checkpoint() bash helpers.\n"
+                                f"Current missing/unsafe pieces: {', '.join(resume_issues)}.\n"
+                                f"Preserve the standard experiment_results.json output contract."
+                            )
+                            with console.status("[bold cyan]Adding task-level resume support to run.sh...[/bold cyan]"):
+                                result = planner.revise_run_sh(
+                                    current_run_sh=active_launch_exp.run_sh_content,
+                                    current_config_yaml=active_launch_exp.config_yaml_content,
+                                    tasks_json=tasks_json,
+                                    user_instruction=instruction,
+                                    code_tree=code_context,
+                                    workdir=workdir,
+                                    setup_script_summary=setup_summary,
+                                    provider=provider,
+                                )
+                            active_launch_exp = experiment_service.save_script(
+                                active_launch_exp,
+                                result["run_sh"],
+                                result["config_yaml"],
+                            )
+                            resume_issues = _run_sh_resume_contract_issues(active_launch_exp.run_sh_content)
+                            if resume_issues:
+                                console.print(
+                                    "[bold red]Error:[/bold red] Agent revision did not add the required task-level resume controls. "
+                                    "Revise run.sh manually or try again.\n"
+                                    f"[dim]Still missing: {', '.join(resume_issues)}[/dim]"
+                                )
+                                continue
+                            console.print(
+                                Panel(
+                                    f"[bold]Summary[/bold]: {result['summary']}\n"
+                                    f"[bold]run.sh[/bold]: {len(result['run_sh'].splitlines())} lines",
+                                    title="[bold green]Resume Controls Added[/bold green]",
+                                    border_style="green",
+                                )
+                            )
+
+                        detail = experiment_service.finalize_experiment(active_launch_exp)
+                        env_overrides = {
+                            "LABIT_ONLY_TASK": task_id,
+                            "LABIT_START_AT": task_id,
+                            "LABIT_FORCE_TASK": task_id,
+                        }
+                        console.print(
+                            Panel(
+                                f"[bold]Experiment[/bold]: {detail.record.experiment_id}\n"
+                                f"[bold]Task[/bold]: {task_id}\n"
+                                f"[bold]Mode[/bold]: run only this task; reuse prior outputs",
+                                title="[bold cyan]Task Retry Submit[/bold cyan]",
+                                border_style="cyan",
+                            )
+                        )
+                        submit_ok = _submit_and_monitor(
+                            console=console,
+                            experiment_service=experiment_service,
+                            active_launch_exp=active_launch_exp,
+                            current_session=current_session,
+                            service=service,
+                            planner=planner,
+                            _hypothesis_service=_hypothesis_service,
+                            first_participant=first_participant,
+                            env_overrides=env_overrides,
+                        )
+                        if submit_ok:
+                            active_launch_exp = None
+                        else:
+                            console.print("[yellow]Task retry was not confirmed stable; keeping launch-exp session active for revision.[/yellow]")
+                    except Exception as exc:
+                        console.print(f"[bold red]Error submitting task retry:[/bold red] {exc}")
                     continue
 
                 if sub_arg == "done":
@@ -2713,20 +3498,67 @@ def run_chat_shell(
                             except Exception:
                                 collected = {}
                             collected_status = str(collected.get("status", "unknown")).strip() or "unknown"
-                            log_tail = str(collected.get("log_tail", ""))[:500]
+                            log_tail = str(collected.get("log_tail", ""))[:2000]
                             status_label = collected_status
                             if collected_status == "stopped":
                                 has_output = collected.get("output_dir_exists") or collected.get("artifact_refs")
                                 status_label = "completed" if has_output else "failed"
 
-                            row = (
-                                f"- {detail.record.experiment_id}/{artifact.launch_id} · "
-                                f"{status_label}"
-                            )
-                            if log_tail:
-                                last_line = log_tail.strip().rsplit("\n", 1)[-1][:120]
-                                row += f" · {last_line}"
-                            rows.append(f"[bold]{row.split(' · ', 1)[0]}[/bold] · {row.split(' · ', 1)[1]}")
+                            progress_hint = _extract_log_hint(log_tail)
+                            error_hint = _task_error_from_collect(collected) or progress_hint
+
+                            # Build display based on status
+                            prefix = f"- {detail.record.experiment_id}/{artifact.launch_id}"
+                            if status_label == "running":
+                                # Show last meaningful log line as progress
+                                if progress_hint:
+                                    row = f"{prefix} · [green]running[/green] · {progress_hint}"
+                                else:
+                                    pid_hint = artifact.submission.pid if artifact.submission else None
+                                    log_hint = artifact.submission.log_path if artifact.submission else None
+                                    if pid_hint and log_hint:
+                                        row = f"{prefix} · [green]running[/green] · pid {pid_hint} · log {log_hint}"
+                                    elif pid_hint:
+                                        row = f"{prefix} · [green]running[/green] · pid {pid_hint}"
+                                    else:
+                                        row = f"{prefix} · [green]running[/green] · (starting up...)"
+                            elif status_label == "failed":
+                                # Show error summary
+                                error_line = error_hint or "(no log)"
+                                row = f"{prefix} · [red]failed[/red] · {error_line}"
+                            elif status_label == "completed":
+                                # Show metrics if available, otherwise last log line
+                                metrics_hint = ""
+                                for file_content in collected.get("files", {}).values():
+                                    try:
+                                        file_data = json.loads(file_content) if isinstance(file_content, str) else file_content
+                                    except (json.JSONDecodeError, TypeError):
+                                        continue
+                                    if isinstance(file_data, dict):
+                                        # Check for nested "metrics" dict (experiment_results.json format)
+                                        metrics_dict = file_data.get("metrics", {}) if "metrics" in file_data else file_data
+                                        if isinstance(metrics_dict, dict):
+                                            for k in ("auroc", "accuracy", "loss", "f1", "eval_loss"):
+                                                if k in metrics_dict:
+                                                    v = metrics_dict[k]
+                                                    metrics_hint += f"{k}={v:.4f} " if isinstance(v, float) else f"{k}={v} "
+                                        # Prefer conclusion over raw metrics
+                                        conclusion = file_data.get("conclusion", "")
+                                        if conclusion:
+                                            metrics_hint = (conclusion[:80] + (" | " + metrics_hint.strip() if metrics_hint else "")).strip()
+                                            break
+                                if metrics_hint:
+                                    row = f"{prefix} · [blue]completed[/blue] · {metrics_hint.strip()}"
+                                elif progress_hint:
+                                    row = f"{prefix} · [blue]completed[/blue] · {progress_hint}"
+                                else:
+                                    row = f"{prefix} · [blue]completed[/blue]"
+                            else:
+                                row = f"{prefix} · {status_label}"
+                                if progress_hint:
+                                    row += f" · {progress_hint}"
+
+                            rows.append(row)
                             rows_by_experiment.setdefault(detail.record.experiment_id, []).append(row)
                             has_experiment_launch = True
                             break  # only show latest launch per experiment
@@ -2835,12 +3667,243 @@ def run_chat_shell(
 
                 experiment_service = _experiment_service()
                 hypothesis_service = _hypothesis_service()
+
+                # --- Step 1: Collect remote results ---
+                try:
+                    hypothesis_detail = hypothesis_service.load_hypothesis(current_session.project, hypothesis_id)
+                except Exception as exc:
+                    console.print(f"[bold red]Error:[/bold red] {exc}")
+                    continue
+
+                console.print("")
+                with console.status("[bold blue]Collecting experiment results from remote...[/bold blue]"):
+                    try:
+                        collected_results = experiment_service.collect_experiment_results(
+                            project=current_session.project,
+                            hypothesis_id=hypothesis_id,
+                        )
+                    except Exception as exc:
+                        console.print(f"[bold red]Error collecting results:[/bold red] {exc}")
+                        collected_results = []
+
+                if not collected_results:
+                    console.print("[yellow]No experiments found for this hypothesis.[/yellow]")
+                    continue
+
+                # --- Step 2: Show results and let agent assess ---
+                from labit.experiments.models import ExperimentAssessment
+                results_summary_parts: list[str] = []
+                assessable_ids: list[str] = []  # only completed experiments get assessed
+                for cr in collected_results:
+                    exp_id = cr["experiment_id"]
+                    exp_title = cr["title"]
+                    collected = cr.get("collected") or {}
+                    remote_status = collected.get("status", "unknown")
+                    log_tail = collected.get("log_tail", "")
+                    files = collected.get("files", {})
+
+                    # Determine if this experiment is assessable (has results)
+                    is_running = remote_status == "running"
+                    has_files = bool(files)
+                    has_log = bool(log_tail and log_tail.strip())
+
+                    # Display each experiment's results
+                    status_color = {"running": "blue", "stopped": "yellow"}.get(remote_status, "dim")
+                    console.print(f"  [bold]{exp_id}[/bold] ({exp_title}) — [{status_color}]{remote_status}[/{status_color}]")
+
+                    if is_running:
+                        console.print(f"    [dim](still running — skipping assessment)[/dim]")
+                        continue
+                    if not has_files and not has_log:
+                        console.print(f"    [dim](no results available — skipping assessment)[/dim]")
+                        continue
+
+                    # Check for standardized experiment_results.json first
+                    std_results = None
+                    if files:
+                        for fpath, fcontent in files.items():
+                            if fpath.endswith("experiment_results.json"):
+                                try:
+                                    std_results = json.loads(fcontent) if isinstance(fcontent, str) else fcontent
+                                except (json.JSONDecodeError, TypeError):
+                                    pass
+                                break
+
+                    # Only assess experiments that completed with results, not failed ones
+                    exp_failed = False
+                    if std_results:
+                        exp_status = std_results.get("status", "unknown")
+                        exp_metrics = std_results.get("metrics", {})
+                        if exp_status == "failed" and not exp_metrics:
+                            exp_failed = True
+
+                    # Build text summary for agent
+                    part = f"## Experiment {exp_id}: {exp_title}\n"
+                    part += f"Remote status: {remote_status}\n"
+
+                    if std_results:
+                        # Use the standardized results file
+                        exp_status = std_results.get("status", "unknown")
+                        metrics = std_results.get("metrics", {})
+                        conclusion = std_results.get("conclusion", "")
+                        error = std_results.get("error", "")
+                        artifacts = std_results.get("artifacts", [])
+
+                        part += f"Experiment status: {exp_status}\n"
+                        if metrics:
+                            metrics_str = ", ".join(f"{k}={v}" for k, v in metrics.items())
+                            part += f"Metrics: {metrics_str}\n"
+                            console.print(f"    [green]metrics:[/green] {metrics_str}")
+                        if conclusion:
+                            part += f"Conclusion: {conclusion}\n"
+                            console.print(f"    [cyan]conclusion:[/cyan] {conclusion}")
+                        if error:
+                            part += f"Error: {error}\n"
+                            console.print(f"    [red]error:[/red] {error}")
+                        if artifacts:
+                            part += f"Artifacts: {', '.join(artifacts)}\n"
+                    elif files:
+                        # Limit to 2 most relevant files to avoid prompt bloat
+                        file_items = list(files.items())
+                        # Prioritize results/summary/metrics files
+                        def _file_priority(item: tuple) -> int:
+                            name = item[0].lower()
+                            for i, kw in enumerate(["result", "summary", "metric", "eval"]):
+                                if kw in name:
+                                    return i
+                            return 99
+                        file_items.sort(key=_file_priority)
+                        for fpath, fcontent in file_items[:2]:
+                            fname = fpath.rsplit("/", 1)[-1] if "/" in fpath else fpath
+                            content_preview = fcontent[:3000] if len(fcontent) > 3000 else fcontent
+                            part += f"\n### {fname}\n```json\n{content_preview}\n```\n"
+                            console.print(f"    [dim]{fname}[/dim]: {fcontent[:200]}{'...' if len(fcontent) > 200 else ''}")
+                    elif log_tail:
+                        last_lines = "\n".join(log_tail.strip().splitlines()[-5:])
+                        part += f"\n### Log tail\n```\n{last_lines}\n```\n"
+                        console.print(f"    [dim]log:[/dim] {log_tail.strip().splitlines()[-1][:120] if log_tail.strip() else '(empty)'}")
+                    else:
+                        part += "No results or logs available yet.\n"
+                        console.print("    [dim](no results yet)[/dim]")
+                    results_summary_parts.append(part)
+                    if exp_failed:
+                        console.print(f"    [dim](failed without metrics — marking as invalid, skipping assessment)[/dim]")
+                    else:
+                        assessable_ids.append(exp_id)
+
+                console.print("")
+
+                if not assessable_ids:
+                    console.print("[yellow]No completed experiments with results to assess. Wait for running experiments to finish.[/yellow]")
+                    continue
+
+                # Cap to most recent 5 experiments to avoid prompt bloat
+                if len(results_summary_parts) > 5:
+                    results_summary_parts = results_summary_parts[:5]
+                    assessable_ids = assessable_ids[:5]
+                    console.print(f"[dim](showing 5 most recent experiments out of {len(collected_results)})[/dim]")
+
+                # --- Step 3: Ask agent to assess each experiment ---
+                h_rec = hypothesis_detail.record
+                assessment_prompt = (
+                    f"You are reviewing experiment results for hypothesis {h_rec.hypothesis_id}: \"{h_rec.title}\"\n\n"
+                    f"**Claim**: {h_rec.claim}\n"
+                    f"**Success criteria**: {h_rec.success_criteria or '(not specified)'}\n"
+                    f"**Failure criteria**: {h_rec.failure_criteria or '(not specified)'}\n\n"
+                    f"## Collected Results\n\n"
+                    + "\n".join(results_summary_parts)
+                    + "\n\n---\n\n"
+                    f"Assess ONLY the following experiments: {', '.join(assessable_ids)}\n\n"
+                    "For each experiment, provide an assessment: `supports`, `contradicts`, `inconclusive`, or `invalid`.\n"
+                    "Also provide a brief rationale for each.\n\n"
+                    "Format your response as:\n"
+                    "ASSESSMENT <experiment_id> <supports|contradicts|inconclusive|invalid>\n"
+                    "RATIONALE <experiment_id> <brief explanation>\n\n"
+                    "Then provide an overall summary of the evidence."
+                )
+
+                console.print("[bold blue]Asking agent to assess results...[/bold blue]")
+                _run_streaming_turn(
+                    service=service,
+                    session=current_session,
+                    query=assessment_prompt,
+                )
+
+                # --- Step 4: Parse agent's assessments from transcript ---
+                transcript = service.transcript(current_session.session_id)
+                last_agent_msg = ""
+                for msg in reversed(transcript):
+                    if msg.role != "user":
+                        last_agent_msg = msg.text
+                        break
+
+                assessment_map = {
+                    "supports": ExperimentAssessment.SUPPORTS,
+                    "contradicts": ExperimentAssessment.CONTRADICTS,
+                    "inconclusive": ExperimentAssessment.INCONCLUSIVE,
+                    "invalid": ExperimentAssessment.INVALID,
+                }
+                assessed_count = 0
+                # Try strict format first: ASSESSMENT <id> <label>
+                for match in re.finditer(r"ASSESSMENT\s+(\S+)\s+(supports|contradicts|inconclusive|invalid)", last_agent_msg, re.IGNORECASE):
+                    exp_id = match.group(1)
+                    assessment_val = match.group(2).lower()
+                    if assessment_val in assessment_map:
+                        try:
+                            experiment_service.update_assessment(
+                                project=current_session.project,
+                                experiment_id=exp_id,
+                                assessment=assessment_map[assessment_val],
+                            )
+                            assessed_count += 1
+                            console.print(f"  [green]Updated {exp_id} → {assessment_val}[/green]")
+                        except Exception as exc:
+                            console.print(f"  [yellow]Could not update {exp_id}: {exc}[/yellow]")
+                # Fallback: try looser patterns like "e001: supports" or "**e001** — supports"
+                if assessed_count == 0:
+                    for match in re.finditer(r"[*`]*(e[-\w]+)[*`]*\s*[:—\-]\s*(supports|contradicts|inconclusive|invalid)", last_agent_msg, re.IGNORECASE):
+                        exp_id = match.group(1)
+                        assessment_val = match.group(2).lower()
+                        if assessment_val in assessment_map:
+                            try:
+                                experiment_service.update_assessment(
+                                    project=current_session.project,
+                                    experiment_id=exp_id,
+                                    assessment=assessment_map[assessment_val],
+                                )
+                                assessed_count += 1
+                                console.print(f"  [green]Updated {exp_id} → {assessment_val}[/green]")
+                            except Exception as exc:
+                                console.print(f"  [yellow]Could not update {exp_id}: {exc}[/yellow]")
+
+                if assessed_count == 0:
+                    console.print("[yellow]Could not parse assessments from agent response. You can set them manually.[/yellow]")
+                    # Let user set assessments interactively
+                    for cr in collected_results:
+                        if cr["assessment"] == "pending":
+                            exp_id = cr["experiment_id"]
+                            choice = Prompt.ask(
+                                f"  Assessment for {exp_id}",
+                                choices=["supports", "contradicts", "inconclusive", "invalid", "skip"],
+                                default="skip",
+                            )
+                            if choice != "skip" and choice in assessment_map:
+                                try:
+                                    experiment_service.update_assessment(
+                                        project=current_session.project,
+                                        experiment_id=exp_id,
+                                        assessment=assessment_map[choice],
+                                    )
+                                    console.print(f"  [green]Updated {exp_id} → {choice}[/green]")
+                                except Exception as exc:
+                                    console.print(f"  [yellow]Could not update {exp_id}: {exc}[/yellow]")
+
+                # --- Step 5: Generate review suggestion (now with assessments) ---
                 try:
                     suggestion = experiment_service.suggest_hypothesis_review(
                         project=current_session.project,
                         hypothesis_id=hypothesis_id,
                     )
-                    hypothesis_detail = hypothesis_service.load_hypothesis(current_session.project, hypothesis_id)
                 except Exception as exc:
                     console.print(f"[bold red]Error:[/bold red] {exc}")
                     continue
@@ -2961,6 +4024,7 @@ def run_chat_shell(
                     active_doc = None
                     active_hypothesis = None
                     active_launch_exp = None
+                    active_dev = None
                 except Exception as exc:
                     console.print(f"[bold red]Error:[/bold red] {exc}")
                     continue
@@ -2976,6 +4040,7 @@ def run_chat_shell(
                     active_doc = None
                     active_hypothesis = None
                     active_launch_exp = None
+                    active_dev = None
                 except Exception as exc:
                     console.print(f"[bold red]Error:[/bold red] {exc}")
                     continue
@@ -2985,7 +4050,325 @@ def run_chat_shell(
                 _render_recent_messages(service.transcript(current_session.session_id), count=8)
                 continue
 
+            if command == "/dev":
+                sub = argument.strip()
+                sub_parts = sub.split(maxsplit=1)
+                dev_action = sub_parts[0] if sub_parts else ""
+                dev_argument = sub_parts[1].strip() if len(sub_parts) > 1 else ""
+
+                if dev_action == "status":
+                    if active_dev is None:
+                        console.print("[dim]No active dev loop.[/dim]")
+                    else:
+                        _render_dev_status(active_dev)
+                    continue
+
+                if dev_action == "stop":
+                    if active_dev is None:
+                        console.print("[dim]No active dev loop to stop.[/dim]")
+                    else:
+                        active_dev.status = "stopped"
+                        console.print("[bold yellow]Dev loop stopped.[/bold yellow]")
+                        if active_dev.dev_branch:
+                            console.print(Panel(
+                                (
+                                    f"[bold]Branch[/bold]: {active_dev.dev_branch}\n"
+                                    f"[bold]Original[/bold]: {active_dev.original_branch}\n\n"
+                                    f"[bold]Branch repo[/bold]: {active_dev.branch_repo_root or active_dev.scope_git_root}\n"
+                                    f"[bold]Worktree[/bold]: {active_dev.worktree_path or '(none)'}\n\n"
+                                    "Use [bold]/dev finish[/bold] to merge, keep, or discard safely."
+                                ),
+                                title="[bold]Dev Branch[/bold]",
+                                border_style="blue",
+                            ))
+                        active_dev = None
+                    continue
+
+                if dev_action == "finish":
+                    if active_dev is None:
+                        console.print("[dim]No active dev loop.[/dim]")
+                        continue
+                    if not active_dev.dev_branch:
+                        console.print("[dim]No dev branch to finish (--branch off was used).[/dim]")
+                        active_dev = None
+                        continue
+                    # Show options: merge, PR, discard, or keep
+                    console.print(Panel(
+                        (
+                            f"[bold]Branch[/bold]: {active_dev.dev_branch}\n"
+                            f"[bold]Original[/bold]: {active_dev.original_branch}\n"
+                            f"[bold]Worktree[/bold]: {active_dev.worktree_path or '(none)'}\n"
+                            f"[bold]Rounds[/bold]: {active_dev.current_round}\n\n"
+                            "[bold]What would you like to do?[/bold]\n"
+                            f"  [bold cyan]1[/bold cyan] — Merge into {active_dev.original_branch}\n"
+                            "  [bold cyan]2[/bold cyan] — Keep branch and remove worktree\n"
+                            "  [bold cyan]3[/bold cyan] — Discard branch and remove worktree\n"
+                        ),
+                        title="[bold green]Finish Dev Loop[/bold green]",
+                        border_style="green",
+                    ))
+                    try:
+                        choice = Prompt.ask("Choice", choices=["1", "2", "3"], default="1")
+                    except (KeyboardInterrupt, EOFError):
+                        continue
+                    finish_cwd = active_dev.branch_repo_root or active_dev.scope_git_root or str(RepoPaths.discover().root)
+                    finish_repo = Path(finish_cwd)
+                    finish_worktree = Path(active_dev.worktree_path) if active_dev.worktree_path else None
+                    # Validate the dev branch exists in this repo
+                    branch_check = _git_output(
+                        "git", "branch", "--list", active_dev.dev_branch, cwd=finish_repo
+                    )
+                    if not branch_check:
+                        console.print(
+                            f"[bold red]Branch '{active_dev.dev_branch}' not found in {finish_cwd}.[/bold red]\n"
+                            "This can happen if the dev session was created before a scope change.\n"
+                            "Refusing to guess which repo should be merged."
+                        )
+                        active_dev = None
+                        continue
+                    if choice == "1":
+                        # Merge into original branch
+                        subprocess.run(["git", "checkout", active_dev.original_branch], capture_output=True, cwd=finish_cwd)
+                        result = subprocess.run(
+                            ["git", "merge", active_dev.dev_branch, "--no-edit"],
+                            capture_output=True, text=True, cwd=finish_cwd,
+                        )
+                        if result.returncode == 0:
+                            console.print(f"[bold green]Merged {active_dev.dev_branch} into {active_dev.original_branch}.[/bold green]")
+                            if finish_worktree is not None:
+                                ok, msg = _remove_dev_worktree(finish_repo, finish_worktree)
+                                if ok:
+                                    console.print(f"[dim]Removed worktree {finish_worktree}.[/dim]")
+                                else:
+                                    console.print(f"[yellow]Worktree cleanup failed:[/yellow] {msg}")
+                        else:
+                            console.print(f"[bold red]Merge failed:[/bold red] {result.stderr.strip()}")
+                            console.print(f"You are now on [bold]{active_dev.original_branch}[/bold]. Resolve manually.")
+                    elif choice == "2":
+                        # Keep branch, remove worktree if present, switch back
+                        subprocess.run(["git", "checkout", active_dev.original_branch], capture_output=True, cwd=finish_cwd)
+                        if finish_worktree is not None:
+                            ok, msg = _remove_dev_worktree(finish_repo, finish_worktree)
+                            if not ok:
+                                console.print(f"[yellow]Worktree cleanup failed:[/yellow] {msg}")
+                        console.print(f"[bold]Branch {active_dev.dev_branch} is preserved.[/bold]")
+                    elif choice == "3":
+                        # Discard branch and worktree
+                        subprocess.run(["git", "checkout", active_dev.original_branch], capture_output=True, cwd=finish_cwd)
+                        if finish_worktree is not None:
+                            ok, msg = _remove_dev_worktree(finish_repo, finish_worktree)
+                            if not ok:
+                                console.print(f"[yellow]Worktree cleanup failed:[/yellow] {msg}")
+                        subprocess.run(["git", "branch", "-D", active_dev.dev_branch], capture_output=True, cwd=finish_cwd)
+                        console.print(f"[bold red]Discarded branch {active_dev.dev_branch}.[/bold red]")
+                    active_dev = None
+                    continue
+
+                if dev_action == "continue":
+                    if active_dev is None:
+                        console.print("[bold red]No active dev loop. Use /dev start <task> first.[/bold red]")
+                        continue
+                    if active_dev.status == "waiting_decision":
+                        console.print("[bold red]Decision pending. Reply with your choice first.[/bold red]")
+                        _render_dev_decision(active_dev)
+                        continue
+                    if active_dev.status in ("completed", "stopped"):
+                        console.print("[dim]Dev loop already finished. Use /dev start for a new one.[/dim]")
+                        active_dev = None
+                        continue
+                    active_dev = _run_dev_loop(
+                        service=service,
+                        session=current_session,
+                        dev_session=active_dev,
+                    )
+                    continue
+
+                if dev_action == "start":
+                    if not dev_argument:
+                        console.print("[bold red]Usage:[/bold red] /dev start <task description>")
+                        continue
+                    if active_dev is not None and active_dev.status == "active":
+                        console.print("[bold red]Dev loop already active. /dev stop first.[/bold red]")
+                        continue
+                    if not current_session.project:
+                        console.print("[bold red]Error:[/bold red] Session not attached to a project.")
+                        continue
+
+                    # Parse optional flags from task
+                    task_text = dev_argument
+                    max_rounds = 6
+                    test_mode = "auto"
+                    # Extract --max-rounds N
+                    mr_match = re.search(r"--max-rounds\s+(\d+)", task_text)
+                    if mr_match:
+                        max_rounds = min(int(mr_match.group(1)), 15)
+                        task_text = task_text[:mr_match.start()] + task_text[mr_match.end():]
+                    # Extract --test off|auto|on
+                    tm_match = re.search(r"--test\s+(off|auto|on)", task_text)
+                    if tm_match:
+                        test_mode = tm_match.group(1)
+                        task_text = task_text[:tm_match.start()] + task_text[tm_match.end():]
+                    # Extract --branch off|auto (default: auto)
+                    branch_mode = "auto"
+                    bm_match = re.search(r"--branch\s+(off|auto)", task_text)
+                    if bm_match:
+                        branch_mode = bm_match.group(1)
+                        task_text = task_text[:bm_match.start()] + task_text[bm_match.end():]
+                    task_text = task_text.strip()
+                    if not task_text:
+                        console.print("[bold red]Usage:[/bold red] /dev start <task description>")
+                        continue
+
+                    # Assign writer/reviewer from participants
+                    participants = current_session.participants
+                    if len(participants) >= 2:
+                        writer_name = participants[0].name
+                        reviewer_name = participants[1].name
+                    else:
+                        writer_name = participants[0].name
+                        reviewer_name = participants[0].name
+
+                    scope_label, scope_pathspecs, scope_git_root = _resolve_dev_scope(current_session)
+                    initial_dirty_files = _list_scope_dirty_files(scope_pathspecs, scope_git_root)
+
+                    # In isolated worktree mode, dirty files in the original checkout
+                    # are not copied into the worktree. In branch-off mode, refuse
+                    # dirty starts unless the user explicitly opts in.
+                    allow_dirty = "--allow-dirty" in dev_argument
+                    if "--allow-dirty" in dev_argument:
+                        task_text = re.sub(r"--allow-dirty\s*", "", task_text).strip()
+                    if branch_mode == "off" and initial_dirty_files and not allow_dirty:
+                        console.print(
+                            "[bold red]Error:[/bold red] Working tree has uncommitted changes. "
+                            "Commit or stash them first, or use [bold]--allow-dirty[/bold] to proceed anyway."
+                        )
+                        preview = "\n".join(f"- {item}" for item in initial_dirty_files[:10])
+                        console.print(Panel(preview, title="Dirty Files", border_style="red"))
+                        continue
+                    if branch_mode == "auto" and initial_dirty_files:
+                        preview = "\n".join(f"- {item}" for item in initial_dirty_files[:10])
+                        console.print(Panel(
+                            preview,
+                            title="[yellow]Original Checkout Has Dirty Files[/yellow]",
+                            border_style="yellow",
+                        ))
+                        console.print(
+                            "[yellow]Note:[/yellow] /dev will use a clean isolated worktree from HEAD; "
+                            "the dirty files above will not be included unless committed first."
+                        )
+
+                    # Create isolated dev worktree (unless --branch off)
+                    dev_branch = ""
+                    original_branch = ""
+                    branch_repo_root = scope_git_root
+                    worktree_path = Path("")
+                    active_scope_git_root = scope_git_root
+                    active_scope_pathspecs = scope_pathspecs
+                    if branch_mode == "auto":
+                        try:
+                            dev_branch, original_branch, worktree_path = _create_dev_worktree(
+                                task=task_text,
+                                git_root=scope_git_root,
+                                project=current_session.project,
+                            )
+                        except Exception as exc:
+                            console.print(f"[bold red]Failed to create dev worktree:[/bold red] {exc}")
+                            continue
+                        active_scope_git_root = worktree_path
+                        active_scope_pathspecs = ["."]
+                        initial_dirty_files = []
+                    else:
+                        # Stay on current branch
+                        try:
+                            original_branch = _git_output(
+                                "git", "rev-parse", "--abbrev-ref", "HEAD",
+                                cwd=scope_git_root,
+                            )
+                        except Exception:
+                            pass
+
+                    active_dev = DevLoopSession(
+                        task=task_text,
+                        writer_name=writer_name,
+                        reviewer_name=reviewer_name,
+                        max_rounds=max_rounds,
+                        test_mode=test_mode,
+                        scope_label=scope_label,
+                        scope_pathspecs=active_scope_pathspecs,
+                        scope_git_root=str(active_scope_git_root),
+                        branch_repo_root=str(branch_repo_root),
+                        worktree_path=str(worktree_path) if str(worktree_path) != "." else "",
+                        initial_dirty_files=initial_dirty_files,
+                        dev_branch=dev_branch,
+                        original_branch=original_branch,
+                    )
+
+                    console.print(Panel(
+                        (
+                            f"[bold]Task[/bold]: {task_text}\n"
+                            f"[bold]Writer[/bold]: {writer_name}\n"
+                            f"[bold]Reviewer[/bold]: {reviewer_name}\n"
+                            f"[bold]Max rounds[/bold]: {max_rounds}\n"
+                            f"[bold]Test mode[/bold]: {test_mode}\n"
+                            f"[bold]Scope[/bold]: {scope_label}\n"
+                            f"[bold]Branch repo[/bold]: {branch_repo_root}\n"
+                            f"[bold]Editable workspace[/bold]: {active_scope_git_root}\n"
+                            f"[bold]Branch[/bold]: {dev_branch + ' (from ' + original_branch + ')' if dev_branch else original_branch + ' (no worktree isolation)'}"
+                        ),
+                        title="[bold green]Dev Loop Starting[/bold green]",
+                        border_style="green",
+                    ))
+
+                    active_dev = _run_dev_loop(
+                        service=service,
+                        session=current_session,
+                        dev_session=active_dev,
+                    )
+                    # Show branch summary after loop ends
+                    if active_dev.dev_branch and active_dev.status in ("completed", "stopped"):
+                        console.print(Panel(
+                            (
+                                f"[bold]Branch[/bold]: {active_dev.dev_branch}\n"
+                                f"[bold]Original[/bold]: {active_dev.original_branch}\n"
+                                f"[bold]Branch repo[/bold]: {active_dev.branch_repo_root or active_dev.scope_git_root}\n"
+                                f"[bold]Worktree[/bold]: {active_dev.worktree_path or '(none)'}\n"
+                                f"[bold]Rounds[/bold]: {active_dev.current_round}\n\n"
+                                "Use [bold]/dev finish[/bold] to merge, keep, or discard the branch."
+                            ),
+                            title="[bold]Dev Loop Finished[/bold]",
+                            border_style="blue",
+                        ))
+                    continue
+
+                console.print(
+                    "[bold red]Usage:[/bold red] /dev start <task> | /dev status | /dev continue | /dev finish | /dev stop"
+                )
+                continue
+
             console.print(f"[bold red]Unknown command:[/bold red] {command}")
+            continue
+
+        # ── Dev loop decision handling ──
+        if active_dev is not None and active_dev.status == "waiting_decision":
+            # User is answering a decision question
+            decision = active_dev.pending_decision
+            if decision:
+                # Check if it's a letter choice
+                choice = raw.strip().upper()
+                if len(choice) == 1 and "A" <= choice <= chr(ord("A") + len(decision.options) - 1):
+                    idx = ord(choice) - ord("A")
+                    active_dev.user_decision = f"Option {choice}: {decision.options[idx]}"
+                else:
+                    active_dev.user_decision = raw.strip()
+
+                active_dev.pending_decision = None
+                active_dev.status = "active"
+                console.print(f"[bold green]Decision recorded:[/bold green] {active_dev.user_decision}")
+                active_dev = _run_dev_loop(
+                    service=service,
+                    session=current_session,
+                    dev_session=active_dev,
+                )
             continue
 
         # ── Launch-exp planning mode ──

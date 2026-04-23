@@ -166,29 +166,70 @@ class DailySummaryService:
         return markdown_path, yaml_path
 
     def _build_prompt(self, inputs: DailySummaryInputs) -> str:
-        snapshot = json.dumps(inputs.model_dump(mode="json"), indent=2, sort_keys=True)
+        raw_snapshot = inputs.model_dump(mode="json")
+        research_keywords = (
+            "experiment",
+            "hypothesis",
+            "result",
+            "evidence",
+            "review",
+            "train",
+            "eval",
+            "evaluation",
+            "ablation",
+            "probe",
+            "metric",
+            "auroc",
+            "accuracy",
+            "bug",
+            "fix",
+            "nan",
+            "invalid",
+            "failed",
+            "failure",
+        )
+
+        def _filter_commits(items: list[dict[str, object]]) -> dict[str, object]:
+            relevant: list[dict[str, object]] = []
+            for item in items:
+                message = str(item.get("message", "")).lower()
+                if any(keyword in message for keyword in research_keywords):
+                    relevant.append(item)
+            return {
+                "total_count": len(items),
+                "research_relevant": relevant[:5],
+            }
+
+        raw_snapshot["research_os_commits"] = _filter_commits(raw_snapshot.get("research_os_commits", []))
+        raw_snapshot["project_code_commits"] = _filter_commits(raw_snapshot.get("project_code_commits", []))
+        snapshot = json.dumps(raw_snapshot, indent=2, sort_keys=True)
         return f"""You are writing a LABIT daily summary for one research project.
 
 Return JSON only. Do not add markdown fences or commentary.
 
+This is a researcher-facing daily summary, not an engineering changelog.
 Write from the provided day-specific structured inputs. Be faithful to what actually happened on that date.
 Do not invent experiments, commits, hypotheses, or results that are not present in the inputs.
 
 The final markdown will contain these sections:
-- What Moved Today
-- Evidence Produced
-- Hypothesis State
-- Papers, Reports, And Captures
-- Code Changes
-- Open Loops
-- Tomorrow Plan
-- Free Write
+- Bottom Line
+- Evidence Gained
+- Belief Updates
+- Blockers
+- Next Action
+- Reflection
+- Infra Notes
 
 Requirements:
-- Each list field should contain 0 to 5 concise bullet items.
-- `free_write` should be 1 to 3 short paragraphs and may connect the dots across sections.
+- `bottom_line` should be 1 to 2 sentences and should say whether new research evidence was produced today.
+- Each list field should contain 0 to 4 concise bullet items.
+- `reflection` should be 0 to 2 short paragraphs.
 - Prefer concrete artifact names and ids when available.
-- Focus on what matters for tomorrow's work, not exhaustive bookkeeping.
+- Focus on what changes tomorrow's research decisions, not exhaustive bookkeeping.
+- If no formal experiment results or strong evidence were produced today, the summary MUST be short.
+- Do not pad the summary with engineering accomplishments to make the day look productive.
+- Only include infra or code changes if they changed result validity, unblocked a key experiment, or create a major risk for tomorrow.
+- If there was no meaningful belief update, say so plainly.
 
 Inputs:
 {snapshot}
@@ -196,14 +237,13 @@ Inputs:
 
     def _draft_schema(self) -> dict:
         properties = {
-            "what_moved_today": {"type": "array", "items": {"type": "string"}},
-            "evidence_produced": {"type": "array", "items": {"type": "string"}},
-            "hypothesis_state": {"type": "array", "items": {"type": "string"}},
-            "papers_reports_and_captures": {"type": "array", "items": {"type": "string"}},
-            "code_changes": {"type": "array", "items": {"type": "string"}},
-            "open_loops": {"type": "array", "items": {"type": "string"}},
-            "tomorrow_plan": {"type": "array", "items": {"type": "string"}},
-            "free_write": {"type": "string"},
+            "bottom_line": {"type": "string"},
+            "evidence_gained": {"type": "array", "items": {"type": "string"}},
+            "belief_updates": {"type": "array", "items": {"type": "string"}},
+            "blockers": {"type": "array", "items": {"type": "string"}},
+            "next_action": {"type": "array", "items": {"type": "string"}},
+            "reflection": {"type": "string"},
+            "infra_notes": {"type": "array", "items": {"type": "string"}},
         }
         return {
             "type": "object",
@@ -214,18 +254,17 @@ Inputs:
 
     def _render_markdown(self, *, inputs: DailySummaryInputs, draft: DailySummaryDraft) -> str:
         sections = [
-            ("What Moved Today", draft.what_moved_today),
-            ("Evidence Produced", draft.evidence_produced),
-            ("Hypothesis State", draft.hypothesis_state),
-            ("Papers, Reports, And Captures", draft.papers_reports_and_captures),
-            ("Code Changes", draft.code_changes),
-            ("Open Loops", draft.open_loops),
-            ("Tomorrow Plan", draft.tomorrow_plan),
+            ("Evidence Gained", draft.evidence_gained),
+            ("Belief Updates", draft.belief_updates),
+            ("Blockers", draft.blockers),
+            ("Next Action", draft.next_action),
         ]
         lines = [
             f"# Daily Summary — {inputs.date}",
             f"**Project**: {inputs.project}",
             f"**Timezone**: {inputs.timezone}",
+            "",
+            "> " + (draft.bottom_line or "No strong research signal was recorded today."),
             "",
         ]
         for title, items in sections:
@@ -236,35 +275,46 @@ Inputs:
             else:
                 lines.append("- None.")
             lines.append("")
-        lines.extend(["## Free Write", "", draft.free_write or "No major narrative summary was generated.", ""])
+        lines.extend(["## Reflection", "", draft.reflection or "No additional reflection was recorded.", ""])
+        if draft.infra_notes:
+            lines.extend(["---", "", "*Infra Notes*", ""])
+            lines.extend(f"- {item}" for item in draft.infra_notes)
+            lines.append("")
         return "\n".join(lines).rstrip()
 
     def _fallback_draft(self, inputs: DailySummaryInputs) -> DailySummaryDraft:
-        what_moved = []
-        what_moved.extend(item.title for item in inputs.hypotheses_created[:2])
-        what_moved.extend(item.title for item in inputs.experiments_created[:2])
         evidence = [item.title or item.summary for item in inputs.tasks_finished[:4]]
-        hypothesis_state = [item.title or item.summary for item in [*inputs.hypotheses_created, *inputs.hypotheses_closed][:5]]
-        papers_reports = [
-            item.title
-            for item in [*inputs.papers_ingested, *inputs.papers_pulled, *inputs.reports, *inputs.ideas][:5]
+        belief_updates = [
+            item.title or item.summary
+            for item in [*inputs.hypotheses_created, *inputs.hypotheses_updated, *inputs.hypotheses_closed][:4]
         ]
-        code_changes = [f"{item.repo_label}: {item.sha[:7]} {item.message}" for item in [*inputs.research_os_commits, *inputs.project_code_commits][:5]]
-        open_loops = [item.title or item.summary for item in [*inputs.todos, *inputs.discussion_syntheses][:5]]
-        tomorrow_plan = open_loops[:3] or ["Continue the highest-priority open loop from today."]
-        free_write = (
-            "Today’s activity was summarized from structured LABIT artifacts. "
-            "Use the sections above as the source of truth for what changed, what evidence was produced, and what still needs attention tomorrow."
+        blockers = [item.title or item.summary for item in [*inputs.todos, *inputs.discussion_syntheses][:4]]
+        next_action = blockers[:3] or ["Advance the highest-leverage open research loop from today."]
+        infra_notes = [
+            f"{item.repo_label}: {item.sha[:7]} {item.message}"
+            for item in [*inputs.research_os_commits, *inputs.project_code_commits][:4]
+            if any(
+                keyword in item.message.lower()
+                for keyword in ("experiment", "result", "eval", "train", "ablation", "fix", "bug", "nan", "invalid", "failed")
+            )
+        ]
+        bottom_line = "No strong research evidence was produced today."
+        if evidence:
+            bottom_line = "New evidence was produced today and should inform the next research step."
+        elif inputs.tasks_submitted or inputs.experiments_created:
+            bottom_line = "Today mostly moved execution infrastructure forward rather than producing new evidence."
+        reflection = (
+            "This daily summary was generated from structured LABIT artifacts. "
+            "Use it to decide the next research action, not as an engineering activity log."
         )
         return DailySummaryDraft(
-            what_moved_today=what_moved[:5],
-            evidence_produced=evidence[:5],
-            hypothesis_state=hypothesis_state[:5],
-            papers_reports_and_captures=papers_reports[:5],
-            code_changes=code_changes[:5],
-            open_loops=open_loops[:5],
-            tomorrow_plan=tomorrow_plan[:5],
-            free_write=free_write,
+            bottom_line=bottom_line,
+            evidence_gained=evidence[:4],
+            belief_updates=belief_updates[:4],
+            blockers=blockers[:4],
+            next_action=next_action[:4],
+            reflection=reflection,
+            infra_notes=infra_notes[:4],
         )
 
     def _collect_events(self, *, project: str, target_date: date) -> list[DailyEventItem]:

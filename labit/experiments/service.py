@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import subprocess
 from collections.abc import Iterable
 from pathlib import Path
@@ -241,6 +242,98 @@ class ExperimentService:
                 continue
             details.append(self.load_experiment(resolved, summary.experiment_id))
         return details
+
+    def latest_launch_artifact(self, project: str, experiment_id: str) -> LaunchArtifact | None:
+        """Return the most recent launch artifact for an experiment, or None."""
+        resolved = self._require_project(project)
+        launches_dir = self.tasks_dir(resolved, experiment_id) / "launches"
+        if not launches_dir.exists():
+            return None
+        launch_ids = sorted(
+            (p.name for p in launches_dir.iterdir() if re.fullmatch(r"l\d+", p.name)),
+            reverse=True,
+        )
+        for lid in launch_ids:
+            try:
+                return self.load_launch_artifact(resolved, experiment_id, lid)
+            except Exception:
+                continue
+        return None
+
+    def collect_experiment_results(
+        self,
+        *,
+        project: str,
+        hypothesis_id: str,
+    ) -> list[dict]:
+        """Collect remote results for all experiments under a hypothesis.
+
+        Returns a list of dicts: {experiment_id, title, status, assessment, collected}
+        where collected is the raw dict from executor.collect().
+        """
+        from labit.experiments.executors.ssh import SSHExecutor
+
+        experiments = self.list_experiments_for_hypothesis(project, hypothesis_id)
+        results: list[dict] = []
+        for exp_detail in experiments:
+            entry: dict = {
+                "experiment_id": exp_detail.record.experiment_id,
+                "title": exp_detail.record.title,
+                "status": exp_detail.record.status.value,
+                "assessment": exp_detail.record.assessment.value,
+                "collected": None,
+            }
+            artifact = self.latest_launch_artifact(project, exp_detail.record.experiment_id)
+            if artifact:
+                if artifact.submission:
+                    try:
+                        executor = SSHExecutor()
+                        collected = executor.collect(artifact)
+                        entry["collected"] = collected
+                    except Exception:
+                        pass
+                elif artifact.launch_dir:
+                    entry["collected"] = self._read_local_results(Path(artifact.launch_dir))
+            else:
+                # No artifact found — scan launch dirs on disk as final fallback
+                launches_dir = self.tasks_dir(
+                    self._require_project(project), exp_detail.record.experiment_id
+                ) / "launches"
+                if launches_dir.exists():
+                    launch_ids = sorted(
+                        (p.name for p in launches_dir.iterdir() if re.fullmatch(r"l\d+", p.name)),
+                        reverse=True,
+                    )
+                    for lid in launch_ids:
+                        local = self._read_local_results(launches_dir / lid)
+                        if local:
+                            entry["collected"] = local
+                            break
+            results.append(entry)
+        return results
+
+    def update_assessment(
+        self, *, project: str, experiment_id: str, assessment: ExperimentAssessment
+    ) -> ExperimentRecord:
+        """Update the assessment field on an experiment record."""
+        detail = self.load_experiment(project, experiment_id)
+        updated = detail.record.model_copy(update={"assessment": assessment})
+        return self.save_experiment_record(project=project, record=updated)
+
+    @staticmethod
+    def _read_local_results(launch_path: Path) -> dict | None:
+        """Read result files from a local launch directory."""
+        try:
+            local_files: dict[str, str] = {}
+            for candidate in ["experiment_results.json", "summary.json", "results.json"]:
+                fpath = launch_path / candidate
+                if fpath.is_file():
+                    local_files[candidate] = fpath.read_text()[:10000]
+            if local_files:
+                return {"status": "stopped", "files": local_files}
+        except Exception:
+            pass
+        return None
 
     def suggest_hypothesis_review(self, *, project: str, hypothesis_id: str) -> HypothesisReviewSuggestion:
         resolved = self._require_project(project)
@@ -878,7 +971,11 @@ class ExperimentService:
         self._refresh_index(resolved)
         return self.load_experiment(resolved, experiment_id)
 
-    def submit_experiment(self, session: LaunchExpSession) -> SubmissionReceipt:
+    def submit_experiment(
+        self,
+        session: LaunchExpSession,
+        env_overrides: dict[str, str] | None = None,
+    ) -> SubmissionReceipt:
         """Submit the experiment-level run.sh via SSH."""
         from labit.experiments.executors.ssh import SSHExecutor
 
@@ -907,11 +1004,12 @@ class ExperimentService:
         # Wrap the experiment's run.sh with the compute profile's setup
         # script so that venv, git pull, and cd workdir happen first.
         raw_command = run_sh_path.read_text(encoding="utf-8")
+        launch_env = {str(k): str(v) for k, v in (env_overrides or {}).items() if str(v).strip()}
         frozen_spec = FrozenLaunchSpec(
             command=raw_command,
             workdir=execution.workdir,
             output_dir=f"outputs/experiments/{experiment_id}",
-            env={},
+            env=launch_env,
         )
         wrapped_run_sh = self._render_run_sh(frozen_spec, execution)
         wrapped_path = launch_dir / "run.sh"
@@ -1255,8 +1353,7 @@ class ExperimentService:
         lines = ["#!/usr/bin/env bash", "set -euo pipefail"]
         lines.extend(self._render_runtime_preamble(execution))
         for key, value in spec.env.items():
-            escaped = value.replace('"', '\\"')
-            lines.append(f'export {key}="{escaped}"')
+            lines.append(f"export {key}={shlex.quote(value)}")
         lines.append(spec.command)
         return "\n".join(lines).rstrip() + "\n"
 
