@@ -36,6 +36,16 @@ class BaseCollection(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def update(
+        self,
+        *,
+        ids: List[str],
+        metadatas: Optional[List[Dict[str, Any]]] = None,
+        documents: Optional[List[str]] = None,
+    ) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
     def delete(self, **kwargs: Any) -> None:
         raise NotImplementedError
 

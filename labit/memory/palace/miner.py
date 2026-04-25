@@ -663,19 +663,121 @@ def status(palace_path: str):
         return
 
     # Count by wing and room
-    r = col.get(limit=10000, include=["metadatas"])
+    r = col.get(limit=50000, include=["metadatas"])
     metas = r["metadatas"]
 
     wing_rooms = defaultdict(lambda: defaultdict(int))
+    has_importance = 0
+    has_memory_type = 0
+    importance_dist = defaultdict(int)
+    memory_type_dist = defaultdict(int)
+    earliest_filed = None
+    latest_filed = None
+
     for m in metas:
         wing_rooms[m.get("wing", "?")][m.get("room", "?")] += 1
+        if m.get("importance") is not None:
+            has_importance += 1
+            importance_dist[m["importance"]] += 1
+        if m.get("memory_type"):
+            has_memory_type += 1
+            memory_type_dist[m["memory_type"]] += 1
+        filed_at = m.get("filed_at")
+        if filed_at:
+            if earliest_filed is None or filed_at < earliest_filed:
+                earliest_filed = filed_at
+            if latest_filed is None or filed_at > latest_filed:
+                latest_filed = filed_at
 
+    total = len(metas)
     print(f"\n{'=' * 55}")
-    print(f"  MemPalace Status — {len(metas)} drawers")
+    print(f"  MemPalace Status — {total} drawers")
     print(f"{'=' * 55}\n")
+
     for wing, rooms in sorted(wing_rooms.items()):
-        print(f"  WING: {wing}")
+        wing_total = sum(rooms.values())
+        print(f"  WING: {wing} ({wing_total} drawers)")
         for room, count in sorted(rooms.items(), key=lambda x: x[1], reverse=True):
             print(f"    ROOM: {room:20} {count:5} drawers")
         print()
-    print(f"{'=' * 55}\n")
+
+    # Importance coverage
+    pct_imp = (has_importance / total * 100) if total else 0
+    pct_mt = (has_memory_type / total * 100) if total else 0
+    print(f"  Importance coverage: {has_importance}/{total} ({pct_imp:.0f}%)")
+    if importance_dist:
+        for score in sorted(importance_dist.keys(), reverse=True):
+            print(f"    score {score:4.1f}: {importance_dist[score]:5} drawers")
+    print(f"  Memory type coverage: {has_memory_type}/{total} ({pct_mt:.0f}%)")
+    if memory_type_dist:
+        for mtype, count in sorted(memory_type_dist.items(), key=lambda x: x[1], reverse=True):
+            print(f"    {mtype:20} {count:5} drawers")
+    print()
+
+    if earliest_filed:
+        print(f"  First mined: {earliest_filed[:19]}")
+    if latest_filed:
+        print(f"  Last mined:  {latest_filed[:19]}")
+
+    if pct_imp < 50:
+        print(f"\n  ⚠ Low importance coverage ({pct_imp:.0f}%).")
+        print("  Run: labit palace backfill --project <name>")
+
+    print(f"\n{'=' * 55}\n")
+
+
+def backfill(palace_path: str, wing: str | None = None, batch_size: int = 500):
+    """Backfill importance and memory_type for existing drawers that lack them."""
+    try:
+        col = get_collection(palace_path, create=False)
+    except Exception:
+        print(f"  No palace found at {palace_path}")
+        return 0
+
+    where_filter: dict | None = None
+    if wing:
+        where_filter = {"wing": wing}
+
+    r = col.get(
+        where=where_filter,
+        limit=50000,
+        include=["metadatas", "documents"],
+    )
+    ids = r["ids"]
+    metas = r["metadatas"]
+    docs = r["documents"]
+
+    # Find drawers missing importance
+    needs_update = []
+    for i, meta in enumerate(metas):
+        if meta.get("importance") is None:
+            needs_update.append(i)
+
+    if not needs_update:
+        print(f"  All {len(ids)} drawers already have importance. Nothing to do.")
+        return 0
+
+    print(f"  Backfilling {len(needs_update)}/{len(ids)} drawers...")
+
+    updated = 0
+    for batch_start in range(0, len(needs_update), batch_size):
+        batch_indices = needs_update[batch_start : batch_start + batch_size]
+        batch_ids = []
+        batch_metas = []
+
+        for idx in batch_indices:
+            content = docs[idx] if docs[idx] else ""
+            importance, memory_type = _score_importance(content)
+            new_meta = dict(metas[idx])
+            new_meta["importance"] = importance
+            if memory_type:
+                new_meta["memory_type"] = memory_type
+            batch_ids.append(ids[idx])
+            batch_metas.append(new_meta)
+
+        col.update(ids=batch_ids, metadatas=batch_metas)
+        updated += len(batch_ids)
+        print(f"    Updated {updated}/{len(needs_update)} drawers...")
+
+    print(f"  Done. Backfilled {updated} drawers.")
+    return updated

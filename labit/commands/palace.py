@@ -124,6 +124,28 @@ def status():
     mp_status(palace_path)
 
 
+@palace_app.command("backfill")
+def backfill_cmd(
+    project: str = typer.Option("", help="Filter by project (wing)"),
+):
+    """Backfill importance/memory_type for existing drawers that lack them."""
+    paths = _paths()
+    palace_path = str(paths.palace_dir)
+
+    try:
+        from labit.memory.palace.miner import backfill as mp_backfill
+    except ImportError:
+        console.print("[red]MemPalace dependencies not available.[/red]")
+        raise typer.Exit(1)
+
+    wing = project or None
+    updated = mp_backfill(palace_path, wing=wing)
+    if updated:
+        console.print(f"[green]Backfilled {updated} drawers.[/green]")
+    else:
+        console.print("[dim]All drawers already have importance metadata.[/dim]")
+
+
 @palace_app.command("search")
 def search_cmd(
     query: str = typer.Argument(..., help="Search query"),

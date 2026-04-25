@@ -61,6 +61,9 @@ class ChromaCollection(BaseCollection):
     def get(self, **kwargs):
         return self._collection.get(**kwargs)
 
+    def update(self, *, ids, metadatas=None, documents=None):
+        self._collection.update(ids=ids, metadatas=metadatas, documents=documents)
+
     def delete(self, **kwargs):
         self._collection.delete(**kwargs)
 
