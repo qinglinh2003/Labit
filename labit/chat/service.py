@@ -4,6 +4,7 @@ import shlex
 import threading
 from dataclasses import dataclass
 from collections.abc import Callable
+from pathlib import Path
 from queue import Queue
 
 from labit.agents.adapters.base import StreamCancelled
@@ -31,6 +32,7 @@ from labit.context.condenser import ResearchRollingCondenser, SessionCondenser
 from labit.context.events import SessionEvent, SessionEventKind, WorkingMemorySnapshot
 from labit.context.maps import ContextMapBuilder
 from labit.context.store import SessionContextStore
+from labit.models import ComputeProfile
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
 
@@ -771,6 +773,10 @@ Reply as `{participant.name}` only. Use plain text or markdown.
             return ""
         if not spec.compute_profiles:
             return ""
+        try:
+            local_code_dir = self.project_service.project_code_dir(project)
+        except Exception:
+            local_code_dir = None
 
         lines = [
             "Remote Compute:",
@@ -784,6 +790,9 @@ Reply as `{participant.name}` only. Use plain text or markdown.
             "- Do not create files in `$HOME`, `/tmp`, or an unspecified remote directory unless the user explicitly asks for that location.",
             "- Before making remote changes, state the intended command or action unless the user already gave a direct instruction.",
             "- Do not run destructive commands, package installs, process killing, or long-running jobs remotely unless explicitly requested.",
+            "- When the user asks to update remote code, use rsync from the local project code directory to the profile workdir; do not create git commits just to synchronize files.",
+            "- Rsync may include files ignored by git; call out secrets or large local artifacts before syncing when they are likely to matter.",
+            "- Do not use rsync `--delete` unless the user explicitly asks for destructive mirroring.",
             "",
             "Profiles:",
         ]
@@ -793,6 +802,8 @@ Reply as `{participant.name}` only. Use plain text or markdown.
             if profile.workdir:
                 lines.append(f"    workdir: {profile.workdir}")
                 lines.append(f"    command pattern: {profile.ssh_display()} \"cd {self._remote_cd_path(profile.workdir)} && <command>\"")
+                if local_code_dir is not None:
+                    lines.append(f"    sync pattern: {self._rsync_display(profile, local_code_dir)}")
             else:
                 lines.append("    workdir: (not configured; ask the user before creating or editing remote files)")
             if profile.notes:
@@ -806,6 +817,34 @@ Reply as `{participant.name}` only. Use plain text or markdown.
         if path.startswith("~/"):
             return f"$HOME/{shlex.quote(path[2:])}"
         return shlex.quote(path)
+
+    def _rsync_display(self, profile: ComputeProfile, local_code_dir: Path) -> str:
+        ssh_parts = ["ssh"]
+        if profile.connection.identity_file:
+            ssh_parts.extend(["-i", str(Path(profile.connection.identity_file).expanduser())])
+        if profile.connection.port != 22:
+            ssh_parts.extend(["-p", str(profile.connection.port)])
+
+        remote_path = profile.workdir.rstrip("/") + "/"
+        command = [
+            "rsync",
+            "-az",
+            "--exclude",
+            ".git/",
+            "--exclude",
+            "__pycache__/",
+            "--exclude",
+            ".venv/",
+            "--exclude",
+            "venv/",
+            "--exclude",
+            ".pytest_cache/",
+            "-e",
+            shlex.join(ssh_parts),
+            f"{local_code_dir}/",
+            f"{profile.connection.target}:{remote_path}",
+        ]
+        return shlex.join(command)
 
     def _conversation_extra_args(self, provider: ProviderKind, *, reasoning_effort: str) -> list[str]:
         if provider == ProviderKind.CLAUDE:
