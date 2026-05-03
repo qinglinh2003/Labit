@@ -596,7 +596,7 @@ def run_chat_shell(
                     muted_next_turn.add(agent_name)
                     console.print(f"[bold #0080ff]{agent_name} muted for next turn.[/bold #0080ff] (auto-unmutes after one turn)")
                 continue
-            if command in {"/long-term-memory", "/ltm"}:
+            if command == "/long-term-memory":
                 query = argument.strip()
                 if not query:
                     console.print("[bold red]Usage:[/bold red] /long-term-memory <question>")

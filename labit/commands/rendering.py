@@ -22,7 +22,6 @@ CHAT_SHELL_COMMANDS = (
     "/show",
     "/mode",
     "/long-term-memory",
-    "/ltm",
     "/idea",
     "/todo",
     "/doc",
@@ -179,7 +178,7 @@ def render_console_header(
         + " · ".join(
             [
                 command_chip("/help"),
-                command_chip("/ltm"),
+                command_chip("/long-term-memory"),
                 command_chip("/exit"),
             ]
         )
