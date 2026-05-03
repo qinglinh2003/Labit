@@ -128,6 +128,7 @@ class ProjectService:
             name=resolved,
             description=spec.description,
             keyword_count=len(spec.keywords),
+            compute_count=len(spec.compute_profiles),
             is_active=(active == resolved),
             config_path=str(self.paths.project_configs_dir / f"{resolved}.yaml"),
         )

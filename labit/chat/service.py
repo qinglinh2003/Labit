@@ -752,6 +752,20 @@ Reply as `{participant.name}` only. Use plain text or markdown.
                     lines.append(f"- Project code directory: {code_dir.relative_to(self.paths.root)}")
             except Exception:
                 pass
+            try:
+                spec = self.project_service.load_project(project)
+                if spec.compute_profiles:
+                    lines.append("- Project SSH compute profiles:")
+                    for profile in spec.compute_profiles:
+                        detail = f"  - {profile.name}: {profile.ssh_display()}"
+                        if profile.workdir:
+                            detail += f" ; workdir={profile.workdir}"
+                        if profile.notes:
+                            detail += f" ; notes={profile.notes}"
+                        lines.append(detail)
+                    lines.append("- Use these SSH profiles only when the user asks to inspect or work on the remote machine.")
+            except Exception:
+                pass
         return "\n".join(lines)
 
     def _conversation_extra_args(self, provider: ProviderKind, *, reasoning_effort: str) -> list[str]:

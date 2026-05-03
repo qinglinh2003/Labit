@@ -30,6 +30,16 @@ labit project switch <name>
 labit project show
 ```
 
+Attach optional SSH compute profiles to a project:
+
+```bash
+labit project compute add gpu --host example.com --user alice --workdir /work/project
+labit project compute list
+labit project compute test gpu
+```
+
+Compute profiles only describe how to reach a remote machine. They are exposed to chat agents as project context, but LABIT does not run an experiment executor or sync stack.
+
 Start a conversation:
 
 ```bash

@@ -8,11 +8,13 @@ from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
+from labit.commands.compute import compute_app
 from labit.models import ProjectSpec
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
 
 project_app = typer.Typer(help="Manage local projects.")
+project_app.add_typer(compute_app, name="compute")
 console = Console()
 T = TypeVar("T")
 
@@ -211,6 +213,7 @@ def current(json_output: bool = typer.Option(False, "--json", help="Emit JSON ou
     table.add_row("Name", payload["active_project"])
     table.add_row("Description", payload["description"])
     table.add_row("Keywords", str(payload["keyword_count"]))
+    table.add_row("Compute profiles", str(payload["compute_count"]))
     table.add_row("Config", payload["config_path"])
     console.print(table)
 
@@ -261,6 +264,10 @@ def show_project(
     table.add_row("Repo", spec.repo or "(blank)")
     table.add_row("Keywords", ", ".join(spec.keywords) or "(blank)")
     table.add_row("Relevance", spec.relevance_criteria or "(blank)")
+    if spec.compute_profiles:
+        table.add_row("Compute profiles", ", ".join(profile.name for profile in spec.compute_profiles))
+    else:
+        table.add_row("Compute profiles", "(none)")
     table.add_row("Config", summary.config_path)
     console.print(table)
 
