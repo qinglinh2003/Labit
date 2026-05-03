@@ -21,7 +21,6 @@ CHAT_SHELL_COMMANDS = (
     "/list",
     "/show",
     "/mode",
-    "/memory",
     "/long-term-memory",
     "/ltm",
     "/idea",
@@ -36,12 +35,6 @@ CHAT_SHELL_COMMANDS = (
     "/doc list",
     "/swap",
     "/mute",
-    "/auto",
-    "/auto start",
-    "/auto run",
-    "/auto log",
-    "/auto status",
-    "/auto stop",
     "/debrief",
     "/review-results",
     "/new",
@@ -195,7 +188,6 @@ def render_console_header(
         "Research: "
         + " · ".join(
             [
-                command_chip("/memory"),
                 command_chip("/idea"),
                 command_chip("/todo"),
                 command_chip("/doc"),
@@ -226,7 +218,6 @@ def render_shell_help(console: Console) -> None:
     table.add_row("/mode [mode]", "Show or switch mode (single, round_robin, parallel).")
     table.add_row("/swap", "Swap the response order of participants (e.g. claude,codex → codex,claude).")
     table.add_row("/mute <name>", "Mute an agent for the next turn only. Toggle: run again to unmute.")
-    table.add_row("/memory [id|kind]", "Show recent project memory, one memory by id, or filter by memory kind.")
     table.add_row("/long-term-memory <question>", "Run a deep long-term memory search for this turn, then answer from the richer retrieved context.")
     table.add_row("/idea [text]", "Save a lightweight project idea. With no text, show saved ideas.")
     table.add_row("/todo [text]", "Save an actionable project todo. With no text, show saved todos.")
@@ -235,11 +226,6 @@ def render_shell_help(console: Console) -> None:
     table.add_row("/doc status|done", "Show or leave the active document editing session.")
     table.add_row("/doc publish <doc_id>", "Promote a document from draft to active.")
     table.add_row("/doc list", "List all documents in the current project.")
-    table.add_row("/auto start <doc_path>", "Start auto-iteration from a design doc (or <constraint> || <success>).")
-    table.add_row("/auto run [N]", "Run N auto-iteration rounds.")
-    table.add_row("/auto log [N]", "Show detailed view of last N iterations.")
-    table.add_row("/auto status", "Show auto-iteration session overview and timeline.")
-    table.add_row("/auto stop", "Stop the current auto-iteration session.")
     table.add_row("/debrief", "Inspect active experiment launches and show their latest runtime state.")
     table.add_row("/review-results <hypothesis_id>", "Summarize experiments linked to a hypothesis, suggest a resolution, and optionally write the decision back.")
     table.add_row("/exit", "Leave the chat shell.")
@@ -438,42 +424,6 @@ def render_capture_records(console: Console, kind: str, records) -> None:
     for item in records:
         console.print(f"- [bold]{item.title}[/bold] [dim]({item.created_at or 'unknown date'})[/dim]")
         console.print(f"  [dim]{item.path}[/dim]")
-
-
-def render_memory_records(console: Console, records) -> None:
-    console.print("[bold]Project Memory[/bold]")
-    if not records:
-        console.print("[dim]No memory records yet.[/dim]")
-        return
-    for record in records:
-        refs = f" · refs: {', '.join(record.evidence_refs[:2])}" if record.evidence_refs else ""
-        console.print(
-            f"- [bold]{record.memory_id}[/bold] [{record.kind.value}/{record.memory_type.value}] "
-            f"{record.title} · {record.namespace.render()} · score:{record.promotion_score}{refs}"
-        )
-
-
-def render_memory_detail(console: Console, record) -> None:
-    body = (
-        f"[bold]Kind[/bold]: {record.kind.value}\n"
-        f"[bold]Type[/bold]: {record.memory_type.value}\n"
-        f"[bold]Status[/bold]: {record.status.value}\n"
-        f"[bold]Namespace[/bold]: {record.namespace.render()}\n"
-        f"[bold]Confidence[/bold]: {record.confidence}\n"
-        f"[bold]Promotion score[/bold]: {record.promotion_score}\n"
-        f"[bold]Promotion reasons[/bold]: {', '.join(record.promotion_reasons) or '(none)'}\n"
-        f"[bold]Updated[/bold]: {record.updated_at}\n"
-        f"[bold]Evidence refs[/bold]: {', '.join(record.evidence_refs) or '(none)'}\n"
-        f"[bold]Source artifacts[/bold]: {', '.join(record.source_artifact_refs) or '(none)'}\n\n"
-        f"{record.summary}"
-    )
-    console.print(
-        Panel(
-            body,
-            title=f"[bold green]{record.memory_id} · {record.title}[/bold green]",
-            border_style="green",
-        )
-    )
 
 
 def render_review_suggestion(console: Console, suggestion) -> None:

@@ -16,7 +16,6 @@ from rich.table import Table
 from rich.text import Text
 
 from labit.capture.commands import handle_capture_command
-from labit.commands.auto import handle_auto_command
 from labit.commands.context import ChatContext
 from labit.commands.dispatch import SlashCommandDispatcher
 from labit.commands.rendering import (
@@ -65,7 +64,6 @@ from labit.experiments.models import (
 from labit.experiments.service import ExperimentService
 from labit.hypotheses.models import HypothesisResolution, HypothesisState, utc_now_iso
 from labit.hypotheses.service import HypothesisService
-from labit.memory.commands import handle_memory_command
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
 
@@ -485,7 +483,6 @@ def run_chat_shell(
     active_doc: DocSession | None = None
     muted_next_turn: set[str] = set()  # agent names to skip on next turn only
     dispatcher = SlashCommandDispatcher()
-    dispatcher.register("/auto", lambda ctx, arg: handle_auto_command(ctx=ctx, argument=arg))
 
     for capture_command in ("/idea", "/todo"):
         dispatcher.register(
@@ -496,8 +493,6 @@ def run_chat_shell(
                 argument=arg,
             ),
         )
-
-    dispatcher.register("/memory", lambda ctx, arg: handle_memory_command(ctx=ctx, argument=arg))
 
     def _handle_document(ctx: ChatContext, arg: str) -> None:
         nonlocal active_doc

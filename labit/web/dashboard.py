@@ -3,8 +3,6 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-from labit.automation.models import AutoIterationEntry, AutoSessionRecord
-from labit.automation.store import AutomationStore
 from labit.experiments.models import ExperimentSummary
 from labit.experiments.service import ExperimentService
 from labit.paths import RepoPaths
@@ -37,27 +35,6 @@ def _load_experiments(paths: RepoPaths, project: str) -> list[ExperimentSummary]
         return []
 
 
-def _load_auto_session(store: AutomationStore, project: str) -> AutoSessionRecord | None:
-    try:
-        return store.load_session(project)
-    except Exception:
-        return None
-
-
-def _load_iterations(store: AutomationStore, project: str, limit: int = 20) -> list[AutoIterationEntry]:
-    try:
-        return store.recent_iterations(project, limit=limit)
-    except Exception:
-        return []
-
-
-def _load_latest_markdown(store: AutomationStore, project: str) -> str:
-    path = store.snapshot_path(project)
-    if not path.exists():
-        return ""
-    return path.read_text(encoding="utf-8")
-
-
 def _experiment_status_counts(experiments: list[ExperimentSummary]) -> Counter[str]:
     return Counter(str(item.status.value if hasattr(item.status, "value") else item.status) for item in experiments)
 
@@ -85,27 +62,13 @@ def _status_badge(status: str) -> str:
     return f":{color}[{status}]"
 
 
-def _render_overview(st: Any, project: str, experiments: list[ExperimentSummary], session: AutoSessionRecord | None) -> None:
+def _render_overview(st: Any, project: str, experiments: list[ExperimentSummary]) -> None:
     counts = _experiment_status_counts(experiments)
-    cols = st.columns(5)
+    cols = st.columns(4)
     cols[0].metric("Project", project)
     cols[1].metric("Experiments", len(experiments))
     cols[2].metric("Running", counts.get("running", 0))
     cols[3].metric("Failed", counts.get("failed", 0))
-    cols[4].metric("Auto", session.status.value if session else "none")
-
-    if session:
-        st.subheader("Auto Session")
-        st.write(f"Supervisor: `{session.supervisor_agent}`")
-        st.write(f"Iterations: `{session.current_iteration}` / `{session.max_iterations}`")
-        with st.expander("Constraint", expanded=False):
-            st.markdown(session.constraint or "_No constraint recorded._")
-        with st.expander("Success Criteria", expanded=False):
-            st.markdown(session.success_criteria or "_No success criteria recorded._")
-        if session.last_decision_summary:
-            st.info(session.last_decision_summary)
-    else:
-        st.info("No automation session found for this project.")
 
 
 def _render_experiment_board(st: Any, experiments: list[ExperimentSummary]) -> None:
@@ -142,67 +105,13 @@ def _render_experiment_board(st: Any, experiments: list[ExperimentSummary]) -> N
             st.write(f"`{item.experiment_id}` {item.title} ({item.status})")
 
 
-def _entry_to_dict(entry: AutoIterationEntry) -> dict[str, Any]:
-    return entry.model_dump(mode="json")
-
-
-def _render_auto_timeline(st: Any, iterations: list[AutoIterationEntry]) -> None:
-    st.subheader("Auto Timeline")
-    if not iterations:
-        st.info("No auto iterations recorded yet.")
-        return
-
-    for entry in reversed(iterations):
-        action = entry.action.value if hasattr(entry.action, "value") else str(entry.action)
-        title = f"Iteration {entry.iteration} · {action} · {entry.created_at}"
-        with st.expander(title, expanded=entry is iterations[-1]):
-            st.markdown("**Observation**")
-            st.text(entry.observation_summary)
-            st.markdown("**Decision**")
-            st.write(entry.decision_summary or "_No decision summary._")
-
-            if entry.worker_tasks:
-                st.markdown("**Worker Tasks**")
-                for task in entry.worker_tasks:
-                    st.write(f"- `{task.worker}` **{task.title}**: {task.instructions}")
-
-            if entry.worker_results:
-                st.markdown("**Worker Results**")
-                for result in entry.worker_results:
-                    with st.container(border=True):
-                        st.write(f"`{result.worker}` · `{result.status}`")
-                        st.write(result.summary)
-                        if result.outputs:
-                            st.caption("Outputs")
-                            for output in result.outputs:
-                                st.write(f"- {output}")
-                        if result.follow_up:
-                            st.caption(f"Follow-up: {result.follow_up}")
-
-            if entry.discussion:
-                st.markdown("**Discussion**")
-                for note in entry.discussion:
-                    st.write(f"- `{note.actor}`: {note.summary}")
-
-            with st.expander("Raw JSON", expanded=False):
-                st.json(_entry_to_dict(entry))
-
-
-def _render_latest_snapshot(st: Any, markdown: str) -> None:
-    st.subheader("Latest Snapshot")
-    if not markdown:
-        st.info("No latest.md snapshot found.")
-        return
-    st.markdown(markdown)
-
-
 def _render_files(st: Any, paths: RepoPaths, project: str) -> None:
     st.subheader("Backing Files")
     project_dir = paths.vault_projects_dir / project
     files = [
-        project_dir / "automation" / "session.yaml",
-        project_dir / "automation" / "iterations.jsonl",
-        project_dir / "automation" / "latest.md",
+        project_dir / "project.yaml",
+        project_dir / "todos.yaml",
+        project_dir / "ideas.yaml",
     ]
     for path in files:
         exists = path.exists()
@@ -234,20 +143,13 @@ def main() -> None:
         if st.button("Refresh"):
             st.rerun()
 
-    store = AutomationStore(paths)
     experiments = _load_experiments(paths, project)
-    session = _load_auto_session(store, project)
-    iterations = _load_iterations(store, project, limit=20)
-    latest_markdown = _load_latest_markdown(store, project)
 
-    overview, experiments_tab, auto_tab, files_tab = st.tabs(["Overview", "Experiments", "Auto", "Files"])
+    overview, experiments_tab, files_tab = st.tabs(["Overview", "Experiments", "Files"])
     with overview:
-        _render_overview(st, project, experiments, session)
+        _render_overview(st, project, experiments)
     with experiments_tab:
         _render_experiment_board(st, experiments)
-    with auto_tab:
-        _render_auto_timeline(st, iterations)
-        _render_latest_snapshot(st, latest_markdown)
     with files_tab:
         _render_files(st, paths, project)
 
