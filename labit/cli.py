@@ -101,14 +101,6 @@ def setup() -> None:
     _render_home()
 
 
-@app.command("web", help="Launch the read-only LABIT web dashboard.")
-def web(
-    port: int = typer.Option(8765, "--port", help="Local port for the dashboard."),
-    address: str = typer.Option("127.0.0.1", "--address", help="Bind address for the dashboard."),
-) -> None:
-    raise typer.Exit(launch_dashboard(port=port, address=address))
-
-
 @app.callback()
 def main(
     ctx: typer.Context,
@@ -118,11 +110,12 @@ def main(
         help="Show the LABIT version and exit.",
         is_eager=True,
     ),
+    port: int = typer.Option(8765, "--port", help="Local port for the default dashboard."),
+    address: str = typer.Option("127.0.0.1", "--address", help="Bind address for the default dashboard."),
 ) -> None:
     """LABIT CLI."""
     if version:
         typer.echo(__version__)
         raise typer.Exit()
     if ctx.invoked_subcommand is None:
-        _render_home()
-        raise typer.Exit()
+        raise typer.Exit(launch_dashboard(port=port, address=address))
