@@ -40,7 +40,6 @@ from labit.commands.rendering import (
     print_launch_exp_hints,
     render_compact_transcript,
     render_console_header,
-    render_doc_status,
     render_experiment_launch_preview,
     render_launch_exp_status,
     render_message_block,
@@ -63,8 +62,9 @@ from labit.chat.models import ChatMode
 from labit.chat.commands import handle_synthesize_command
 from labit.chat.service import ChatService
 from labit.context.events import SessionEventKind
+from labit.documents.commands import handle_document_command
 from labit.documents.drafter import DocDrafter
-from labit.documents.models import DocSession, DocStatus
+from labit.documents.models import DocSession
 from labit.documents.service import DocumentService
 from labit.devloop.commands import handle_dev_command
 from labit.devloop.engine import run_dev_loop
@@ -813,6 +813,17 @@ def run_chat_shell(
     dispatcher.register("/synthesize", lambda ctx, arg: handle_synthesize_command(ctx=ctx, argument=arg))
     dispatcher.register("/investigate", lambda ctx, arg: handle_investigate_command(ctx=ctx, argument=arg))
 
+    def _handle_document(ctx: ChatContext, arg: str) -> None:
+        nonlocal active_doc
+        result = handle_document_command(
+            ctx=ctx,
+            argument=arg,
+            active_doc=active_doc,
+        )
+        active_doc = result.active_doc
+
+    dispatcher.register("/doc", _handle_document)
+
     def _handle_dev(ctx: ChatContext, arg: str) -> None:
         nonlocal active_dev
         active_dev = handle_dev_command(
@@ -914,312 +925,6 @@ def run_chat_shell(
                         continue
                     muted_next_turn.add(agent_name)
                     console.print(f"[bold #0080ff]{agent_name} muted for next turn.[/bold #0080ff] (auto-unmutes after one turn)")
-                continue
-            if command == "/doc":
-                doc_parts = argument.split(maxsplit=1)
-                doc_action = doc_parts[0].strip().lower() if doc_parts else "status"
-                doc_argument = doc_parts[1].strip() if len(doc_parts) > 1 else ""
-                if doc_action in {"status", ""}:
-                    if active_doc is None:
-                        console.print("[dim]No active document session. Use /doc start <title> or /doc open <id>.[/dim]")
-                    else:
-                        render_doc_status(console,active_doc)
-                    continue
-                if doc_action == "done":
-                    if active_doc is None:
-                        console.print("[dim]No active document session.[/dim]")
-                    else:
-                        try:
-                            _document_service().end_session(active_doc)
-                        except Exception:
-                            pass
-                        console.print(
-                            f"[green]Document session closed.[/green] "
-                            f"[dim]{active_doc.doc_id} · {active_doc.document_path} ({active_doc.status.value})[/dim]"
-                        )
-                        active_doc = None
-                    continue
-                if doc_action == "publish":
-                    publish_target = doc_argument.strip()
-                    if not publish_target:
-                        if active_doc is None:
-                            console.print("[bold red]Usage:[/bold red] /doc publish <doc_id>")
-                            continue
-                        publish_target = active_doc.doc_id
-                    if not current_session.project:
-                        console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
-                        continue
-                    try:
-                        published_doc = _document_service().publish_document(
-                            project=current_session.project,
-                            doc_id=publish_target,
-                            source_session=current_session,
-                        )
-                        if active_doc is not None and active_doc.doc_id == published_doc.doc_id:
-                            active_doc = published_doc
-                        console.print(f"[green]Document published.[/green] [dim]{published_doc.doc_id} → active[/dim]")
-                    except Exception as exc:
-                        console.print(f"[bold red]Error:[/bold red] {exc}")
-                    continue
-                if doc_action == "list":
-                    if not current_session.project:
-                        console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
-                        continue
-                    try:
-                        docs = _document_service().list_documents(current_session.project)
-                    except Exception as exc:
-                        console.print(f"[bold red]Error:[/bold red] {exc}")
-                        continue
-                    if not docs:
-                        console.print("[dim]No documents found.[/dim]")
-                    else:
-                        from rich.table import Table as RichTable
-
-                        t = RichTable(title="Documents", border_style="dim")
-                        t.add_column("ID", style="bold")
-                        t.add_column("Title")
-                        t.add_column("Status")
-                        t.add_column("Updated")
-                        for d in docs:
-                            t.add_row(
-                                d.get("doc_id", "?"),
-                                d.get("title", "?"),
-                                d.get("status", "?"),
-                                d.get("updated_at", "?"),
-                            )
-                        console.print(t)
-                    continue
-                if doc_action == "open":
-                    doc_id = doc_argument.strip()
-                    if not doc_id:
-                        console.print("[bold red]Usage:[/bold red] /doc open <doc_id>")
-                        continue
-                    if not current_session.project:
-                        console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
-                        continue
-                    if active_doc is not None:
-                        console.print("[bold red]Error:[/bold red] A document session is already active. Use /doc done first.")
-                        continue
-                    try:
-                        active_doc = _document_service().open_document(
-                            project=current_session.project,
-                            doc_id=doc_id,
-                            session=current_session,
-                        )
-                    except Exception as exc:
-                        console.print(f"[bold red]Error:[/bold red] {exc}")
-                        continue
-                    status_note = ""
-                    if active_doc.status == DocStatus.DRAFT:
-                        status_note = " (demoted to draft for editing)"
-                    console.print(
-                        Panel(
-                            (
-                                f"[bold]ID[/bold]: {active_doc.doc_id}\n"
-                                f"[bold]Title[/bold]: {active_doc.title}\n"
-                                f"[bold]Status[/bold]: {active_doc.status.value}{status_note}\n"
-                                f"[bold]Document[/bold]: {active_doc.document_path}\n\n"
-                                    ),
-                            title="[bold green]Document opened[/bold green]",
-                            border_style="green",
-                        )
-                    )
-                    print_doc_mode_hints(console, current_session)
-                    continue
-                if doc_action == "auto":
-                    if active_doc is None:
-                        console.print("[bold red]Error:[/bold red] No active document. Use /doc start or /doc open first.")
-                        continue
-                    # Parse round count
-                    max_rounds = 5
-                    if doc_argument.strip():
-                        try:
-                            max_rounds = int(doc_argument.strip())
-                        except ValueError:
-                            console.print("[bold red]Usage:[/bold red] /doc auto [N]  (N = number of rounds, default 5, max 10)")
-                            continue
-                    max_rounds = min(max(max_rounds, 1), 10)
-
-                    doc_service = _document_service()
-                    drafter = _doc_drafter()
-                    author = current_session.participants[0]
-                    reviewer = (
-                        current_session.participants[1]
-                        if current_session.mode == ChatMode.ROUND_ROBIN and len(current_session.participants) >= 2
-                        else None
-                    )
-
-                    console.print(f"[bold yellow]Auto-iteration starting: up to {max_rounds} rounds. Ctrl+C to stop.[/bold yellow]")
-                    # Initial instruction for first round: use reviewer's last review or generic
-                    auto_instruction = "Review the document and improve it. Fix any issues, improve clarity, and strengthen the content."
-
-                    interrupted = False
-                    for round_num in range(1, max_rounds + 1):
-                        console.print(f"\n[bold]── Round {round_num}/{max_rounds} ──[/bold]")
-                        try:
-                            old_markdown = doc_service.read_document(active_doc)
-
-                            # Author revises
-                            with console.status(f"[bold blue]{author.name} revising (round {round_num})...[/bold blue]"):
-                                update = drafter.revise_document(
-                                    session=current_session,
-                                    transcript=service.transcript(current_session.session_id),
-                                    context_snapshot=service.context_snapshot(current_session.session_id),
-                                    doc_title=active_doc.title,
-                                    current_markdown=old_markdown,
-                                    user_instruction=auto_instruction,
-                                    interaction_log=doc_service.interaction_excerpt(active_doc),
-                                    author_name=author.name,
-                                    provider=author.provider,
-                                )
-                                active_doc = doc_service.revise_document(
-                                    doc_session=active_doc,
-                                    update=update,
-                                    user_instruction=auto_instruction,
-                                )
-                            console.print(
-                                Panel(
-                                    f"[bold]Iteration[/bold]: {active_doc.iteration}\n[bold]Summary[/bold]: {update.summary}",
-                                    title=f"[bold green]{author.name} · Round {round_num}[/bold green]",
-                                    border_style="green",
-                                )
-                            )
-
-                            # Reviewer reviews (round-robin) or self-review (single)
-                            if reviewer is not None:
-                                from labit.documents.drafter import compute_changed_sections
-
-                                new_markdown = doc_service.read_document(active_doc)
-                                changed_sections = compute_changed_sections(old_markdown, new_markdown)
-
-                                with console.status(f"[bold cyan]{reviewer.name} reviewing (round {round_num})...[/bold cyan]"):
-                                    review_update = drafter.review_document(
-                                        current_markdown=new_markdown,
-                                        revision_summary=update.summary,
-                                        user_instruction=auto_instruction,
-                                        reviewer_name=reviewer.name,
-                                        changed_sections=changed_sections,
-                                        provider=reviewer.provider,
-                                    )
-                                    active_doc = doc_service.record_review(
-                                        doc_session=active_doc,
-                                        update=review_update,
-                                        reviewer_name=reviewer.name,
-                                    )
-                                console.print(
-                                    Panel(
-                                        f"[bold]Review[/bold]: {review_update.summary}",
-                                        title=f"[bold cyan]{reviewer.name} · Review[/bold cyan]",
-                                        border_style="cyan",
-                                    )
-                                )
-                                # Use reviewer feedback as next round's instruction
-                                auto_instruction = review_update.summary
-                            else:
-                                # Single agent: use own revision summary as next instruction
-                                auto_instruction = f"Continue improving. Previous changes: {update.summary}"
-
-                            # Convergence check: all review blocks closed + no new open reviews
-                            from labit.documents.drafter import count_open_reviews
-
-                            current_md = doc_service.read_document(active_doc)
-                            open_count = count_open_reviews(current_md)
-                            if open_count == 0:
-                                console.print(f"[bold green]Converged at round {round_num} — all review blocks resolved, no open issues remaining.[/bold green]")
-                                break
-                            else:
-                                console.print(f"[dim]  {open_count} open review(s) remaining[/dim]")
-
-                        except KeyboardInterrupt:
-                            console.print(f"\n[bold yellow]Auto-iteration interrupted at round {round_num}.[/bold yellow]")
-                            interrupted = True
-                            break
-                        except Exception as exc:
-                            console.print(f"[bold red]Error in round {round_num}:[/bold red] {exc}")
-                            break
-
-                    if not interrupted:
-                        console.print(f"[bold green]Auto-iteration complete. {active_doc.iteration} total iterations.[/bold green]")
-                    print_doc_mode_hints(console, current_session)
-                    try:
-                        service.record_session_event(
-                            session_id=current_session.session_id,
-                            kind=SessionEventKind.ARTIFACT_DOCUMENT_UPDATED,
-                            actor="labit",
-                            summary=f"Document auto-iterated: {active_doc.title}",
-                            payload={
-                                "doc_id": active_doc.doc_id,
-                                "title": active_doc.title,
-                                "iteration": active_doc.iteration,
-                            },
-                            evidence_refs=_session_evidence_refs(current_session) + [f"document:{active_doc.document_path}"],
-                        )
-                    except Exception:
-                        pass
-                    continue
-                if doc_action != "start":
-                    console.print("[bold red]Usage:[/bold red] /doc start <title> | /doc open <id> | /doc auto [N] | /doc status | /doc done | /doc publish <id> | /doc list")
-                    continue
-                title = doc_argument
-                if not title:
-                    console.print("[bold red]Usage:[/bold red] /doc start <title>")
-                    continue
-                if not current_session.project:
-                    console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
-                    continue
-                if active_doc is not None:
-                    console.print("[bold red]Error:[/bold red] A document session is already active. Use /doc done first.")
-                    continue
-
-                doc_service = _document_service()
-                try:
-                    with console.status(f"[bold blue]{current_session.participants[0].name} writing document draft...[/bold blue]"):
-                        update = _doc_drafter().draft_from_session(
-                            session=current_session,
-                            transcript=service.transcript(current_session.session_id),
-                            context_snapshot=service.context_snapshot(current_session.session_id),
-                            title=title,
-                            provider=current_session.participants[0].provider,
-                        )
-                        active_doc = doc_service.start_document(
-                            project=current_session.project,
-                            title=title,
-                            update=update,
-                            session=current_session,
-                        )
-                except Exception as exc:
-                    console.print(f"[bold red]Error:[/bold red] {exc}")
-                    continue
-
-                console.print(
-                    Panel(
-                        (
-                            f"[bold]ID[/bold]: {active_doc.doc_id}\n"
-                            f"[bold]Document[/bold]: {active_doc.document_path}\n"
-                            f"[bold]Interaction log[/bold]: {active_doc.log_path}\n"
-                            f"[bold]Summary[/bold]: {update.summary}\n\n"
-                            ),
-                        title="[bold green]Document draft saved[/bold green]",
-                        border_style="green",
-                    )
-                )
-                print_doc_mode_hints(console, current_session)
-                try:
-                    service.record_session_event(
-                        session_id=current_session.session_id,
-                        kind=SessionEventKind.ARTIFACT_DOCUMENT_CREATED,
-                        actor="labit",
-                        summary=f"Document draft created: {update.title}",
-                        payload={
-                            "doc_id": active_doc.doc_id,
-                            "title": update.title,
-                            "document_path": active_doc.document_path,
-                            "log_path": active_doc.log_path,
-                        },
-                        evidence_refs=_session_evidence_refs(current_session) + [f"document:{active_doc.document_path}"],
-                    )
-                except Exception:
-                    pass
                 continue
             if command in {"/paste-image", "/image"}:
                 query = argument.strip() or "Please inspect the attached image and describe anything important."
