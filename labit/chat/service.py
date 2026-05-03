@@ -792,12 +792,20 @@ Reply as `{participant.name}` only. Use plain text or markdown.
             lines.append(f"    ssh: {profile.ssh_display()}")
             if profile.workdir:
                 lines.append(f"    workdir: {profile.workdir}")
-                lines.append(f"    command pattern: {profile.ssh_display()} \"cd {shlex.quote(profile.workdir)} && <command>\"")
+                lines.append(f"    command pattern: {profile.ssh_display()} \"cd {self._remote_cd_path(profile.workdir)} && <command>\"")
             else:
                 lines.append("    workdir: (not configured; ask the user before creating or editing remote files)")
             if profile.notes:
                 lines.append(f"    notes: {profile.notes}")
         return "\n".join(lines)
+
+    def _remote_cd_path(self, path: str) -> str:
+        path = path.strip()
+        if path == "~":
+            return "$HOME"
+        if path.startswith("~/"):
+            return f"$HOME/{shlex.quote(path[2:])}"
+        return shlex.quote(path)
 
     def _conversation_extra_args(self, provider: ProviderKind, *, reasoning_effort: str) -> list[str]:
         if provider == ProviderKind.CLAUDE:

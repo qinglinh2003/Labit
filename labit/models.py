@@ -118,7 +118,7 @@ class ComputeProfile(BaseModel):
     def ssh_command(self) -> list[str]:
         command = ["ssh"]
         if self.connection.identity_file:
-            command.extend(["-i", self.connection.identity_file])
+            command.extend(["-i", str(Path(self.connection.identity_file).expanduser())])
         if self.connection.port != 22:
             command.extend(["-p", str(self.connection.port)])
         command.append(self.connection.target)

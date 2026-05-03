@@ -43,6 +43,7 @@ class ProjectService:
             )
 
         raw = yaml.safe_load((self.paths.project_configs_dir / f"{resolved}.yaml").read_text()) or {}
+        raw = self._with_legacy_compute_profiles(raw)
         # Existing repo configs may carry legacy metadata such as `docs`.
         # Ignore unknown fields when reading repo-owned config files so
         # inspection commands remain backward-compatible.
@@ -148,3 +149,40 @@ class ProjectService:
             handle.write(content)
             temp_path = Path(handle.name)
         temp_path.replace(path)
+
+    def _with_legacy_compute_profiles(self, raw: dict) -> dict:
+        """Hydrate old project configs that referenced configs/compute/<name>.yaml."""
+        if raw.get("compute_profiles"):
+            return raw
+
+        legacy_name = str(raw.get("compute_profile") or "").strip()
+        if not legacy_name:
+            return raw
+
+        legacy_path = self.paths.configs_dir / "compute" / f"{legacy_name}.yaml"
+        if not legacy_path.exists():
+            return raw
+
+        legacy = yaml.safe_load(legacy_path.read_text()) or {}
+        connection = legacy.get("connection") or {}
+        workspace = legacy.get("workspace") or {}
+        notes = []
+        datadir = str(workspace.get("datadir") or "").strip()
+        if datadir:
+            notes.append(f"legacy datadir: {datadir}")
+
+        profile = {
+            "name": str(legacy.get("name") or legacy_name).strip(),
+            "connection": {
+                "user": str(connection.get("user") or "").strip(),
+                "host": str(connection.get("host") or "").strip(),
+                "port": int(connection.get("port") or 22),
+                "identity_file": connection.get("identity_file") or connection.get("ssh_key"),
+            },
+            "workdir": str(workspace.get("workdir") or "").strip(),
+            "notes": "; ".join(notes),
+        }
+
+        updated = dict(raw)
+        updated["compute_profiles"] = [profile]
+        return updated
