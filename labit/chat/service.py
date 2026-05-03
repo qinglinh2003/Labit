@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 import threading
 from dataclasses import dataclass
 from collections.abc import Callable
@@ -506,6 +507,7 @@ class ChatService:
         )
 
         platform_context = self._platform_context(session.project)
+        remote_compute_context = self._remote_compute_context(session.project)
 
         return f"""You are `{participant.name}` in a LABIT shared conversation.
 
@@ -516,6 +518,8 @@ Session:
 - Participants: {participants}
 
 {platform_context}
+
+{remote_compute_context}
 
 Guidelines:
 - Continue the conversation naturally.
@@ -679,6 +683,7 @@ Reply as `{participant.name}` only. Use plain text or markdown.
         participants = ", ".join(item.name for item in session.participants)
         working_memory_text = self._render_compact_working_memory(working_memory)
         platform_context = self._platform_context(session.project)
+        remote_compute_context = self._remote_compute_context(session.project)
 
         return f"""You are `{participant.name}` in a LABIT research conversation.
 
@@ -687,6 +692,8 @@ Mode: {session.mode.value}
 Participants: {participants}
 
 {platform_context}
+
+{remote_compute_context}
 
 Guidelines:
 - Continue the conversation naturally.
@@ -752,20 +759,44 @@ Reply as `{participant.name}` only. Use plain text or markdown.
                     lines.append(f"- Project code directory: {code_dir.relative_to(self.paths.root)}")
             except Exception:
                 pass
-            try:
-                spec = self.project_service.load_project(project)
-                if spec.compute_profiles:
-                    lines.append("- Project SSH compute profiles:")
-                    for profile in spec.compute_profiles:
-                        detail = f"  - {profile.name}: {profile.ssh_display()}"
-                        if profile.workdir:
-                            detail += f" ; workdir={profile.workdir}"
-                        if profile.notes:
-                            detail += f" ; notes={profile.notes}"
-                        lines.append(detail)
-                    lines.append("- Use these SSH profiles only when the user asks to inspect or work on the remote machine.")
-            except Exception:
-                pass
+        return "\n".join(lines)
+
+    def _remote_compute_context(self, project: str | None) -> str:
+        """Build the remote compute capability block for agent prompts."""
+        if not project:
+            return ""
+        try:
+            spec = self.project_service.load_project(project)
+        except Exception:
+            return ""
+        if not spec.compute_profiles:
+            return ""
+
+        lines = [
+            "Remote Compute:",
+            "This project has SSH access to remote machines. These machines are separate from the local LABIT workspace.",
+            "",
+            "Rules:",
+            "- Only SSH into a remote machine when the user explicitly asks you to inspect, debug, run, or check something remotely.",
+            "- Prefer local project files when the question can be answered locally.",
+            "- Treat each profile's workdir as the expected remote project directory.",
+            "- When running remote shell commands for a profile with a workdir, start from that workdir using `cd <workdir> && ...` or an equivalent shell command.",
+            "- Do not create files in `$HOME`, `/tmp`, or an unspecified remote directory unless the user explicitly asks for that location.",
+            "- Before making remote changes, state the intended command or action unless the user already gave a direct instruction.",
+            "- Do not run destructive commands, package installs, process killing, or long-running jobs remotely unless explicitly requested.",
+            "",
+            "Profiles:",
+        ]
+        for profile in spec.compute_profiles:
+            lines.append(f"- {profile.name}:")
+            lines.append(f"    ssh: {profile.ssh_display()}")
+            if profile.workdir:
+                lines.append(f"    workdir: {profile.workdir}")
+                lines.append(f"    command pattern: {profile.ssh_display()} \"cd {shlex.quote(profile.workdir)} && <command>\"")
+            else:
+                lines.append("    workdir: (not configured; ask the user before creating or editing remote files)")
+            if profile.notes:
+                lines.append(f"    notes: {profile.notes}")
         return "\n".join(lines)
 
     def _conversation_extra_args(self, provider: ProviderKind, *, reasoning_effort: str) -> list[str]:

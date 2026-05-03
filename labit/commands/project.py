@@ -101,6 +101,7 @@ def _prompt_project_fields_for_edit(spec: ProjectSpec) -> ProjectSpec:
             "repo": repo or None,
             "keywords": keywords,
             "relevance_criteria": relevance_criteria,
+            "compute_profiles": [profile.model_dump(mode="json") for profile in spec.compute_profiles],
         }
     )
 
