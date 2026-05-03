@@ -10,15 +10,9 @@ from rich.table import Table
 from labit import __version__
 from labit.commands.chat import chat_app
 from labit.commands.compute import compute_app
-from labit.commands.daily_summary import daily_summary_app
-from labit.commands.experiment import experiment_app
-from labit.commands.memory import memory_app
-from labit.commands.palace import palace_app
-from labit.commands.paper import paper_app
 from labit.commands.project import project_app
 from labit.commands.storage import storage_app
 from labit.commands.sync import sync_app
-from labit.commands.weekly_summary import weekly_summary_app
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
 from labit.web.command import launch_dashboard
@@ -27,14 +21,8 @@ app = typer.Typer(help="LABIT: local-first control plane for research workflows.
 app.add_typer(project_app, name="project")
 app.add_typer(compute_app, name="compute")
 app.add_typer(storage_app, name="storage")
-app.add_typer(paper_app, name="paper")
-app.add_typer(experiment_app, name="experiment")
-app.add_typer(memory_app, name="memory")
-app.add_typer(palace_app, name="palace")
 app.add_typer(sync_app, name="sync")
 app.add_typer(chat_app, name="chat")
-app.add_typer(daily_summary_app)
-app.add_typer(weekly_summary_app)
 
 console = Console()
 
@@ -88,7 +76,7 @@ def _render_home() -> None:
         next_steps = [
             f"Continue the active project with `labit chat`.",
             f"Inspect project state with `labit project show {active_project}`.",
-            "Pull in a paper with `labit paper ingest <arxiv-id-or-url>`.",
+            "Open the dashboard with `labit`.",
         ]
 
     console.print("[bold]Next Steps[/bold]")
