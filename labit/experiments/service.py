@@ -41,6 +41,7 @@ from labit.experiments.models import (
     TaskSummary,
     utc_now_iso,
 )
+from labit.experiments.lifecycle import inspect_experiment_dir, summarize_task_statuses
 from labit.hypotheses.service import HypothesisService
 from labit.paths import RepoPaths
 from labit.services.compute_service import ComputeService
@@ -90,6 +91,12 @@ class ExperimentService:
         resolved = self._require_project(project)
         experiment_dir = self.experiment_dir(resolved, experiment_id)
         if not (experiment_dir / "experiment.yaml").exists():
+            snapshot = inspect_experiment_dir(experiment_dir)
+            if snapshot.state.value == "draft":
+                raise FileNotFoundError(
+                    f"Experiment '{experiment_id}' is still a launch-exp draft in project '{resolved}'. "
+                    "Finalize it with /launch-exp done before loading it as a finalized experiment."
+                )
             raise FileNotFoundError(f"Experiment '{experiment_id}' not found in project '{resolved}'.")
         return self._load_detail(experiment_dir)
 
@@ -560,18 +567,7 @@ class ExperimentService:
         resolved = self._require_project(project)
         detail = self.load_experiment(resolved, experiment_id)
         task_statuses = {self.load_task(resolved, experiment_id, task.task_id).status for task in detail.tasks}
-        if any(status == TaskStatus.RUNNING for status in task_statuses):
-            next_status = ExperimentStatus.RUNNING
-        elif any(status == TaskStatus.QUEUED for status in task_statuses):
-            next_status = ExperimentStatus.QUEUED
-        elif task_statuses and all(status == TaskStatus.COMPLETED for status in task_statuses):
-            next_status = ExperimentStatus.COMPLETED
-        elif task_statuses and all(status in {TaskStatus.CANCELLED, TaskStatus.SKIPPED} for status in task_statuses):
-            next_status = ExperimentStatus.CANCELLED
-        elif any(status == TaskStatus.FAILED for status in task_statuses):
-            next_status = ExperimentStatus.FAILED
-        else:
-            next_status = ExperimentStatus.PLANNED
+        next_status = summarize_task_statuses(task_statuses)
         updated = detail.record.model_copy(update={"status": next_status, "updated_at": utc_now_iso()})
         self._atomic_write_yaml(self.experiment_dir(resolved, experiment_id) / "experiment.yaml", updated.model_dump(mode="json"))
         self._refresh_index(resolved)
