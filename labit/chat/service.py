@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import threading
 from dataclasses import dataclass
 from collections.abc import Callable
@@ -19,7 +18,6 @@ from labit.chat.models import (
     ChatReply,
     ChatSession,
     ChatStatus,
-    ContextBinding,
     ContextSnapshot,
     MemoryBinding,
     MessageType,
@@ -32,7 +30,7 @@ from labit.context.condenser import ResearchRollingCondenser, SessionCondenser
 from labit.context.events import SessionEvent, SessionEventKind, WorkingMemorySnapshot
 from labit.context.maps import ContextMapBuilder
 from labit.context.store import SessionContextStore
-from labit.memory.retrievers import MemoryRetriever, MemPalaceRetriever
+from labit.memory.retrievers import MemoryRetriever
 from labit.memory.service import MemoryService
 from labit.memory.store import MemoryStore
 from labit.paths import RepoPaths
@@ -83,13 +81,7 @@ class ChatService:
         if memory_retriever:
             self.memory_retriever = memory_retriever
         else:
-            legacy = MemoryRetriever(self.memory_store)
-            backend = os.getenv("LABIT_MEMORY_BACKEND", "palace").strip().lower()
-            if backend in {"legacy", "yaml", "memorystore"}:
-                self.memory_retriever = legacy
-            else:
-                palace_path = paths.palace_dir
-                self.memory_retriever = MemPalaceRetriever(palace_path, fallback=legacy)
+            self.memory_retriever = MemoryRetriever(self.memory_store)
 
     def open_session(
         self,
@@ -99,7 +91,6 @@ class ChatService:
         provider: str | ProviderKind | None = None,
         second_provider: str | ProviderKind | None = None,
         project: str | None = None,
-        context_bindings: list[ContextBinding] | None = None,
         memory_bindings: list[MemoryBinding] | None = None,
     ) -> ChatSession:
         session = ChatSession(
@@ -107,7 +98,6 @@ class ChatService:
             mode=mode,
             project=project,
             participants=self._default_participants(mode=mode, provider=provider, second_provider=second_provider),
-            context_bindings=context_bindings or [ContextBinding(provider="none")],
             memory_bindings=memory_bindings or [MemoryBinding(provider="session_working_memory")],
         )
         snapshot = self.context_registry.build_snapshot(session=session, transcript=[], paths=self.paths)
@@ -115,21 +105,6 @@ class ChatService:
         self.session_context_store.write_working_memory(
             WorkingMemorySnapshot(session_id=session.session_id, project=session.project)
         )
-        for binding in session.context_bindings:
-            if binding.provider == "paper_focus":
-                paper_id = str(binding.config.get("paper_id", "")).strip()
-                if paper_id:
-                    self.session_context_store.append_event(
-                        SessionEvent(
-                            session_id=session.session_id,
-                            project=session.project,
-                            kind=SessionEventKind.ARTIFACT_FOCUS_BOUND,
-                            actor="system",
-                            summary=f"Bound paper focus context for {paper_id}",
-                            payload={"provider": binding.provider, "config": binding.config},
-                            evidence_refs=[f"paper:{paper_id}"],
-                        )
-                    )
         self._refresh_working_memory(session)
         self.store.write_context_snapshot(
             session.session_id,
@@ -632,7 +607,6 @@ Reply as `{participant.name}` only. Use plain text or markdown.
             project=session.project,
             query=base_query_text,
             evidence_refs=evidence_refs,
-            exclude_paper_ids=self._bound_paper_ids(session),
             allow_fallback=deep_memory,
         )
         memory_query_text = self.context_map_builder.shape_memory_query(
@@ -647,25 +621,13 @@ Reply as `{participant.name}` only. Use plain text or markdown.
                 evidence_refs=evidence_refs,
                 limit=12 if deep_memory else 6,
             )
-        wake_up_section = None
-        if session.project and isinstance(self.memory_retriever, MemPalaceRetriever):
-            wake_up_text = self.memory_retriever.wake_up(wing=session.project)
-            if wake_up_text:
-                from labit.context.assembler import ContextSection
-                wake_up_section = ContextSection(
-                    title="Long-term Memory",
-                    source="mempalace",
-                    priority=55,
-                    content=wake_up_text,
-                )
-        extra_sections = [wake_up_section] if wake_up_section else []
         assembled = self.assembler.assemble(
             task_header=task_header,
             bound_sections=bound_sections,
             recent_sections=recent_sections,
             working_memory=working_memory,
             memories=retrieved_memories,
-            map_sections=map_sections + extra_sections,
+            map_sections=map_sections,
         )
         return assembled.render()
 
@@ -842,16 +804,6 @@ Reply as `{participant.name}` only. Use plain text or markdown.
             except Exception:
                 pass
         return "\n".join(lines)
-
-    def _bound_paper_ids(self, session: ChatSession) -> list[str]:
-        paper_ids: list[str] = []
-        for binding in session.context_bindings:
-            if binding.provider != "paper_focus":
-                continue
-            paper_id = str(binding.config.get("paper_id", "")).strip()
-            if paper_id and paper_id not in paper_ids:
-                paper_ids.append(paper_id)
-        return paper_ids
 
     def _conversation_extra_args(self, provider: ProviderKind, *, reasoning_effort: str) -> list[str]:
         if provider == ProviderKind.CLAUDE:

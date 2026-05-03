@@ -38,7 +38,7 @@ def _render_home() -> None:
     console.print(
         Panel(
             "[bold]LABIT[/bold]\n"
-            "[dim]Local-first research workspace for papers, discussion, hypotheses, experiments, and review.[/dim]",
+            "[dim]Local-first workspace for research conversation, documents, and lightweight capture.[/dim]",
             title="[bold green]Welcome[/bold green]",
             border_style="green",
         )

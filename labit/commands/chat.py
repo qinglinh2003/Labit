@@ -218,12 +218,6 @@ def _session_evidence_refs(session) -> list[str]:
     refs: list[str] = []
     if session.project:
         refs.append(f"project:{session.project}")
-    for binding in session.context_bindings:
-        if binding.provider != "paper_focus":
-            continue
-        paper_id = str(binding.config.get("paper_id", "")).strip()
-        if paper_id:
-            refs.append(f"paper:{paper_id}")
     return refs
 
 

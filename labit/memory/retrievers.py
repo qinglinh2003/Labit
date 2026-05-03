@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
-from pathlib import Path
 import re
 from dataclasses import dataclass
 
@@ -142,92 +141,3 @@ class MemoryRetriever:
             if len(selected) >= limit:
                 break
         return selected
-
-
-class MemPalaceRetriever:
-    """Retriever backed by the upstream mempalace package.
-
-    Uses Layer1 for wake-up and Layer3 for semantic search.
-    Falls back to the legacy MemoryRetriever if mempalace is not available.
-    """
-
-    def __init__(self, palace_path: str | Path, fallback: MemoryRetriever | None = None):
-        self.palace_path = str(palace_path)
-        self.fallback = fallback
-        self._available: bool | None = None
-
-    def _check_available(self) -> bool:
-        if self._available is not None:
-            return self._available
-        try:
-            from labit.memory.palace.layers import Layer3  # noqa: F401
-            palace = Path(self.palace_path)
-            if not palace.is_dir():
-                self._available = False
-                return False
-            self._available = True
-        except ImportError:
-            logger.debug("MemPalace dependencies not available, using fallback")
-            self._available = False
-        return self._available
-
-    def retrieve(
-        self,
-        *,
-        project: str,
-        query: str,
-        evidence_refs: list[str] | None = None,
-        limit: int = 6,
-    ) -> list[MemoryRecord]:
-        if not self._check_available():
-            if self.fallback:
-                return self.fallback.retrieve(
-                    project=project, query=query,
-                    evidence_refs=evidence_refs, limit=limit,
-                )
-            return []
-
-        try:
-            from labit.memory.palace.layers import Layer3
-            l3 = Layer3(palace_path=self.palace_path)
-            hits = l3.search_raw(query, wing=project or None, n_results=limit)
-        except Exception as exc:
-            logger.warning("MemPalace search failed: %s", exc)
-            if self.fallback:
-                return self.fallback.retrieve(
-                    project=project, query=query,
-                    evidence_refs=evidence_refs, limit=limit,
-                )
-            return []
-
-        records: list[MemoryRecord] = []
-        for hit in hits:
-            room = hit.get("room", "general")
-            source_file = hit.get("source_file", "")
-            similarity = hit.get("similarity", 0.0)
-            title = f"[verbatim:{room}] {source_file}" if source_file else f"[verbatim:{room}]"
-            source_refs = [f"file:{source_file}"] if source_file else []
-            records.append(MemoryRecord(
-                project=project or "unknown",
-                namespace=MemoryNamespace(parts=(project or "unknown", room)),
-                kind=MemoryKind.VERBATIM_RECALL,
-                memory_type=MemoryType.EPISODIC,
-                title=title,
-                summary=hit.get("text", ""),
-                source_artifact_refs=source_refs,
-                confidence="medium",
-                promotion_score=int(similarity * 10),
-            ))
-        return records
-
-    def wake_up(self, *, wing: str | None = None) -> str:
-        """Generate L0+L1 wake-up text (~600-900 tokens). Returns empty string if unavailable."""
-        if not self._check_available():
-            return ""
-        try:
-            from labit.memory.palace.layers import MemoryStack
-            stack = MemoryStack(palace_path=self.palace_path)
-            return stack.wake_up(wing=wing)
-        except Exception as exc:
-            logger.debug("wake_up failed: %s", exc)
-            return ""

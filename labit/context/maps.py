@@ -7,18 +7,7 @@ from labit.capture.models import CaptureRecord
 from labit.capture.service import CaptureService
 from labit.codebase.map import CodeMapBuilder
 from labit.context.assembler import ContextSection
-from labit.papers.service import PaperService
 from labit.paths import RepoPaths
-
-
-@dataclass(frozen=True)
-class _RankedPaper:
-    paper_id: str
-    title: str
-    status: str
-    path: str
-    summary: str
-    score: int
 
 
 @dataclass(frozen=True)
@@ -35,7 +24,6 @@ class ContextMapBuilder:
     def __init__(self, paths: RepoPaths):
         self.paths = paths
         self.capture_service = CaptureService(paths)
-        self.paper_service = PaperService(paths)
         self.code_map_builder = CodeMapBuilder(paths)
 
     def build_sections(
@@ -44,7 +32,6 @@ class ContextMapBuilder:
         project: str | None,
         query: str,
         evidence_refs: list[str] | None = None,
-        exclude_paper_ids: list[str] | None = None,
         allow_fallback: bool = False,
     ) -> list[ContextSection]:
         if not project:
@@ -53,16 +40,6 @@ class ContextMapBuilder:
             return []
 
         sections: list[ContextSection] = []
-        paper_section = self._build_paper_section(
-            project=project,
-            query=query,
-            evidence_refs=evidence_refs or [],
-            exclude_paper_ids=exclude_paper_ids or [],
-            allow_fallback=allow_fallback,
-        )
-        if paper_section is not None:
-            sections.append(paper_section)
-
         docs_section = self._build_docs_section(project=project, query=query, allow_fallback=allow_fallback)
         if docs_section is not None:
             sections.append(docs_section)
@@ -93,82 +70,6 @@ class ContextMapBuilder:
             return shaped
         return f"{shaped[: max_chars - 1].rstrip()}…"
 
-    def _build_paper_section(
-        self,
-        *,
-        project: str,
-        query: str,
-        evidence_refs: list[str],
-        exclude_paper_ids: list[str],
-        allow_fallback: bool,
-    ) -> ContextSection | None:
-        query_tokens = self._tokenize(query)
-        exclude = set(exclude_paper_ids)
-        evidence_papers = {ref.split(":", 1)[1] for ref in evidence_refs if ref.startswith("paper:")}
-        ranked: list[_RankedPaper] = []
-
-        for entry in self.paper_service.list_project_index_entries(project):
-            if entry.paper_id in exclude:
-                continue
-            score = 0
-            haystack = f"{entry.paper_id} {entry.title} {entry.status.value}"
-            score += len(query_tokens & self._tokenize(haystack)) * 4
-            if entry.paper_id in evidence_papers:
-                score += 8
-            if entry.status.value == "ingested":
-                score += 2
-            if score <= 0 and query_tokens:
-                continue
-
-            summary_excerpt = self._paper_summary_excerpt(project=project, paper_id=entry.paper_id)
-            ranked.append(
-                _RankedPaper(
-                    paper_id=entry.paper_id,
-                    title=entry.title,
-                    status=entry.status.value,
-                    path=entry.path,
-                    summary=summary_excerpt,
-                    score=score,
-                )
-            )
-
-        if not ranked and allow_fallback:
-            fallback_entries = sorted(
-                self.paper_service.list_project_index_entries(project),
-                key=lambda entry: (entry.status.value == "ingested", entry.added_at),
-                reverse=True,
-            )
-            for entry in fallback_entries[:4]:
-                if entry.paper_id in exclude:
-                    continue
-                ranked.append(
-                    _RankedPaper(
-                        paper_id=entry.paper_id,
-                        title=entry.title,
-                        status=entry.status.value,
-                        path=entry.path,
-                        summary=self._paper_summary_excerpt(project=project, paper_id=entry.paper_id),
-                        score=0,
-                    )
-                )
-
-        if not ranked:
-            return None
-
-        ranked.sort(key=lambda item: (-item.score, item.title.lower()))
-        lines: list[str] = []
-        for item in ranked[:4]:
-            lines.append(f"- {item.paper_id} | {item.status} | {item.title}")
-            if item.summary:
-                lines.append(f"  summary: {item.summary}")
-            lines.append(f"  record: {item.path}")
-        return ContextSection(
-            title="Related Project Papers",
-            source="map:papers",
-            priority=60,
-            content="\n".join(lines),
-        )
-
     def _build_code_section(self, *, project: str, query: str, allow_fallback: bool) -> ContextSection | None:
         snapshot = self.code_map_builder.build_snapshot(project)
         if snapshot is None:
@@ -188,7 +89,6 @@ class ContextMapBuilder:
         ranked: list[_RankedDoc] = []
         for kind, records in (
             ("idea", self.capture_service.list_ideas(project)),
-            ("note", self.capture_service.list_notes(project)),
             ("todo", self.capture_service.list_todos(project)),
         ):
             for record in records:
@@ -213,7 +113,6 @@ class ContextMapBuilder:
             for kind, records in (
                 ("todo", self.capture_service.list_todos(project)),
                 ("idea", self.capture_service.list_ideas(project)),
-                ("note", self.capture_service.list_notes(project)),
             ):
                 for record in records[:3]:
                     fallback.append(
@@ -244,19 +143,6 @@ class ContextMapBuilder:
             priority=57,
             content="\n".join(lines),
         )
-
-    def _paper_summary_excerpt(self, *, project: str, paper_id: str) -> str:
-        try:
-            record = self.paper_service.load_project_record(project, paper_id)
-        except FileNotFoundError:
-            return ""
-        if not record.summary_path:
-            return ""
-        summary_path = self.paths.root / record.summary_path
-        if not summary_path.exists():
-            return ""
-        text = summary_path.read_text(encoding="utf-8").strip()
-        return self._clip(" ".join(text.split()), 260)
 
     def _doc_excerpt(self, record: CaptureRecord) -> str:
         path = self.paths.root / record.path

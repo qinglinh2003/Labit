@@ -72,32 +72,11 @@ class ResearchRollingCondenser(SessionCondenser):
         for event in relevant:
             evidence_refs.extend(event.evidence_refs)
             if event.kind in {
-                SessionEventKind.ARTIFACT_HYPOTHESIS_CREATED,
-                SessionEventKind.ARTIFACT_HYPOTHESIS_UPDATED,
-                SessionEventKind.ARTIFACT_REPORT_CREATED,
                 SessionEventKind.ARTIFACT_DOCUMENT_CREATED,
                 SessionEventKind.ARTIFACT_DOCUMENT_UPDATED,
                 SessionEventKind.DISCUSSION_SYNTHESIS,
             }:
                 decisions.append(event.summary)
-            if event.kind == SessionEventKind.ARTIFACT_FOCUS_BOUND:
-                paper_id = ""
-                config = event.payload.get("config") if isinstance(event.payload, dict) else None
-                if isinstance(config, dict):
-                    paper_id = str(config.get("paper_id", "")).strip()
-                if paper_id:
-                    active_artifacts.append(f"paper:{paper_id}")
-            if event.kind in {
-                SessionEventKind.ARTIFACT_HYPOTHESIS_CREATED,
-                SessionEventKind.ARTIFACT_HYPOTHESIS_UPDATED,
-            }:
-                hypothesis_id = str(event.payload.get("hypothesis_id", "")).strip()
-                if hypothesis_id:
-                    active_artifacts.append(f"hypothesis:{hypothesis_id}")
-            if event.kind == SessionEventKind.ARTIFACT_REPORT_CREATED:
-                report_path = str(event.payload.get("report_path", "")).strip()
-                if report_path:
-                    active_artifacts.append(f"report:{report_path}")
             if event.kind in {
                 SessionEventKind.ARTIFACT_DOCUMENT_CREATED,
                 SessionEventKind.ARTIFACT_DOCUMENT_UPDATED,
@@ -109,7 +88,6 @@ class ResearchRollingCondenser(SessionCondenser):
                     active_artifacts.append(f"document:{doc_path}")
             if event.kind in {
                 SessionEventKind.ARTIFACT_TODO_CREATED,
-                SessionEventKind.ARTIFACT_NOTE_CREATED,
                 SessionEventKind.ARTIFACT_IDEA_CREATED,
             }:
                 followups.append(event.summary)

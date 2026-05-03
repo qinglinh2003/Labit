@@ -68,44 +68,6 @@ class MemoryService:
                 confidence="medium",
             )
 
-        if event.kind == SessionEventKind.ARTIFACT_HYPOTHESIS_CREATED:
-            hypothesis_id = str(event.payload.get("hypothesis_id", "")).strip()
-            title = str(event.payload.get("title", "")).strip() or event.summary
-            claim = str(event.payload.get("claim", "")).strip()
-            if not hypothesis_id:
-                return None
-            return MemoryRecord(
-                project=event.project or "",
-                namespace=MemoryNamespace(parts=("hypothesis", hypothesis_id)),
-                kind=MemoryKind.OPEN_LOOP,
-                memory_type=MemoryType.SEMANTIC,
-                title=f"Hypothesis {hypothesis_id}: {title}",
-                summary=claim or event.summary,
-                evidence_refs=event.evidence_refs,
-                source_event_ids=[event.event_id],
-                source_artifact_refs=[f"hypothesis:{hypothesis_id}", f"conversation:{event.session_id}"],
-                confidence="high",
-            )
-
-        if event.kind == SessionEventKind.ARTIFACT_REPORT_CREATED:
-            report_path = str(event.payload.get("report_path", "")).strip()
-            title = str(event.payload.get("title", "")).strip() or event.summary
-            summary = str(event.payload.get("summary", "")).strip() or event.summary
-            if not report_path:
-                return None
-            return MemoryRecord(
-                project=event.project or "",
-                namespace=MemoryNamespace(parts=("investigation", report_path)),
-                kind=MemoryKind.INVESTIGATION_FINDING,
-                memory_type=MemoryType.EPISODIC,
-                title=title,
-                summary=summary,
-                evidence_refs=event.evidence_refs,
-                source_event_ids=[event.event_id],
-                source_artifact_refs=[f"report:{report_path}", f"conversation:{event.session_id}"],
-                confidence="medium",
-            )
-
         return None
 
     def _promotion_decision(self, event: SessionEvent, record: MemoryRecord) -> PromotionDecision:
@@ -133,34 +95,6 @@ class MemoryService:
                 score += 1
                 reasons.append("nontrivial_summary")
             return PromotionDecision(promote=score >= 6, score=score, reasons=reasons or ["low_signal"])
-
-        if event.kind == SessionEventKind.ARTIFACT_HYPOTHESIS_CREATED:
-            score += 8
-            reasons.append("formal_hypothesis")
-            claim = str(event.payload.get("claim", "")).strip()
-            source_papers = event.payload.get("source_paper_ids", [])
-            if claim:
-                score += 2
-                reasons.append("has_claim")
-            if isinstance(source_papers, list) and source_papers:
-                score += 2
-                reasons.append("has_source_papers")
-            if event.evidence_refs:
-                score += 1
-                reasons.append("has_evidence_refs")
-            return PromotionDecision(promote=True, score=score, reasons=reasons)
-
-        if event.kind == SessionEventKind.ARTIFACT_REPORT_CREATED:
-            score += 6
-            reasons.append("formal_report")
-            summary = str(event.payload.get("summary", "")).strip()
-            if summary:
-                score += 2
-                reasons.append("has_summary")
-            if event.evidence_refs:
-                score += 2
-                reasons.append("has_evidence_refs")
-            return PromotionDecision(promote=score >= 8, score=score, reasons=reasons)
 
         return PromotionDecision(promote=False, score=0, reasons=["unsupported_event"])
 

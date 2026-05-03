@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -13,7 +12,7 @@ from labit.models import ProjectDraft, ProjectSeed, ProjectSpec, ProjectSummary,
 from labit.paths import RepoPaths
 
 
-PROJECT_SUBDIRS = ("digests", "sparks", "hypotheses", "tasks", "code", "docs")
+PROJECT_SUBDIRS = ("digests", "sparks", "code", "docs")
 
 
 class ProjectService:
@@ -151,8 +150,6 @@ class ProjectService:
             name=resolved,
             description=spec.description,
             keyword_count=len(spec.keywords),
-            paper_count=self.count_project_papers(resolved),
-            hypothesis_count=self.count_project_hypotheses(resolved),
             is_active=(active == resolved),
             config_path=str(self.paths.project_configs_dir / f"{resolved}.yaml"),
         )
@@ -206,52 +203,6 @@ class ProjectService:
             "repo": spec.repo,
             "target_dir": str(target_dir),
         }
-
-    def count_project_hypotheses(self, name: str) -> int:
-        path = self.paths.vault_projects_dir / name / "hypotheses"
-        if not path.exists():
-            return 0
-        structured_ids = {
-            item.name
-            for item in path.iterdir()
-            if item.is_dir() and (item / "hypothesis.yaml").exists() and re.fullmatch(r"h\d+", item.name)
-        }
-        legacy_ids = {
-            item.stem
-            for item in path.glob("h*.yaml")
-            if re.fullmatch(r"h\d+", item.stem)
-        }
-        return len(structured_ids | legacy_ids)
-
-    def count_project_papers(self, name: str) -> int:
-        key_papers_index = self.paths.vault_projects_dir / name / "key_papers" / "index.yaml"
-        if key_papers_index.exists():
-            raw = yaml.safe_load(key_papers_index.read_text()) or {}
-            if isinstance(raw, dict):
-                papers = raw.get("papers")
-                if isinstance(papers, list):
-                    return len(papers)
-
-        index_path = self.paths.vault_projects_dir / name / "papers.yaml"
-        if index_path.exists():
-            data = yaml.safe_load(index_path.read_text()) or []
-            if isinstance(data, list):
-                return len(data)
-
-        if not self.paths.papers_dir.exists():
-            return 0
-
-        count = 0
-        pattern = re.compile(r"relevance_to:\s*\[([^\]]*)\]")
-        for path in self.paths.papers_dir.glob("*.md"):
-            content = path.read_text()
-            match = pattern.search(content)
-            if not match:
-                continue
-            values = [item.strip() for item in match.group(1).split(",") if item.strip()]
-            if name in values:
-                count += 1
-        return count
 
     def _atomic_write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

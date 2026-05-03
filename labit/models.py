@@ -69,22 +69,6 @@ def _normalize_keywords(values: list[str]) -> list[str]:
 
 
 
-def _normalize_arxiv_categories(values: list[str]) -> list[str]:
-    cleaned: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        item = value.strip()
-        if not item:
-            continue
-        key = item.lower()
-        if key in seen:
-            continue
-        cleaned.append(item)
-        seen.add(key)
-    return cleaned
-
-
-
 def _extract_phrases(text: str, *, max_items: int = 12) -> list[str]:
     parts = re.split(r"[\n,;]", text)
     phrases: list[str] = []
@@ -151,7 +135,6 @@ class ProjectDraft(BaseModel):
 
     description: str = ""
     keywords: list[str] = Field(default_factory=list)
-    arxiv_categories: list[str] = Field(default_factory=list)
     relevance_criteria: str = ""
 
     @field_validator("description", "relevance_criteria")
@@ -163,11 +146,6 @@ class ProjectDraft(BaseModel):
     @classmethod
     def normalize_keywords(cls, values: list[str]) -> list[str]:
         return _normalize_keywords(values)
-
-    @field_validator("arxiv_categories")
-    @classmethod
-    def normalize_arxiv_categories(cls, values: list[str]) -> list[str]:
-        return _normalize_arxiv_categories(values)
 
     @classmethod
     def scaffold_from_brief(cls, brief: "SemanticBrief") -> "ProjectDraft":
@@ -185,7 +163,6 @@ class ProjectDraft(BaseModel):
         return cls(
             description=brief.goal,
             keywords=keywords[:12],
-            arxiv_categories=[],
             relevance_criteria=" ".join(part.strip() for part in relevance_parts if part.strip()),
         )
 
@@ -200,7 +177,6 @@ class ProjectSpec(BaseModel):
     description: str = ""
     repo: str | None = None
     keywords: list[str] = Field(default_factory=list)
-    arxiv_categories: list[str] = Field(default_factory=list)
     relevance_criteria: str = ""
 
     @field_validator("name")
@@ -223,11 +199,6 @@ class ProjectSpec(BaseModel):
     def normalize_keywords(cls, values: list[str]) -> list[str]:
         return _normalize_keywords(values)
 
-    @field_validator("arxiv_categories")
-    @classmethod
-    def normalize_arxiv_categories(cls, values: list[str]) -> list[str]:
-        return _normalize_arxiv_categories(values)
-
     @classmethod
     def from_seed_and_draft(cls, seed: ProjectSeed, draft: ProjectDraft) -> "ProjectSpec":
         return cls(
@@ -235,7 +206,6 @@ class ProjectSpec(BaseModel):
             repo=seed.repo,
             description=draft.description,
             keywords=draft.keywords,
-            arxiv_categories=draft.arxiv_categories,
             relevance_criteria=draft.relevance_criteria,
         )
 
@@ -249,7 +219,6 @@ class ProjectSpec(BaseModel):
         return ProjectDraft(
             description=self.description,
             keywords=self.keywords,
-            arxiv_categories=self.arxiv_categories,
             relevance_criteria=self.relevance_criteria,
         )
 
@@ -261,7 +230,5 @@ class ProjectSummary(BaseModel):
     name: str
     description: str
     keyword_count: int
-    paper_count: int
-    hypothesis_count: int
     is_active: bool
     config_path: str

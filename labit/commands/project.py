@@ -91,7 +91,6 @@ def _prompt_project_fields_for_edit(spec: ProjectSpec) -> ProjectSpec:
     description = _prompt_edit_text("Description", default=spec.description)
     repo = _prompt_edit_text("Repository URL or local path", default=spec.repo or "")
     keywords = _prompt_edit_csv("Keywords (comma-separated)", default=spec.keywords)
-    arxiv_categories = _prompt_edit_csv("arXiv categories (comma-separated)", default=spec.arxiv_categories)
     relevance_criteria = _prompt_edit_text("Relevance criteria", default=spec.relevance_criteria)
 
     return ProjectSpec.model_validate(
@@ -100,7 +99,6 @@ def _prompt_project_fields_for_edit(spec: ProjectSpec) -> ProjectSpec:
             "description": description,
             "repo": repo or None,
             "keywords": keywords,
-            "arxiv_categories": arxiv_categories,
             "relevance_criteria": relevance_criteria,
         }
     )
@@ -114,7 +112,6 @@ def _render_spec_review(spec: ProjectSpec) -> None:
     table.add_row("Description", spec.description or "(blank)")
     table.add_row("Repo", spec.repo or "(blank)")
     table.add_row("Keywords", ", ".join(spec.keywords) or "(blank)")
-    table.add_row("arXiv Categories", ", ".join(spec.arxiv_categories) or "(blank)")
     table.add_row("Relevance", spec.relevance_criteria or "(blank)")
     console.print(table)
 
@@ -137,7 +134,6 @@ def new_project(json_output: bool = typer.Option(False, "--json", help="Emit JSO
     description = _prompt_text("Description")
     repo = _prompt_text("Repository URL or local path")
     keywords = _prompt_csv("Keywords (comma-separated)")
-    arxiv_categories = _prompt_csv("arXiv categories (comma-separated)")
     relevance_criteria = _prompt_text("Relevance criteria")
 
     try:
@@ -147,7 +143,6 @@ def new_project(json_output: bool = typer.Option(False, "--json", help="Emit JSO
                 "description": description,
                 "repo": repo or None,
                 "keywords": keywords,
-                "arxiv_categories": arxiv_categories,
                 "relevance_criteria": relevance_criteria,
             }
         )
@@ -250,8 +245,6 @@ def current(json_output: bool = typer.Option(False, "--json", help="Emit JSON ou
     table.add_row("Name", payload["active_project"])
     table.add_row("Description", payload["description"])
     table.add_row("Keywords", str(payload["keyword_count"]))
-    table.add_row("Papers", str(payload["paper_count"]))
-    table.add_row("Hypotheses", str(payload["hypothesis_count"]))
     table.add_row("Config", payload["config_path"])
     console.print(table)
 
@@ -301,10 +294,7 @@ def show_project(
     table.add_row("Description", summary.description or "(blank)")
     table.add_row("Repo", spec.repo or "(blank)")
     table.add_row("Keywords", ", ".join(spec.keywords) or "(blank)")
-    table.add_row("arXiv Categories", ", ".join(spec.arxiv_categories) or "(blank)")
     table.add_row("Relevance", spec.relevance_criteria or "(blank)")
-    table.add_row("Papers", str(summary.paper_count))
-    table.add_row("Hypotheses", str(summary.hypothesis_count))
     table.add_row("Config", summary.config_path)
     console.print(table)
 

@@ -19,17 +19,11 @@ class CaptureService:
     def list_ideas(self, project: str) -> list[CaptureRecord]:
         return self._list_records(project, kind="idea")
 
-    def list_notes(self, project: str) -> list[CaptureRecord]:
-        return self._list_records(project, kind="note")
-
     def list_todos(self, project: str) -> list[CaptureRecord]:
         return self._list_records(project, kind="todo")
 
     def save_idea(self, *, project: str, draft: IdeaDraft, session: ChatSession, intent: str = "") -> CaptureRecord:
         return self._save_idea_record(project=project, draft=draft, session=session, intent=intent)
-
-    def save_note(self, *, project: str, content: str, session: ChatSession) -> CaptureRecord:
-        return self._save_record(project=project, kind="note", content=content, session=session)
 
     def save_todo(self, *, project: str, content: str, session: ChatSession) -> CaptureRecord:
         return self._save_record(project=project, kind="todo", content=content, session=session)
@@ -122,7 +116,6 @@ class CaptureService:
     def _target_dir(self, project: str, *, kind: str) -> Path:
         folder_map = {
             "idea": "ideas",
-            "note": "notes",
             "todo": "todos",
         }
         folder = folder_map.get(kind, f"{kind}s")
@@ -152,13 +145,6 @@ class CaptureService:
         return slug or "untitled"
 
     def _source_label(self, session: ChatSession) -> str:
-        paper_id = ""
-        for binding in session.context_bindings:
-            if binding.provider == "paper_focus":
-                paper_id = str(binding.config.get("paper_id", "")).strip()
-                break
-        if paper_id:
-            return f"paper_focus:{paper_id} · {session.title} · {session.session_id}"
         return f"chat:{session.title} · {session.session_id}"
 
     def _render_idea_body(
@@ -186,7 +172,6 @@ class CaptureService:
     def _render_body(self, *, kind: str, title: str, date_text: str, source: str, content: str) -> str:
         heading_map = {
             "idea": "Idea",
-            "note": "Note",
             "todo": "Todo",
         }
         heading = heading_map.get(kind, kind.title())

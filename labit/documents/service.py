@@ -493,13 +493,6 @@ class DocumentService:
         return slug
 
     def _source_label(self, session: ChatSession) -> str:
-        paper_id = ""
-        for binding in session.context_bindings:
-            if binding.provider == "paper_focus":
-                paper_id = str(binding.config.get("paper_id", "")).strip()
-                break
-        if paper_id:
-            return f"paper_focus:{paper_id} · {session.title} · {session.session_id}"
         return f"chat:{session.title} · {session.session_id}"
 
     def _normalize_markdown(self, markdown: str) -> str:

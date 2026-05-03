@@ -404,7 +404,6 @@ def render_idea_preview(console: Console, draft) -> None:
 def render_capture_records(console: Console, kind: str, records) -> None:
     label_map = {
         "idea": "Ideas",
-        "note": "Notes",
         "todo": "Todos",
     }
     label = label_map.get(kind, f"{kind.title()}s")

@@ -21,9 +21,6 @@ dependencies = [
 dev = [
   "pytest>=8.0,<9",
 ]
-mempalace = [
-  "chromadb>=0.5.0,<0.7",
-]
 web = [
   "streamlit>=1.35,<2",
 ]

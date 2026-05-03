@@ -11,18 +11,10 @@ class SessionEventKind(str, Enum):
     MESSAGE_USER = "message.user"
     MESSAGE_AGENT = "message.agent"
     MESSAGE_SYSTEM = "message.system"
-    ARTIFACT_FOCUS_BOUND = "artifact.focus_bound"
     ARTIFACT_IDEA_CREATED = "artifact.idea_created"
-    ARTIFACT_NOTE_CREATED = "artifact.note_created"
     ARTIFACT_TODO_CREATED = "artifact.todo_created"
     ARTIFACT_DOCUMENT_CREATED = "artifact.document_created"
     ARTIFACT_DOCUMENT_UPDATED = "artifact.document_updated"
-    ARTIFACT_HYPOTHESIS_CREATED = "artifact.hypothesis_created"
-    ARTIFACT_HYPOTHESIS_UPDATED = "artifact.hypothesis_updated"
-    ARTIFACT_EXPERIMENT_CREATED = "artifact.experiment_created"
-    ARTIFACT_TASK_LAUNCHED = "artifact.task_launched"
-    ARTIFACT_HYPOTHESIS_REVIEWED = "artifact.hypothesis_reviewed"
-    ARTIFACT_REPORT_CREATED = "artifact.report_created"
     DISCUSSION_SYNTHESIS = "discussion.synthesis"
 
 
