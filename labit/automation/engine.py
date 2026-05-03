@@ -392,6 +392,9 @@ class AutoIterationEngine:
                 Do NOT wait for experiments to finish. Labit's backend will monitor progress and collect results automatically.
                 Your job is to kick things off (or fix/patch code), then exit cleanly.
 
+                IMPORTANT: Do NOT run `git commit` yourself. Labit handles all commits automatically.
+                Only make file edits and run commands — never commit, push, or manage git history.
+
                 Keep your final reply short and factual:
                 - what you actually changed or ran
                 - what you submitted/launched

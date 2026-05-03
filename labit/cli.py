@@ -22,6 +22,7 @@ from labit.commands.sync import sync_app
 from labit.commands.weekly_summary import weekly_summary_app
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
+from labit.web.command import launch_dashboard
 
 app = typer.Typer(help="LABIT: local-first control plane for research workflows.", invoke_without_command=True)
 app.add_typer(project_app, name="project")
@@ -100,6 +101,14 @@ def _render_home() -> None:
 @app.command("setup", help="Show first-run setup and current LABIT status.")
 def setup() -> None:
     _render_home()
+
+
+@app.command("web", help="Launch the read-only LABIT web dashboard.")
+def web(
+    port: int = typer.Option(8765, "--port", help="Local port for the dashboard."),
+    address: str = typer.Option("127.0.0.1", "--address", help="Bind address for the dashboard."),
+) -> None:
+    raise typer.Exit(launch_dashboard(port=port, address=address))
 
 
 @app.callback()

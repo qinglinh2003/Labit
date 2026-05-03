@@ -147,7 +147,7 @@ class ClaudeAdapter(AgentAdapter):
         )
 
     def _build_command(self, request: AgentRequest, *, stream: bool) -> list[str]:
-        cmd = ["claude", "-p", "--input-format", "text"]
+        cmd = ["claude", "-p", "--input-format", "text", "--effort", "max"]
 
         if request.system_prompt:
             cmd.extend(["--system-prompt", request.system_prompt])
