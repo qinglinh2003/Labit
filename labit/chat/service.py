@@ -30,9 +30,6 @@ from labit.context.condenser import ResearchRollingCondenser, SessionCondenser
 from labit.context.events import SessionEvent, SessionEventKind, WorkingMemorySnapshot
 from labit.context.maps import ContextMapBuilder
 from labit.context.store import SessionContextStore
-from labit.memory.retrievers import MemoryRetriever
-from labit.memory.service import MemoryService
-from labit.memory.store import MemoryStore
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
 
@@ -61,9 +58,6 @@ class ChatService:
         condenser: SessionCondenser | None = None,
         assembler: ContextAssembler | None = None,
         context_map_builder: ContextMapBuilder | None = None,
-        memory_store: MemoryStore | None = None,
-        memory_service: MemoryService | None = None,
-        memory_retriever: MemoryRetriever | None = None,
     ):
         self.paths = paths
         self.store = store or ChatStore(paths)
@@ -76,12 +70,6 @@ class ChatService:
             budget=TokenBudget(total_tokens=120000, reserve_tokens=20000)
         )
         self.context_map_builder = context_map_builder or ContextMapBuilder(paths)
-        self.memory_store = memory_store or MemoryStore(paths)
-        self.memory_service = memory_service or MemoryService(paths, store=self.memory_store)
-        if memory_retriever:
-            self.memory_retriever = memory_retriever
-        else:
-            self.memory_retriever = MemoryRetriever(self.memory_store)
 
     def open_session(
         self,
@@ -366,7 +354,6 @@ class ChatService:
             evidence_refs=evidence_refs or [],
         )
         self.session_context_store.append_event(event)
-        self._promote_event_to_memory(event)
         self._refresh_working_memory(session)
         self.store.write_context_snapshot(
             session.session_id,
@@ -377,31 +364,6 @@ class ChatService:
             ),
         )
         return event
-
-    def record_discussion_synthesis(
-        self,
-        *,
-        session_id: str,
-        summary: str,
-        consensus: list[str] | None = None,
-        disagreements: list[str] | None = None,
-        followups: list[str] | None = None,
-        evidence_refs: list[str] | None = None,
-        actor: str = "labit",
-    ) -> SessionEvent:
-        payload = {
-            "consensus": consensus or [],
-            "disagreements": disagreements or [],
-            "followups": followups or [],
-        }
-        return self.record_session_event(
-            session_id=session_id,
-            kind=SessionEventKind.DISCUSSION_SYNTHESIS,
-            actor=actor,
-            summary=summary,
-            payload=payload,
-            evidence_refs=evidence_refs or [],
-        )
 
     def _generate_reply(
         self,
@@ -609,24 +571,11 @@ Reply as `{participant.name}` only. Use plain text or markdown.
             evidence_refs=evidence_refs,
             allow_fallback=deep_memory,
         )
-        memory_query_text = self.context_map_builder.shape_memory_query(
-            base_query=base_query_text,
-            sections=map_sections,
-        )
-        retrieved_memories = []
-        if session.project:
-            retrieved_memories = self.memory_retriever.retrieve(
-                project=session.project,
-                query=memory_query_text,
-                evidence_refs=evidence_refs,
-                limit=12 if deep_memory else 6,
-            )
         assembled = self.assembler.assemble(
             task_header=task_header,
             bound_sections=bound_sections,
             recent_sections=recent_sections,
             working_memory=working_memory,
-            memories=retrieved_memories,
             map_sections=map_sections,
         )
         return assembled.render()
@@ -871,12 +820,6 @@ Reply as `{participant.name}` only. Use plain text or markdown.
         if len(text) <= max_chars:
             return text
         return f"{text[: max_chars - 1]}…"
-
-    def _promote_event_to_memory(self, event: SessionEvent) -> None:
-        try:
-            self.memory_service.promote_event(event)
-        except Exception:
-            return
 
     def _refresh_working_memory(self, session: ChatSession) -> None:
         events = self.session_context_store.load_events(session.session_id)

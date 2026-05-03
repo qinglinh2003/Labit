@@ -6,7 +6,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from labit.context.budget import TokenBudget, TokenBudgetDecision
 from labit.context.events import WorkingMemorySnapshot
-from labit.memory.models import MemoryRecord
 
 
 class ContextSection(BaseModel):
@@ -45,7 +44,6 @@ class ContextAssembler:
         bound_sections: list[ContextSection],
         recent_sections: list[ContextSection],
         working_memory: WorkingMemorySnapshot | None = None,
-        memories: list[MemoryRecord] | None = None,
         map_sections: list[ContextSection] | None = None,
     ) -> AssembledContext:
         sections: list[ContextSection] = [ContextSection(title="Task", content=task_header, source="task", priority=100)]
@@ -59,16 +57,6 @@ class ContextAssembler:
                     source="working_memory",
                     priority=70,
                     content=self._render_working_memory(working_memory),
-                )
-            )
-
-        for record in memories or []:
-            sections.append(
-                ContextSection(
-                    title=record.title,
-                    source=f"memory:{record.kind.value}",
-                    priority=50,
-                    content=record.summary,
                 )
             )
 

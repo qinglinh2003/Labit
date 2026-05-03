@@ -74,7 +74,6 @@ class ResearchRollingCondenser(SessionCondenser):
             if event.kind in {
                 SessionEventKind.ARTIFACT_DOCUMENT_CREATED,
                 SessionEventKind.ARTIFACT_DOCUMENT_UPDATED,
-                SessionEventKind.DISCUSSION_SYNTHESIS,
             }:
                 decisions.append(event.summary)
             if event.kind in {
@@ -93,12 +92,6 @@ class ResearchRollingCondenser(SessionCondenser):
                 followups.append(event.summary)
             if event.kind == SessionEventKind.ARTIFACT_TODO_CREATED:
                 open_questions.append(event.summary)
-            if event.kind == SessionEventKind.DISCUSSION_SYNTHESIS:
-                payload = event.payload if isinstance(event.payload, dict) else {}
-                consensus.extend(self._coerce_list(payload.get("consensus")))
-                disagreements.extend(self._coerce_list(payload.get("disagreements")))
-                followups.extend(self._coerce_list(payload.get("followups")))
-
         discussion = snapshot.discussion_state.model_copy(
             update={
                 "consensus": (consensus or decisions)[-3:],

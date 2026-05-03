@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import shutil
-import subprocess
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 import yaml
 from pydantic import ValidationError
 
-from labit.models import ProjectDraft, ProjectSeed, ProjectSpec, ProjectSummary, SemanticBrief
+from labit.models import ProjectSpec, ProjectSummary
 from labit.paths import RepoPaths
 
 
@@ -53,27 +52,6 @@ class ProjectService:
             raise ValueError(
                 f"Project '{resolved}' uses an outdated config format. Recreate it under the new project-profile schema.\n{exc}"
             ) from exc
-
-    def load_project_seed(self, seed_path: Path) -> ProjectSeed:
-        raw = yaml.safe_load(seed_path.read_text()) or {}
-        return ProjectSeed.model_validate(raw)
-
-    def load_semantic_brief(self, brief_path: Path) -> SemanticBrief:
-        raw = yaml.safe_load(brief_path.read_text()) or {}
-        return SemanticBrief.model_validate(raw)
-
-    def load_project_spec(self, spec_path: Path) -> ProjectSpec:
-        raw = yaml.safe_load(spec_path.read_text()) or {}
-        return ProjectSpec.model_validate(raw)
-
-    def build_project_draft(self, brief: SemanticBrief) -> ProjectDraft:
-        return ProjectDraft.scaffold_from_brief(brief)
-
-    def compose_project_spec(self, seed: ProjectSeed, draft: ProjectDraft) -> ProjectSpec:
-        return ProjectSpec.from_seed_and_draft(seed, draft)
-
-    def project_exists(self, name: str) -> bool:
-        return self.resolve_project_name(name) is not None
 
     def ensure_project_dirs(self, name: str) -> Path:
         base = self.paths.vault_projects_dir / name
@@ -162,47 +140,6 @@ class ProjectService:
             except ValueError:
                 continue
         return summaries
-
-    def planned_create_actions(self, spec: ProjectSpec, *, set_active: bool = False) -> list[str]:
-        actions = [
-            f"write config: {self.paths.project_configs_dir / f'{spec.name}.yaml'}",
-            f"create project overlay: {self.paths.vault_projects_dir / spec.name}",
-        ]
-        for subdir in PROJECT_SUBDIRS:
-            actions.append(f"ensure dir: {self.paths.vault_projects_dir / spec.name / subdir}")
-        if set_active:
-            actions.append(f"set active project: {spec.name}")
-        return actions
-
-    def planned_clone_action(self, spec: ProjectSpec) -> str | None:
-        if not spec.repo:
-            return None
-        return f"git clone {spec.repo} {self.project_code_dir(spec.name)}"
-
-    def clone_project_code(self, name: str) -> dict:
-        spec = self.load_project(name)
-        if not spec.repo:
-            raise ValueError(f"Project '{spec.name}' does not declare a repository URL.")
-
-        target_dir = self.project_code_dir(spec.name)
-        target_dir.parent.mkdir(parents=True, exist_ok=True)
-        if target_dir.exists() and any(target_dir.iterdir()):
-            raise FileExistsError(
-                f"Code directory already exists and is not empty: {target_dir}"
-            )
-
-        cmd = ["git", "clone", spec.repo, str(target_dir)]
-        try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as exc:
-            detail = (exc.stderr or exc.stdout or str(exc)).strip()
-            raise RuntimeError(f"git clone failed: {detail}") from exc
-
-        return {
-            "name": spec.name,
-            "repo": spec.repo,
-            "target_dir": str(target_dir),
-        }
 
     def _atomic_write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

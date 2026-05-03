@@ -15,7 +15,6 @@ class SessionEventKind(str, Enum):
     ARTIFACT_TODO_CREATED = "artifact.todo_created"
     ARTIFACT_DOCUMENT_CREATED = "artifact.document_created"
     ARTIFACT_DOCUMENT_UPDATED = "artifact.document_updated"
-    DISCUSSION_SYNTHESIS = "discussion.synthesis"
 
 
 class SessionEvent(BaseModel):

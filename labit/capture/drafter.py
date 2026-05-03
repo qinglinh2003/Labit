@@ -57,7 +57,7 @@ class IdeaDrafter:
 
 Return JSON only. Do not add markdown fences or commentary.
 
-This is for an idea that is not yet a formal hypothesis. Be concise and faithful to the conversation. Prefer one clear idea over a broad brainstorm.
+This is for a lightweight idea note. Be concise and faithful to the conversation. Prefer one clear idea over a broad brainstorm.
 
 Return:
 - `title`: short and specific

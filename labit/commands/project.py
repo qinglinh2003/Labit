@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Callable, TypeVar
 
 import typer
@@ -13,7 +12,7 @@ from labit.models import ProjectSpec
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
 
-project_app = typer.Typer(help="Manage project state and project specs.")
+project_app = typer.Typer(help="Manage local projects.")
 console = Console()
 T = TypeVar("T")
 
@@ -160,48 +159,18 @@ def new_project(json_output: bool = typer.Option(False, "--json", help="Emit JSO
         raise typer.Exit(code=1)
 
     set_active = typer.confirm("Set as active project?", default=True)
-    clone = bool(project_spec.repo) and typer.confirm("Clone project code now?", default=True)
-    total_steps = 2 if clone else 1
-
     try:
         created = _run_step(
             "Creating project files",
             step=1,
-            total=total_steps,
+            total=1,
             as_json=json_output,
             fn=lambda: service.save_project(project_spec, set_active=set_active),
         )
     except (FileExistsError, FileNotFoundError) as exc:
         raise typer.Exit(code=_fail(str(exc), as_json=json_output))
 
-    cloned = None
-    if clone:
-        try:
-            cloned = _run_step(
-                "Cloning repository (this may take a moment)",
-                step=2,
-                total=total_steps,
-                as_json=json_output,
-                fn=lambda: service.clone_project_code(project_spec.name),
-            )
-        except (FileNotFoundError, FileExistsError, ValueError, RuntimeError) as exc:
-            payload = {"initialized": False, "created": created, "clone_requested": True, "error": str(exc)}
-            if json_output:
-                _emit(payload, as_json=True)
-            else:
-                _print_kv_summary(
-                    "Project created, but clone failed",
-                    [
-                        ("Name", created["name"]),
-                        ("Config", created["config_path"]),
-                        ("Workspace", created["project_dir"]),
-                        ("Clone error", str(exc)),
-                        ("Retry", f"labit project clone-code {created['name']}"),
-                    ],
-                )
-            raise typer.Exit(code=1)
-
-    payload = {"initialized": True, "created": created, "clone_requested": clone, "cloned": cloned}
+    payload = {"initialized": True, "created": created}
     if json_output:
         _emit(payload, as_json=True)
         return
@@ -213,9 +182,6 @@ def new_project(json_output: bool = typer.Option(False, "--json", help="Emit JSO
     ]
     if set_active:
         rows.append(("Active project", created["name"]))
-    if cloned:
-        rows.append(("Repo", cloned["repo"]))
-        rows.append(("Code dir", cloned["target_dir"]))
     rows.append(("Next", f"labit project show {created['name']}"))
     _print_kv_summary("Project ready", rows)
 
@@ -417,240 +383,9 @@ def delete_project(
     _print_kv_summary("Project deleted", rows)
 
 
-@project_app.command("validate", help="Validate a spec YAML.")
-def validate_project(
-    spec: Path = typer.Option(..., exists=True, dir_okay=False, readable=True, help="Path to a project spec YAML."),
-    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
-) -> None:
-    service = _service()
-    try:
-        project_spec = service.load_project_spec(spec)
-    except ValidationError as exc:
-        raise typer.Exit(code=_fail(str(exc), as_json=json_output))
-
-    payload = {"valid": True, "spec_path": str(spec.resolve()), "project": project_spec.model_dump(mode="json", exclude_none=True)}
-    if json_output:
-        _emit(payload, as_json=True)
-        return
-
-    console.print(f"[bold green]Valid project spec[/bold green]: {project_spec.name}")
-    console.print(f"Spec: {spec.resolve()}")
-
-
-@project_app.command("draft", help="Draft a spec YAML from seed + brief.")
-def draft_project(
-    seed: Path = typer.Option(..., exists=True, dir_okay=False, readable=True, help="Path to a ProjectSeed YAML."),
-    brief: Path = typer.Option(..., exists=True, dir_okay=False, readable=True, help="Path to a SemanticBrief YAML."),
-    output: Path | None = typer.Option(None, "--output", help="Optional output path for the generated draft spec YAML."),
-    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
-) -> None:
-    service = _service()
-    try:
-        project_seed = service.load_project_seed(seed)
-        semantic_brief = service.load_semantic_brief(brief)
-        project_draft = service.build_project_draft(semantic_brief)
-        project_spec = service.compose_project_spec(project_seed, project_draft)
-    except ValidationError as exc:
-        raise typer.Exit(code=_fail(str(exc), as_json=json_output))
-
-    payload = {
-        "seed": project_seed.model_dump(mode="json", exclude_none=True),
-        "brief": semantic_brief.model_dump(mode="json", exclude_none=True),
-        "draft": project_draft.model_dump(mode="json", exclude_none=True),
-        "spec": project_spec.model_dump(mode="json", exclude_none=True),
-    }
-
-    if output is not None:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(json_to_yaml(payload["spec"]))
-        payload["output"] = str(output.resolve())
-
-    if json_output:
-        _emit(payload, as_json=True)
-        return
-
-    console.print(f"[bold green]Drafted project spec[/bold green]: {project_spec.name}")
-    console.print(f"Description: {project_draft.description}")
-    if output is not None:
-        console.print(f"Wrote spec draft: {output.resolve()}")
-
-
-@project_app.command("create", help="Create a project from spec YAML.")
-def create_project(
-    spec: Path = typer.Option(..., exists=True, dir_okay=False, readable=True, help="Path to a project spec YAML."),
-    set_active: bool = typer.Option(False, "--set-active", help="Set the new project as active."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Show planned actions without writing files."),
-    force: bool = typer.Option(False, "--force", help="Overwrite an existing project config."),
-    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
-) -> None:
-    service = _service()
-    try:
-        project_spec = service.load_project_spec(spec)
-    except ValidationError as exc:
-        raise typer.Exit(code=_fail(str(exc), as_json=json_output))
-
-    actions = service.planned_create_actions(project_spec, set_active=set_active)
-    if dry_run:
-        payload = {"dry_run": True, "project": project_spec.model_dump(mode="json", exclude_none=True), "actions": actions}
-        if json_output:
-            _emit(payload, as_json=True)
-            return
-        console.print(f"[bold]Dry run for {project_spec.name}[/bold]")
-        for action in actions:
-            console.print(f"- {action}")
-        return
-
-    try:
-        result = _run_step("Creating project files", step=1, total=1, as_json=json_output, fn=lambda: service.save_project(project_spec, force=force, set_active=set_active))
-    except (FileExistsError, FileNotFoundError) as exc:
-        raise typer.Exit(code=_fail(str(exc), as_json=json_output))
-
-    payload = {"created": True, "project": result, "actions": actions}
-    if json_output:
-        _emit(payload, as_json=True)
-        return
-
-    rows = [
-        ("Name", result["name"]),
-        ("Config", result["config_path"]),
-        ("Workspace", result["project_dir"]),
-    ]
-    if set_active:
-        rows.append(("Active project", result["name"]))
-    rows.append(("Next", f"labit project show {result['name']}"))
-    _print_kv_summary("Project ready", rows)
-
-
-@project_app.command("clone-code", help="Clone a project's code repo.")
-def clone_code(
-    name: str | None = typer.Argument(None, help="Project name. Defaults to the active project."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Show the clone action without executing it."),
-    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
-) -> None:
-    service = _service()
-    if name and (name.startswith(("git@", "https://", "http://", "ssh://")) or "/" in name):
-        raise typer.Exit(code=_fail("clone-code expects a project name, not a repository URL or path.", as_json=json_output))
-
-    project_name = name or service.active_project_name()
-    if project_name is None:
-        raise typer.Exit(code=_fail("No active project. Pass a name or create a project first.", as_json=json_output))
-
-    try:
-        spec = service.load_project(project_name)
-    except FileNotFoundError as exc:
-        raise typer.Exit(code=_fail(str(exc), as_json=json_output))
-
-    action = service.planned_clone_action(spec)
-    if action is None:
-        raise typer.Exit(code=_fail(f"Project '{spec.name}' does not declare a repository URL.", as_json=json_output))
-
-    if dry_run:
-        payload = {"dry_run": True, "project": spec.name, "repo": spec.repo, "target_dir": str(service.project_code_dir(spec.name)), "actions": [action]}
-        if json_output:
-            _emit(payload, as_json=True)
-            return
-        console.print(f"[bold]Dry run for {spec.name}[/bold]")
-        console.print(f"- {action}")
-        return
-
-    try:
-        result = _run_step("Cloning repository (this may take a moment)", step=1, total=1, as_json=json_output, fn=lambda: service.clone_project_code(spec.name))
-    except (FileNotFoundError, FileExistsError, ValueError, RuntimeError) as exc:
-        raise typer.Exit(code=_fail(str(exc), as_json=json_output))
-
-    payload = {"cloned": True, "project": result}
-    if json_output:
-        _emit(payload, as_json=True)
-        return
-
-    _print_kv_summary("Project code ready", [("Project", result["name"]), ("Repo", result["repo"]), ("Code dir", result["target_dir"]), ("Next", f"labit project show {result['name']}")])
-
-
-@project_app.command("init", help="Create from spec YAML + clone repo.")
-def init_project(
-    spec: Path = typer.Option(..., exists=True, dir_okay=False, readable=True, help="Path to a project spec YAML."),
-    set_active: bool = typer.Option(False, "--set-active", help="Set the new project as active."),
-    clone: bool = typer.Option(True, "--clone/--no-clone", help="Clone the configured repo after project creation when a repo is declared."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Show planned actions without writing files."),
-    force: bool = typer.Option(False, "--force", help="Overwrite an existing project config."),
-    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
-) -> None:
-    service = _service()
-    try:
-        project_spec = service.load_project_spec(spec)
-    except ValidationError as exc:
-        raise typer.Exit(code=_fail(str(exc), as_json=json_output))
-
-    actions = service.planned_create_actions(project_spec, set_active=set_active)
-    clone_action = service.planned_clone_action(project_spec) if clone else None
-    if clone_action:
-        actions.append(clone_action)
-
-    if dry_run:
-        payload = {"dry_run": True, "project": project_spec.model_dump(mode="json", exclude_none=True), "actions": actions}
-        if json_output:
-            _emit(payload, as_json=True)
-            return
-        console.print(f"[bold]Init dry run for {project_spec.name}[/bold]")
-        for action in actions:
-            console.print(f"- {action}")
-        return
-
-    total_steps = 2 if clone_action else 1
-    try:
-        created = _run_step("Creating project files", step=1, total=total_steps, as_json=json_output, fn=lambda: service.save_project(project_spec, force=force, set_active=set_active))
-    except (FileExistsError, FileNotFoundError) as exc:
-        raise typer.Exit(code=_fail(str(exc), as_json=json_output))
-
-    cloned = None
-    if clone_action:
-        try:
-            cloned = _run_step("Cloning repository (this may take a moment)", step=2, total=total_steps, as_json=json_output, fn=lambda: service.clone_project_code(project_spec.name))
-        except (FileNotFoundError, FileExistsError, ValueError, RuntimeError) as exc:
-            payload = {"initialized": False, "created": created, "clone_requested": True, "error": str(exc)}
-            if json_output:
-                _emit(payload, as_json=True)
-            else:
-                _print_kv_summary(
-                    "Project created, but clone failed",
-                    [
-                        ("Name", created["name"]),
-                        ("Config", created["config_path"]),
-                        ("Workspace", created["project_dir"]),
-                        ("Clone error", str(exc)),
-                        ("Retry", f"labit project clone-code {created['name']}"),
-                    ],
-                )
-            raise typer.Exit(code=1)
-
-    payload = {"initialized": True, "created": created, "clone_requested": bool(clone_action), "cloned": cloned, "actions": actions}
-    if json_output:
-        _emit(payload, as_json=True)
-        return
-
-    rows = [
-        ("Name", created["name"]),
-        ("Config", created["config_path"]),
-        ("Workspace", created["project_dir"]),
-    ]
-    if set_active:
-        rows.append(("Active project", created["name"]))
-    if cloned:
-        rows.append(("Repo", cloned["repo"]))
-        rows.append(("Code dir", cloned["target_dir"]))
-    rows.append(("Next", f"labit project show {created['name']}"))
-    _print_kv_summary("Project ready", rows)
-
-
 def _fail(message: str, *, as_json: bool) -> int:
     if as_json:
         _emit({"error": message}, as_json=True)
     else:
         console.print(f"[bold red]Error:[/bold red] {message}")
     return 1
-
-
-def json_to_yaml(data: object) -> str:
-    import yaml
-
-    return yaml.safe_dump(data, sort_keys=False, allow_unicode=True)

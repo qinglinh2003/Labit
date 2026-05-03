@@ -55,21 +55,6 @@ class ContextMapBuilder:
             return True
         return bool(self._tokenize(query))
 
-    def shape_memory_query(self, *, base_query: str, sections: list[ContextSection], max_chars: int = 4000) -> str:
-        parts: list[str] = []
-        if base_query.strip():
-            parts.append(base_query.strip())
-
-        for section in sections:
-            parts.append(f"[{section.title}]")
-            lines = [line.strip() for line in section.content.splitlines() if line.strip()]
-            parts.extend(lines[:8])
-
-        shaped = "\n".join(parts).strip()
-        if len(shaped) <= max_chars:
-            return shaped
-        return f"{shaped[: max_chars - 1].rstrip()}…"
-
     def _build_code_section(self, *, project: str, query: str, allow_fallback: bool) -> ContextSection | None:
         snapshot = self.code_map_builder.build_snapshot(project)
         if snapshot is None:
