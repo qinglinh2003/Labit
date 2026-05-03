@@ -8,20 +8,66 @@ from datetime import datetime
 from pathlib import Path
 
 import typer
-from rich.console import Console, Group, RenderableType
+from rich.console import Console, Group
 from rich.live import Live
 from rich.pretty import Pretty
-from labit.rendering import LaTeXMarkdown as Markdown
 from rich.panel import Panel
 from rich.prompt import Prompt
-from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
-from rich.theme import Theme
 
-from labit.automation import AutoActor, AutoIterationEngine
 from labit.capture.drafter import IdeaDrafter
 from labit.capture.service import CaptureService
+from labit.commands.auto import handle_auto_command
+from labit.commands.rendering import (
+    CHAT_SHELL_COMMANDS,
+    COMMAND_COLOR,
+    CODE_THEME,
+    LABIT_THEME,
+    PROVIDER_STYLES,
+    ThinkingIndicator,
+    agent_panel,
+    box_bottom,
+    box_line,
+    box_top,
+    box_width,
+    clip_box_text,
+    debrief_markdown,
+    launch_markdown,
+    md,
+    message_body,
+    print_doc_mode_hints,
+    print_hypothesis_mode_hints,
+    print_launch_exp_hints,
+    render_capture_records,
+    render_compact_transcript,
+    render_console_header,
+    render_dev_decision,
+    render_dev_status,
+    render_doc_status,
+    render_experiment_launch_preview,
+    render_hypothesis_preview,
+    render_idea_preview,
+    render_investigation_result,
+    render_launch_exp_status,
+    render_memory_detail,
+    render_memory_records,
+    render_message_block,
+    render_recent_messages,
+    render_related_reports,
+    render_review_suggestion,
+    render_session_summary,
+    render_shell_header,
+    render_shell_help,
+    render_synthesis_preview,
+    render_task_breakdown,
+    render_task_detail,
+    render_transcript,
+    render_user_shell_message,
+    review_markdown,
+    sanitize_markdown,
+    transcript_preview_text,
+)
 from labit.chat.clipboard import ClipboardImageError, capture_clipboard_image
 from labit.chat.composer import ComposerResult, prompt_toolkit_available, prompt_with_clipboard_image
 from labit.chat.models import ChatMode
@@ -56,111 +102,15 @@ from labit.memory.store import MemoryStore
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
 
-import subprocess
 from dataclasses import dataclass, field
-from pathlib import Path
+import subprocess
 
 chat_app = typer.Typer(
     help="Shared free conversation sessions with one or more agent backends.",
     invoke_without_command=True,
 )
-_LABIT_THEME = Theme(
-    {
-        # ── Headers ──────────────────────────────────────────────
-        "markdown.h1": "bold bright_cyan",
-        "markdown.h1.border": "bright_cyan",
-        "markdown.h2": "bold bright_white underline",
-        "markdown.h3": "bold dodger_blue2",
-        "markdown.h4": "bold grey70",
-        "markdown.h5": "grey70 underline",
-        "markdown.h6": "dim italic",
-        # ── Inline ───────────────────────────────────────────────
-        "markdown.strong": "bold #0080ff",
-        "markdown.em": "italic dim",
-        "markdown.emph": "italic dim",
-        "markdown.s": "dim strike",
-        # ── Code ─────────────────────────────────────────────────
-        "markdown.code": "bold cyan",
-        "markdown.code_block": "",
-        # ── Blocks ───────────────────────────────────────────────
-        "markdown.block_quote": "dim",
-        "markdown.hr": "dim cyan",
-        # ── Lists ────────────────────────────────────────────────
-        "markdown.item.bullet": "bright_cyan",
-        "markdown.item.number": "bright_cyan",
-        # ── Links ────────────────────────────────────────────────
-        "markdown.link": "bright_blue underline",
-        "markdown.link_url": "dim blue",
-    }
-)
 
-_CODE_THEME = "default"
-
-console = Console(theme=_LABIT_THEME)
-_COMMAND_COLOR = "#0080ff"
-_ACCENT_COLOR = "#a0a000"
-
-_PROVIDER_STYLES = {
-    "claude": ("blue", "CLAUDE"),
-    "codex": ("green", "CODEX"),
-}
-
-_CHAT_SHELL_COMMANDS = (
-    "/help",
-    "/list",
-    "/show",
-    "/mode",
-    "/memory",
-    "/paste-image",
-    "/image",
-    "/think",
-    "/think-long-term",
-    "/think-ltm",
-    "/long-term-memory",
-    "/ltm",
-    "/synthesize",
-    "/investigate",
-    "/idea",
-    "/note",
-    "/todo",
-    "/doc",
-    "/doc auto",
-    "/doc start",
-    "/doc open",
-    "/doc done",
-    "/doc status",
-    "/doc publish",
-    "/doc list",
-    "/hypothesis",
-    "/launch-exp",
-    "/swap",
-    "/mute",
-    "/launch-exp resume",
-    "/launch-exp approve-tasks",
-    "/launch-exp approve-task",
-    "/launch-exp reopen-task",
-    "/launch-exp generate-script",
-    "/launch-exp run-task",
-    "/launch-exp status",
-    "/launch-exp done",
-    "/auto",
-    "/auto start",
-    "/auto run",
-    "/auto log",
-    "/auto status",
-    "/auto stop",
-    "/debrief",
-    "/review-results",
-    "/dev",
-    "/dev start",
-    "/dev status",
-    "/dev continue",
-    "/dev stop",
-    "/dev finish",
-    "/new",
-    "/switch",
-    "/exit",
-)
+console = Console(theme=LABIT_THEME)
 
 
 def _chat_service() -> ChatService:
@@ -185,10 +135,6 @@ def _capture_service() -> CaptureService:
 
 def _experiment_service() -> ExperimentService:
     return ExperimentService(RepoPaths.discover())
-
-
-def _auto_engine() -> AutoIterationEngine:
-    return AutoIterationEngine(RepoPaths.discover())
 
 
 def _idea_drafter() -> IdeaDrafter:
@@ -256,326 +202,46 @@ def _prompt_mode() -> ChatMode:
         console.print(f"[bold red]Choose one of:[/bold red] {', '.join(choices)}")
 
 
-def _render_session_summary(session) -> None:
-    participants = "\n".join(f"- {item.name} ({item.provider.value})" for item in session.participants)
-    body = (
-        f"[bold]Session ID[/bold]: {session.session_id}\n"
-        f"[bold]Mode[/bold]: {session.mode.value}\n"
-        f"[bold]Project[/bold]: {session.project or '(none)'}\n"
-        f"[bold]Status[/bold]: {session.status.value}\n"
-        f"[bold]Participants[/bold]:\n{participants}"
-    )
-    console.print(Panel(body, title=f"[bold green]{session.title}[/bold green]", border_style="green"))
-
-
-def _render_transcript(messages) -> None:
-    if not messages:
-        console.print("[dim]No messages yet.[/dim]")
-        return
-    for message in messages:
-        _render_message_block(message)
-
-
-def _render_compact_transcript(messages) -> None:
-    if not messages:
-        console.print("[dim]No messages yet.[/dim]")
-        return
-    for message in messages:
-        if message.message_type.value == "user":
-            console.print(Panel.fit(_message_body(message), title=f"user · turn {message.turn_index}", border_style="white"))
-            continue
-        provider_name = message.provider.value if message.provider else "agent"
-        color, label = _PROVIDER_STYLES.get(provider_name, ("cyan", provider_name.upper()))
-        title = f"{label} · {message.speaker} · turn {message.turn_index}"
-        console.print(Panel.fit(message.content, title=title, border_style=color))
-
-
-def _render_message_block(message) -> None:
-    if message.message_type.value == "user":
-        console.print(Panel(_message_body(message), title=f"user · turn {message.turn_index}", border_style="white"))
-        console.print("")
-        return
-
-    console.print(
-        _agent_panel(
-            message.speaker,
-            message.provider.value if message.provider else "agent",
-            message.content,
-            turn_index=message.turn_index,
-        )
-    )
-    console.print("")
-
-
-class _ThinkingIndicator:
-    """Animated spinner with elapsed time for the generating placeholder."""
-
-    def __init__(self) -> None:
-        self._start = time.monotonic()
-        self._spinner = Spinner("dots", style="dim")
-
-    def __rich_console__(self, console: Console, options: object):  # noqa: ANN001
-        elapsed = time.monotonic() - self._start
-        # Build a single-line Text: spinner frame + label
-        text = self._spinner.render(time.monotonic())
-        text.append(f" Thinking… {elapsed:.1f}s", style="dim")
-        yield text
-
-
-_FENCE_INLINE_RE = re.compile(r"(`{3,})(.+)$", re.MULTILINE)
-
-
-def _sanitize_markdown(text: str) -> str:
-    """Fix common AI markdown issues that break the Rich parser.
-
-    1. Closing ``` stuck on the end of a code line → move to its own line.
-    2. Ensure fenced code blocks are always properly closed.
-    """
-    # Fix closing ``` appended to the end of a code line, e.g.:
-    #   python train.py --config foo.yaml```
-    # becomes:
-    #   python train.py --config foo.yaml
-    #   ```
-    in_fence = False
-    lines = text.split("\n")
-    result: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if not in_fence:
-            # Opening fence: ```python or just ```
-            if stripped.startswith("```"):
-                in_fence = True
-                result.append(line)
-                # If line is both opening and closing on same line like ```code```
-                # count backticks
-                if stripped.count("```") >= 2 and len(stripped) > 3:
-                    in_fence = False
-            else:
-                result.append(line)
-        else:
-            # Inside a fence — check if line ends with ``` (closing stuck to content)
-            if stripped == "```":
-                in_fence = False
-                result.append(line)
-            elif stripped.endswith("```") and not stripped.startswith("```"):
-                # e.g. "python train.py```" → split into two lines
-                result.append(line[: line.rfind("```")])
-                result.append("```")
-                in_fence = False
-            else:
-                result.append(line)
-    # If still in an unclosed fence, close it
-    if in_fence:
-        result.append("```")
-    return "\n".join(result)
-
-
-def _md(content: str, *, sanitize: bool = True) -> Markdown:
-    """Create a themed Markdown renderable."""
-    text = _sanitize_markdown(content) if sanitize else content
-    return Markdown(text, code_theme=_CODE_THEME)
-
-
-def _agent_panel(
-    speaker: str,
-    provider_name: str,
-    content: str,
-    *,
-    turn_index: int | None = None,
-    thinking: _ThinkingIndicator | None = None,
-    status_text: str | None = None,
-) -> Panel:
-    color, label = _PROVIDER_STYLES.get(provider_name, ("cyan", provider_name.upper()))
-    title = f"{label} · {speaker}"
-    if turn_index is not None:
-        title = f"{title} · turn {turn_index}"
-    if status_text:
-        title = f"{title} · {status_text}"
-    body: RenderableType = _md(content) if content.strip() else (thinking or _ThinkingIndicator())
-    return Panel(body, title=title, border_style=color)
-
-
-def _render_user_shell_message(content: str, *, attachments: list | None = None) -> None:
-    if attachments:
-        body = _message_body(type("ShellMessage", (), {"content": content, "attachments": attachments})())
-    else:
-        body = content
-    console.print(Panel(body, title="user", border_style="white"))
-    console.print("")
-
-
-def _render_recent_messages(messages, *, count: int = 8) -> None:
-    console.print(Panel.fit(_transcript_preview_text(messages[-count:]), title="Recent Messages", border_style="blue"))
-
-
-def _transcript_preview_text(messages) -> Text:
-    if not messages:
-        return Text("No messages yet.", style="dim")
-    text = Text()
-    for idx, message in enumerate(messages):
-        if idx:
-            text.append("\n")
-        if message.message_type.value == "user":
-            text.append("user", style="bold white on blue")
-        else:
-            text.append(message.speaker, style="bold cyan")
-            if message.provider:
-                text.append(f" ({message.provider.value})", style="dim")
-        text.append(": ")
-        text.append(message.content)
-        if getattr(message, "attachments", None):
-            text.append(f" [{len(message.attachments)} attachment", style="dim")
-            if len(message.attachments) != 1:
-                text.append("s", style="dim")
-            text.append("]", style="dim")
-    return text
-
-
-def _message_body(message) -> str:
-    body = message.content
-    attachments = getattr(message, "attachments", None) or []
-    if not attachments:
-        return body
-    lines = [body, "", "Attachments:"]
-    for attachment in attachments:
-        label = attachment.label or attachment.path.rsplit("/", 1)[-1]
-        lines.append(f"- {attachment.kind.value}: {label}")
-    return "\n".join(lines).strip()
-
-
-def _render_shell_header(session) -> None:
-    mode_label = {
-        ChatMode.SINGLE: "Single agent",
-        ChatMode.ROUND_ROBIN: "Round robin",
-        ChatMode.PARALLEL: "Parallel replies",
-    }[session.mode]
-    participants = ", ".join(f"{item.name}:{item.provider.value}" for item in session.participants)
-    body = (
-        f"[bold]Project[/bold]: {session.project or '(none)'}\n"
-        f"[bold]Mode[/bold]: {mode_label}\n"
-        f"[bold]Participants[/bold]: {participants}\n"
-        f"[bold]Session ID[/bold]: {session.session_id}\n"
-        "[dim]Type a message to continue. Use /help to see shell commands.[/dim]"
-    )
-    console.print(Panel(body, title=f"[bold green]LABIT Chat · {session.title}[/bold green]", border_style="green"))
-
-
-def _box_width() -> int:
-    width = console.size.width if console.size.width else 80
-    return max(60, width - 4)
-
-
-def _clip_box_text(text: str, width: int) -> str:
-    text = text.strip()
-    if len(text) <= width:
-        return text
-    if width <= 1:
-        return text[:width]
-    return f"{text[: width - 1]}…"
-
-
-def _box_top(title: str, width: int) -> str:
-    inner_width = width - 2
-    title_text = f" {title} "
-    if len(title_text) >= inner_width:
-        return f"╭{title_text[:inner_width]}╮"
-    filler = "─" * (inner_width - len(title_text))
-    return f"╭{title_text}{filler}╮"
-
-
-def _box_line(text: str, width: int) -> str:
-    inner_width = width - 2
-    content = _clip_box_text(text, inner_width)
-    return f"│{content.ljust(inner_width)}│"
-
-
-def _box_bottom(width: int) -> str:
-    return f"╰{'─' * (width - 2)}╯"
-
-
-def _command_chip(label: str) -> str:
-    return f"[bold {_COMMAND_COLOR}]{label}[/bold {_COMMAND_COLOR}]"
-
-
-def _render_console_header(*, project: str, mode: str, participants: str) -> None:
-    console.print(f"[dim]{project} · {mode} · {participants}[/dim]")
-    console.print(
-        "Shortcuts: "
-        + " · ".join(
-            [
-                _command_chip("/help"),
-                _command_chip("/think"),
-                _command_chip("/think-ltm"),
-                _command_chip("/ltm"),
-                _command_chip("/image"),
-                _command_chip("/exit"),
-            ]
-        )
-    )
-    console.print(
-        "Research: "
-        + " · ".join(
-            [
-                _command_chip("/memory"),
-                _command_chip("/idea"),
-                _command_chip("/todo"),
-                _command_chip("/doc"),
-                _command_chip("/investigate"),
-                _command_chip("/hypothesis"),
-            ]
-        )
-    )
-    console.print(
-        "Multi-agent: "
-        + " · ".join(
-            [
-                _command_chip("/mode"),
-                _command_chip("/swap"),
-                _command_chip("/mute"),
-                _command_chip("/dev"),
-            ]
-        )
-    )
 
 
 def _prompt_in_box(session) -> ComposerResult:
-    width = _box_width()
+    width = box_width(console)
     inner_width = width - 2
     project = session.project or "no-project"
     mode = session.mode.value
     participants = ", ".join(f"{item.name}:{item.provider.value}" for item in session.participants)
     prompt_prefix = " › "
     if not console.is_terminal:
-        _render_console_header(project=project, mode=mode, participants=participants)
-        console.print(f"[yellow]{_box_top('Input', width)}[/yellow]")
-        console.print(f"[yellow]{_box_line('', width)}[/yellow]")
+        render_console_header(console, project=project, mode=mode, participants=participants)
+        console.print(f"[yellow]{box_top('Input', width)}[/yellow]")
+        console.print(f"[yellow]{box_line('', width)}[/yellow]")
         console.print(f"[yellow]│[/yellow]{prompt_prefix}", end="")
         raw = console.input("")
-        console.print(f"[yellow]{_box_line('', width)}[/yellow]")
-        console.print(f"[yellow]{_box_bottom(width)}[/yellow]")
+        console.print(f"[yellow]{box_line('', width)}[/yellow]")
+        console.print(f"[yellow]{box_bottom(width)}[/yellow]")
         return ComposerResult(text=raw)
 
     if prompt_toolkit_available():
-        _render_console_header(project=project, mode=mode, participants=participants)
+        render_console_header(console, project=project, mode=mode, participants=participants)
         return prompt_with_clipboard_image(
             console=console,
             paths=RepoPaths.discover(),
             session_id=session.session_id,
             prompt_prefix=prompt_prefix,
-            slash_commands=_CHAT_SHELL_COMMANDS,
+            slash_commands=CHAT_SHELL_COMMANDS,
         )
 
-    top = _box_top("Input", width)
-    empty = _box_line("", width)
+    top = box_top("Input", width)
+    empty = box_line("", width)
     prompt_fill = " " * max(0, inner_width - len(prompt_prefix))
     prompt_line = f"│{prompt_prefix}{prompt_fill}│"
-    bottom = _box_bottom(width)
+    bottom = box_bottom(width)
 
     stream = console.file
     yellow = "\x1b[33m"
     reset = "\x1b[0m"
 
-    _render_console_header(project=project, mode=mode, participants=participants)
+    render_console_header(console, project=project, mode=mode, participants=participants)
     stream.write(f"{yellow}{top}{reset}\n")
     stream.write(f"{yellow}{empty}{reset}\n")
     stream.write(f"{yellow}{prompt_line}{reset}\n")
@@ -618,62 +284,6 @@ def _open_default_session(
     return session, True
 
 
-def _shell_help() -> None:
-    table = Table(show_header=True, header_style=f"bold {_COMMAND_COLOR}")
-    table.add_column("Command", style=f"bold {_COMMAND_COLOR}")
-    table.add_column("What It Does")
-    table.add_row("/help", "Show shell commands.")
-    table.add_row("/list", "List existing chat sessions.")
-    table.add_row("/new", "Create a new session and switch into it.")
-    table.add_row("/switch <session_id>", "Switch to another session.")
-    table.add_row("/show", "Show the full transcript for the current session.")
-    table.add_row("/mode [mode]", "Show or switch mode (single, round_robin, parallel).")
-    table.add_row("/swap", "Swap the response order of participants (e.g. claude,codex → codex,claude).")
-    table.add_row("/mute <name>", "Mute an agent for the next turn only. Toggle: run again to unmute.")
-    table.add_row("/memory [id|kind]", "Show recent project memory, one memory by id, or filter by memory kind.")
-    table.add_row("/think <question>", "Ask the next turn with the highest reasoning effort, while keeping the normal chat context shape.")
-    table.add_row("/long-term-memory <question>", "Run a deep long-term memory search for this turn, then answer from the richer retrieved context.")
-    table.add_row("/think-long-term <question>", "Run the next turn with both deep long-term memory search and the highest reasoning effort.")
-    table.add_row("/paste-image [question]", "Read one image from the system clipboard, save it under .labit/, and send it as this turn's image input.")
-    table.add_row("/idea [text]", "Save a lightweight project idea. With no text, show saved ideas.")
-    table.add_row("/note [text]", "Save a lightweight project note. With no text, show saved notes.")
-    table.add_row("/todo [text]", "Save an actionable project todo. With no text, show saved todos.")
-    table.add_row("/doc start <title>", "Enter document mode and write a design doc to docs/designs/.")
-    table.add_row("/doc open <doc_id>", "Re-open an existing document for editing.")
-    table.add_row("/doc status|done", "Show or leave the active document editing session.")
-    table.add_row("/doc publish <doc_id>", "Promote a document from draft to active.")
-    table.add_row("/doc list", "List all documents in the current project.")
-    table.add_row("/synthesize [hint]", "Distill the current discussion into consensus, disagreements, and follow-ups.")
-    table.add_row("/investigate <topic>", "Investigate a topic from the current session and write a report.")
-    table.add_row("/hypothesis [idea]", "Draft a hypothesis and enter editing mode for iterative refinement.")
-    table.add_row("/hypothesis open <id>", "Re-open an existing hypothesis for editing.")
-    table.add_row("/hypothesis status", "Show current hypothesis being edited.")
-    table.add_row("/hypothesis done", "Leave hypothesis editing mode.")
-    table.add_row("/launch-exp <hypothesis_id>", "Start interactive experiment planning from a hypothesis.")
-    table.add_row("/launch-exp resume <experiment_id>", "Resume a failed/existing experiment for revision or resubmission.")
-    table.add_row("/launch-exp approve-tasks", "Approve the current task breakdown and move to detailed planning.")
-    table.add_row("/launch-exp approve-task <id>", "Approve a specific task's detailed plan.")
-    table.add_row("/launch-exp reopen-task <id>", "Reopen a previously approved task for re-planning.")
-    table.add_row("/launch-exp generate-script", "Generate run.sh from approved task plans.")
-    table.add_row("/launch-exp run-task <id>", "Submit only one task from the run.sh, reusing earlier outputs.")
-    table.add_row("/launch-exp status", "Show current experiment planning status.")
-    table.add_row("/launch-exp done", "Finalize the experiment and exit planning mode.")
-    table.add_row("/auto start <doc_path>", "Start auto-iteration from a design doc (or <constraint> || <success>).")
-    table.add_row("/auto run [N]", "Run N auto-iteration rounds.")
-    table.add_row("/auto log [N]", "Show detailed view of last N iterations.")
-    table.add_row("/auto status", "Show auto-iteration session overview and timeline.")
-    table.add_row("/auto stop", "Stop the current auto-iteration session.")
-    table.add_row("/debrief", "Inspect active experiment launches and show their latest runtime state.")
-    table.add_row("/review-results <hypothesis_id>", "Summarize experiments linked to a hypothesis, suggest a resolution, and optionally write the decision back.")
-    table.add_row("/dev start <task>", "Start autonomous dev loop in an isolated worktree (writer+reviewer auto-iterate).")
-    table.add_row("/dev status", "Show current dev loop status.")
-    table.add_row("/dev continue", "Resume dev loop after a decision point.")
-    table.add_row("/dev finish", "Merge, keep, or discard the dev worktree branch.")
-    table.add_row("/dev stop", "Stop the current dev loop.")
-    table.add_row("/exit", "Leave the chat shell.")
-    console.print(Panel(table, title="LABIT Chat Commands", border_style=_COMMAND_COLOR))
-
-
 def _confirm_in_shell(prompt: str, *, default: bool = True) -> bool:
     suffix = "[Y/n]" if default else "[y/N]"
     raw = console.input(f"{prompt} {suffix}: ").strip().lower()
@@ -682,72 +292,6 @@ def _confirm_in_shell(prompt: str, *, default: bool = True) -> bool:
     return raw in {"y", "yes"}
 
 
-def _render_hypothesis_preview(draft, *, project: str) -> None:
-    body = (
-        f"[bold]Project[/bold]: {project}\n"
-        f"[bold]Claim[/bold]: {draft.claim}\n"
-        f"[bold]Independent variable[/bold]: {draft.independent_variable or '(blank)'}\n"
-        f"[bold]Dependent variable[/bold]: {draft.dependent_variable or '(blank)'}\n"
-        f"[bold]Success criteria[/bold]: {draft.success_criteria or '(blank)'}\n"
-        f"[bold]Failure criteria[/bold]: {draft.failure_criteria or '(blank)'}\n"
-        f"[bold]Source papers[/bold]: {', '.join(draft.source_paper_ids) or '(none)'}"
-    )
-    console.print(Panel(body, title=f"[bold green]Hypothesis Draft · {draft.title}[/bold green]", border_style="green"))
-    if draft.motivation:
-        console.print(Panel(draft.motivation, title="Motivation", border_style="cyan"))
-    if draft.rationale_markdown:
-        console.print(Panel(_md(draft.rationale_markdown, sanitize=False), title="Rationale", border_style="blue"))
-    if draft.experiment_plan_markdown:
-        console.print(Panel(_md(draft.experiment_plan_markdown, sanitize=False), title="Experiment Plan", border_style="magenta"))
-
-
-def _render_idea_preview(draft) -> None:
-    console.print(
-        Panel(
-            (
-                f"[bold]Summary[/bold]:\n{draft.summary_markdown}\n\n"
-                f"[bold]Key question[/bold]: {draft.key_question}"
-            ),
-            title=f"[bold green]Idea Draft · {draft.title}[/bold green]",
-            border_style="green",
-        )
-    )
-
-
-def _print_hypothesis_mode_hints(console: Console, session, hypothesis_id: str) -> None:
-    """Print helpful hints when entering hypothesis editing mode."""
-    lines = [
-        f"[dim]──── Hypothesis Mode · {hypothesis_id} ────[/dim]",
-        "[dim]  Type feedback to revise the hypothesis (agent updates files, not chat).[/dim]",
-        "[dim]  /hypothesis status  — show current hypothesis info[/dim]",
-        "[dim]  /hypothesis done    — leave hypothesis editing mode[/dim]",
-        "[dim]  Ctrl+C              — interrupt current revision[/dim]",
-    ]
-    if session.mode == ChatMode.ROUND_ROBIN and len(session.participants) >= 2:
-        author = session.participants[0].name
-        reviewer = session.participants[1].name
-        lines.append(f"[dim]  Round-robin: {author} revises → {reviewer} reviews[/dim]")
-    console.print("\n".join(lines))
-    console.print("")
-
-
-def _print_doc_mode_hints(console: Console, session) -> None:
-    """Print helpful hints when entering document editing mode."""
-    lines = [
-        "[dim]──── Document Mode ────[/dim]",
-        "[dim]  Type feedback to revise the document (agent writes to file, not chat).[/dim]",
-        "[dim]  /doc status   — show current document info[/dim]",
-        "[dim]  /doc auto [N] — auto-iterate N rounds (default 5, max 10); Ctrl+C to stop[/dim]",
-        "[dim]  /doc done     — leave document mode (status unchanged)[/dim]",
-        "[dim]  /doc publish   — mark document as active (usable after /doc done)[/dim]",
-        "[dim]  Ctrl+C        — interrupt current revision[/dim]",
-    ]
-    if session.mode == ChatMode.ROUND_ROBIN and len(session.participants) >= 2:
-        author = session.participants[0].name
-        reviewer = session.participants[1].name
-        lines.append(f"[dim]  Round-robin: {author} revises → {reviewer} reviews (review blocks in doc)[/dim]")
-    console.print("\n".join(lines))
-    console.print("")
 
 
 def _submit_and_monitor(
@@ -1015,525 +559,6 @@ def _run_sh_resume_contract_issues(run_sh: str) -> list[str]:
     return issues
 
 
-def _print_launch_exp_hints(console: Console, session: LaunchExpSession) -> None:
-    phase_label = {
-        LaunchExpPhase.TASK_BREAKDOWN: "Task Breakdown",
-        LaunchExpPhase.TASK_PLANNING: "Task Planning",
-        LaunchExpPhase.SCRIPT_GENERATION: "Script Generation",
-    }.get(session.phase, session.phase.value)
-    lines = [
-        f"[dim]──── Experiment Planning Mode ({phase_label}) ────[/dim]",
-        "[dim]  Type feedback to iterate on the current phase.[/dim]",
-    ]
-    if session.phase == LaunchExpPhase.TASK_BREAKDOWN:
-        lines.append("[dim]  /launch-exp approve-tasks   — approve task list, move to detailed planning[/dim]")
-    elif session.phase == LaunchExpPhase.TASK_PLANNING:
-        ct = session.current_task
-        if ct:
-            lines.append(f"[dim]  Current task: {ct.id} — {ct.name}[/dim]")
-        lines.append("[dim]  /launch-exp approve-task     — approve current task's detail[/dim]")
-        lines.append("[dim]  /launch-exp reopen-task <id> — reopen a previously approved task[/dim]")
-    elif session.phase == LaunchExpPhase.SCRIPT_GENERATION:
-        lines.append("[dim]  /launch-exp generate-script  — generate run.sh[/dim]")
-        if session.run_sh_content:
-            lines.append("[dim]  /launch-exp run-task <id>    — submit only one task, reusing prior outputs[/dim]")
-            lines.append("[dim]  /launch-exp done              — finalize and exit planning mode[/dim]")
-        else:
-            lines.append("[dim]  Generate script first, then /launch-exp done to finalize.[/dim]")
-    lines.append("[dim]  /launch-exp status            — show planning progress[/dim]")
-    lines.append("[dim]  Ctrl+C                        — interrupt current operation[/dim]")
-    console.print("\n".join(lines))
-    console.print("")
-
-
-def _auto_iteration_actors(session, supervisor_agent: str = "codex") -> list[AutoActor]:
-    participants = list(session.participants)
-    if not participants:
-        raise ValueError("No chat participants available for auto-iteration.")
-    # Reorder so the designated supervisor goes first
-    supervisor_idx = next(
-        (i for i, p in enumerate(participants) if p.name == supervisor_agent),
-        None,
-    )
-    if supervisor_idx is not None and supervisor_idx != 0:
-        participants[0], participants[supervisor_idx] = participants[supervisor_idx], participants[0]
-    if len(participants) == 1:
-        participants = [participants[0], participants[0], participants[0]]
-    elif len(participants) == 2:
-        participants = [participants[0], participants[0], participants[1]]
-    return [
-        AutoActor(name="supervisor", provider=participants[0].provider),
-        AutoActor(name="worker_a", provider=participants[1].provider),
-        AutoActor(name="worker_b", provider=participants[2].provider),
-    ]
-
-
-def _parse_design_doc(text: str) -> tuple[str, str]:
-    """Extract constraint and success_criteria from a loose design doc."""
-    import re
-    constraint = ""
-    success = ""
-    sections: dict[str, str] = {}
-    current_heading = ""
-    current_lines: list[str] = []
-    for line in text.splitlines():
-        heading_match = re.match(r"^#{1,3}\s+(.+)", line)
-        if heading_match:
-            if current_heading:
-                sections[current_heading] = "\n".join(current_lines).strip()
-            current_heading = heading_match.group(1).strip().lower()
-            current_lines = []
-        else:
-            current_lines.append(line)
-    if current_heading:
-        sections[current_heading] = "\n".join(current_lines).strip()
-
-    # Match common section names for constraints
-    for key in ["constraint", "constraints", "rules", "bounds", "limitations",
-                "hard project requirements", "hard requirements", "requirements",
-                "convergence policy", "convergence rules"]:
-        if key in sections and sections[key]:
-            constraint = sections[key]
-            break
-
-    # Match common section names for success
-    for key in ["success criteria", "success", "goal", "goals", "objective",
-                "objectives", "done when", "current design objective",
-                "design objective", "bottom line"]:
-        if key in sections and sections[key]:
-            success = sections[key]
-            break
-
-    # Fallback: if either is missing, synthesize from the full doc
-    if not constraint:
-        constraint = "(see design doc)"
-    if not success:
-        success = "(see design doc)"
-
-    return constraint, success
-
-
-def _render_auto_status(console: Console, session_record, iterations) -> None:
-    if session_record is None:
-        console.print("[dim]No active auto-iteration session.[/dim]")
-        return
-
-    # Session overview
-    status_style = {
-        "running": "green", "waiting": "yellow", "needs_human": "red",
-        "done": "cyan", "stopped": "dim",
-    }.get(session_record.status.value, "white")
-    console.print(
-        Panel(
-            (
-                f"[bold]Project[/bold]: {session_record.project}\n"
-                f"[bold]Status[/bold]: [{status_style}]{session_record.status.value}[/{status_style}]\n"
-                f"[bold]Supervisor[/bold]: {session_record.supervisor_agent}\n"
-                f"[bold]Iteration[/bold]: {session_record.current_iteration}/{session_record.max_iterations}\n"
-                f"[bold]Updated[/bold]: {session_record.updated_at}\n"
-                f"\n[bold]Constraint[/bold]: {session_record.constraint}\n"
-                f"[bold]Success[/bold]: {session_record.success_criteria}"
-            ),
-            title="[bold green]Auto Session[/bold green]",
-            border_style="green",
-        )
-    )
-
-    # Latest observation & decision
-    if session_record.last_observation_summary:
-        console.print(
-            Panel(session_record.last_observation_summary, title="Latest Observation", border_style="blue")
-        )
-    if session_record.last_decision_summary:
-        console.print(
-            Panel(session_record.last_decision_summary, title="Latest Decision", border_style="cyan")
-        )
-
-    # Iteration timeline
-    if not iterations:
-        console.print("[dim]No iterations recorded yet.[/dim]")
-        return
-    table = Table(title="Recent Iterations", border_style="dim", show_lines=True)
-    table.add_column("Iter", style="bold", width=4)
-    table.add_column("Trigger", width=18)
-    table.add_column("Action", width=12)
-    table.add_column("Decision", min_width=30)
-    table.add_column("Workers", min_width=20)
-    for entry in iterations:
-        worker_info = ""
-        if entry.worker_results:
-            worker_info = "\n".join(
-                f"{wr.worker}[{wr.status}]: {wr.summary[:80]}" for wr in entry.worker_results
-            )
-        elif entry.worker_tasks:
-            worker_info = "\n".join(f"{wt.worker}: {wt.title}" for wt in entry.worker_tasks)
-        if entry.discussion:
-            disc = "\n".join(f"{n.actor}: {n.summary[:60]}" for n in entry.discussion)
-            worker_info = f"{worker_info}\n---\n{disc}" if worker_info else disc
-        table.add_row(
-            str(entry.iteration),
-            entry.trigger,
-            entry.action.value,
-            entry.decision_summary[:120],
-            worker_info[:300] if worker_info else "-",
-        )
-    console.print(table)
-
-
-def _render_auto_log(console: Console, iterations: list, n: int = 3) -> None:
-    """Render detailed view of the last N iterations."""
-    if not iterations:
-        console.print("[dim]No iterations recorded yet.[/dim]")
-        return
-    for entry in iterations[-n:]:
-        # Header
-        header = f"Iteration {entry.iteration} | {entry.trigger} | {entry.action.value}"
-        if entry.human_needed:
-            header += " | [bold red]NEEDS HUMAN[/bold red]"
-        if entry.success_reached:
-            header += " | [bold green]SUCCESS[/bold green]"
-
-        parts = [f"[bold]Decision[/bold]: {entry.decision_summary}"]
-
-        # Observation
-        if entry.observation_summary:
-            parts.append(f"\n[bold]Observation[/bold]:\n{entry.observation_summary}")
-
-        # Worker tasks & results
-        if entry.worker_tasks:
-            parts.append("\n[bold]Worker Tasks[/bold]:")
-            for wt in entry.worker_tasks:
-                parts.append(f"  {wt.worker}: {wt.title}\n    {wt.instructions[:200]}")
-
-        if entry.worker_results:
-            parts.append("\n[bold]Worker Results[/bold]:")
-            for wr in entry.worker_results:
-                parts.append(f"  {wr.worker} [{wr.status}]: {wr.summary}")
-                if wr.actions_taken:
-                    parts.append("    Actions: " + ", ".join(wr.actions_taken[:5]))
-                if wr.outputs:
-                    parts.append("    Outputs: " + ", ".join(wr.outputs[:5]))
-                if wr.follow_up:
-                    parts.append(f"    Follow-up: {wr.follow_up}")
-
-        # Discussion
-        if entry.discussion:
-            parts.append("\n[bold]Discussion[/bold]:")
-            for note in entry.discussion:
-                parts.append(f"  {note.actor}: {note.summary}")
-                if note.evidence:
-                    for ev in note.evidence[:3]:
-                        parts.append(f"    - {ev}")
-                if note.next_step:
-                    parts.append(f"    Next: {note.next_step}")
-
-        console.print(Panel("\n".join(parts), title=header, border_style="cyan"))
-        console.print()
-
-
-def _render_task_breakdown(session: LaunchExpSession) -> None:
-    table = Table(title="Task Breakdown", show_header=True, border_style="blue")
-    table.add_column("ID", style="bold")
-    table.add_column("Name")
-    table.add_column("Goal")
-    table.add_column("Depends On")
-    table.add_column("Status")
-    for t in session.task_plans:
-        status = "[green]approved[/green]" if t.approved else "[dim]pending[/dim]"
-        deps = ", ".join(t.depends_on) if t.depends_on else "-"
-        table.add_row(t.id, t.name, t.goal[:80] if t.goal else "-", deps, status)
-    console.print(table)
-    console.print("")
-
-
-def _render_task_detail(task: ExperimentTaskPlan) -> None:
-    parts = [
-        f"[bold]ID[/bold]: {task.id}",
-        f"[bold]Name[/bold]: {task.name}",
-        f"[bold]Goal[/bold]: {task.goal}",
-    ]
-    if task.depends_on:
-        parts.append(f"[bold]Depends on[/bold]: {', '.join(task.depends_on)}")
-    if task.entry_hint:
-        parts.append(f"[bold]Entry hint[/bold]: {task.entry_hint}")
-    if task.inputs:
-        parts.append(f"[bold]Inputs[/bold]: {task.inputs}")
-    if task.outputs:
-        parts.append(f"[bold]Outputs[/bold]: {task.outputs}")
-    if task.checkpoint:
-        parts.append(f"[bold]Checkpoint[/bold]: {task.checkpoint}")
-    if task.failure_modes:
-        parts.append(f"[bold]Failure modes[/bold]: {task.failure_modes}")
-    console.print(
-        Panel(
-            "\n".join(parts),
-            title=f"[bold cyan]Task Detail: {task.id}[/bold cyan]",
-            border_style="cyan",
-        )
-    )
-
-
-def _render_launch_exp_status(session: LaunchExpSession) -> None:
-    phase_label = {
-        LaunchExpPhase.TASK_BREAKDOWN: "Task Breakdown",
-        LaunchExpPhase.TASK_PLANNING: "Task Planning",
-        LaunchExpPhase.SCRIPT_GENERATION: "Script Generation",
-    }.get(session.phase, session.phase.value)
-    approved = sum(1 for t in session.task_plans if t.approved)
-    total = len(session.task_plans)
-    parts = [
-        f"[bold]Hypothesis[/bold]: {session.hypothesis_id}",
-        f"[bold]Experiment[/bold]: {session.experiment_id}",
-        f"[bold]Phase[/bold]: {phase_label}",
-        f"[bold]Tasks[/bold]: {approved}/{total} approved",
-    ]
-    if session.phase == LaunchExpPhase.TASK_PLANNING:
-        ct = session.current_task
-        if ct:
-            parts.append(f"[bold]Current task[/bold]: {ct.id}: {ct.name}")
-    if session.run_sh_content:
-        parts.append(f"[bold]run.sh[/bold]: {len(session.run_sh_content.splitlines())} lines")
-    console.print(
-        Panel(
-            "\n".join(parts),
-            title="[bold blue]Experiment Planning Status[/bold blue]",
-            border_style="blue",
-        )
-    )
-
-
-def _render_doc_status(doc_session: DocSession) -> None:
-    console.print(
-        Panel(
-            (
-                f"[bold]ID[/bold]: {doc_session.doc_id}\n"
-                f"[bold]Title[/bold]: {doc_session.title}\n"
-                f"[bold]Status[/bold]: {doc_session.status.value}\n"
-                f"[bold]Project[/bold]: {doc_session.project}\n"
-                f"[bold]Document[/bold]: {doc_session.document_path}\n"
-                f"[bold]Interaction log[/bold]: {doc_session.log_path}\n"
-                f"[bold]Iterations[/bold]: {doc_session.iteration}\n"
-                f"[bold]Updated[/bold]: {doc_session.updated_at}"
-            ),
-            title="[bold green]Active Document Session[/bold green]",
-            border_style="green",
-        )
-    )
-
-
-def _render_synthesis_preview(draft) -> None:
-    parts = [f"[bold]Summary[/bold]:\n{draft.summary}"]
-    if draft.consensus:
-        parts.append("[bold]Consensus[/bold]:\n" + "\n".join(f"- {item}" for item in draft.consensus))
-    if draft.disagreements:
-        parts.append("[bold]Disagreements[/bold]:\n" + "\n".join(f"- {item}" for item in draft.disagreements))
-    if draft.followups:
-        parts.append("[bold]Follow-ups[/bold]:\n" + "\n".join(f"- {item}" for item in draft.followups))
-    console.print(
-        Panel(
-            "\n\n".join(parts),
-            title="[bold green]Discussion Synthesis[/bold green]",
-            border_style="green",
-        )
-    )
-
-
-def _render_capture_records(kind: str, records) -> None:
-    label_map = {
-        "idea": "Ideas",
-        "note": "Notes",
-        "todo": "Todos",
-    }
-    label = label_map.get(kind, f"{kind.title()}s")
-    console.print(f"[bold]{label}[/bold]")
-    if not records:
-        console.print(f"[dim]No {kind}s yet.[/dim]")
-        return
-    for item in records:
-        console.print(f"- [bold]{item.title}[/bold] [dim]({item.created_at or 'unknown date'})[/dim]")
-        console.print(f"  [dim]{item.path}[/dim]")
-
-
-def _render_related_reports(reports) -> None:
-    console.print("[bold]Related reports[/bold]")
-    for item in reports:
-        summary = item.summary or "(no summary)"
-        console.print(f"- [bold]{item.title}[/bold] [dim]({item.path})[/dim]")
-        console.print(f"  {summary}")
-
-
-def _render_memory_records(records) -> None:
-    console.print("[bold]Project Memory[/bold]")
-    if not records:
-        console.print("[dim]No memory records yet.[/dim]")
-        return
-    for record in records:
-        refs = f" · refs: {', '.join(record.evidence_refs[:2])}" if record.evidence_refs else ""
-        console.print(
-            f"- [bold]{record.memory_id}[/bold] [{record.kind.value}/{record.memory_type.value}] "
-            f"{record.title} · {record.namespace.render()} · score:{record.promotion_score}{refs}"
-        )
-
-
-def _render_memory_detail(record) -> None:
-    body = (
-        f"[bold]Kind[/bold]: {record.kind.value}\n"
-        f"[bold]Type[/bold]: {record.memory_type.value}\n"
-        f"[bold]Status[/bold]: {record.status.value}\n"
-        f"[bold]Namespace[/bold]: {record.namespace.render()}\n"
-        f"[bold]Confidence[/bold]: {record.confidence}\n"
-        f"[bold]Promotion score[/bold]: {record.promotion_score}\n"
-        f"[bold]Promotion reasons[/bold]: {', '.join(record.promotion_reasons) or '(none)'}\n"
-        f"[bold]Updated[/bold]: {record.updated_at}\n"
-        f"[bold]Evidence refs[/bold]: {', '.join(record.evidence_refs) or '(none)'}\n"
-        f"[bold]Source artifacts[/bold]: {', '.join(record.source_artifact_refs) or '(none)'}\n\n"
-        f"{record.summary}"
-    )
-    console.print(
-        Panel(
-            body,
-            title=f"[bold green]{record.memory_id} · {record.title}[/bold green]",
-            border_style="green",
-        )
-    )
-
-
-def _render_investigation_result(result) -> None:
-    console.print(
-        Panel(
-            (
-                f"[bold]Title[/bold]: {result.title}\n"
-                f"[bold]Path[/bold]: {result.report_path}\n"
-                f"[bold]Run[/bold]: {result.run_id}\n"
-                f"[bold]Summary[/bold]: {result.summary or '(blank)'}"
-            ),
-            title="[bold green]Investigation complete[/bold green]",
-            border_style="green",
-        )
-    )
-
-
-def _render_experiment_launch_preview(
-    *,
-    hypothesis_id: str,
-    defaults: dict[str, str],
-    execution,
-) -> None:
-    body = (
-        f"[bold]Hypothesis[/bold]: {hypothesis_id}\n"
-        f"[bold]Title[/bold]: {defaults.get('title') or '(blank)'}\n"
-        f"[bold]Objective[/bold]: {defaults.get('objective') or '(blank)'}\n"
-        f"[bold]Task kind[/bold]: {defaults.get('task_kind') or '(blank)'}\n"
-        f"[bold]Research role[/bold]: {defaults.get('research_role') or '(blank)'}\n"
-        f"[bold]Branch[/bold]: {defaults.get('branch') or '(blank)'}\n"
-        f"[bold]Config[/bold]: {defaults.get('config_ref') or '(blank)'}\n"
-        f"[bold]GPU[/bold]: {defaults.get('gpu') or '(blank)'}\n"
-        f"[bold]Output dir[/bold]: {defaults.get('output_dir') or '(blank)'}\n"
-        f"[bold]Command[/bold]: {defaults.get('command') or '(blank)'}\n\n"
-        f"[bold]Compute[/bold]: {execution.profile}\n"
-        f"[bold]Backend[/bold]: {execution.backend.value}\n"
-        f"[bold]User[/bold]: {execution.user or '(blank)'}\n"
-        f"[bold]Host[/bold]: {execution.host or '(blank)'}\n"
-        f"[bold]Workdir[/bold]: {execution.workdir or '(blank)'}\n"
-        f"[bold]Setup[/bold]: {'configured' if execution.setup_script else '(blank)'}"
-    )
-    console.print(Panel(body, title="[bold green]Launch Experiment Preview[/bold green]", border_style="green"))
-
-
-def _render_review_suggestion(suggestion) -> None:
-    body = (
-        f"[bold]Hypothesis[/bold]: {suggestion.hypothesis_id}\n"
-        f"[bold]Current[/bold]: {suggestion.current_state}/{suggestion.current_resolution}\n"
-        f"[bold]Suggested[/bold]: {suggestion.suggested_state}/{suggestion.suggested_resolution}\n"
-        f"[bold]Supporting[/bold]: {', '.join(suggestion.supporting_experiment_ids) or '(none)'}\n"
-        f"[bold]Contradicting[/bold]: {', '.join(suggestion.contradicting_experiment_ids) or '(none)'}\n"
-        f"[bold]Pending[/bold]: {', '.join(suggestion.pending_experiment_ids) or '(none)'}\n"
-        f"[bold]Reviewed[/bold]: {', '.join(suggestion.reviewed_experiment_ids) or '(none)'}\n\n"
-        f"[bold]Result summary[/bold]: {suggestion.result_summary or '(blank)'}\n\n"
-        f"[bold]Decision rationale[/bold]: {suggestion.decision_rationale or '(blank)'}"
-    )
-    console.print(
-        Panel(
-            body,
-            title=f"[bold green]Review Results · {suggestion.title}[/bold green]",
-            border_style="green",
-        )
-    )
-    if suggestion.next_steps:
-        console.print("[bold]Next steps[/bold]")
-        for item in suggestion.next_steps:
-            console.print(f"- {item}")
-
-
-def _launch_markdown(
-    *,
-    hypothesis_id: str,
-    experiment_id: str,
-    task_id: str,
-    launch_id: str,
-    defaults: dict[str, str],
-    execution,
-    receipt,
-) -> str:
-    lines = [
-        f"# Launch {experiment_id}",
-        "",
-        f"- Hypothesis: {hypothesis_id}",
-        f"- Task: {task_id}",
-        f"- Launch: {launch_id}",
-        f"- Accepted: {'yes' if receipt.accepted else 'no'}",
-        f"- Compute: {execution.profile}",
-        f"- Backend: {execution.backend.value}",
-        f"- User: {execution.user or '(blank)'}",
-        f"- Host: {receipt.remote_host or execution.host or '(blank)'}",
-        f"- Setup: {'configured' if execution.setup_script else '(blank)'}",
-        f"- Branch: {defaults.get('branch') or '(blank)'}",
-        f"- Config: {defaults.get('config_ref') or '(blank)'}",
-        f"- GPU: {defaults.get('gpu') or '(blank)'}",
-        f"- Output dir: {defaults.get('output_dir') or '(blank)'}",
-        f"- PID: {receipt.pid or '(none)'}",
-        f"- Log: {receipt.log_path or '(none)'}",
-        "",
-        "## Command",
-        "",
-        "```bash",
-        defaults.get("command", "").strip(),
-        "```",
-    ]
-    if receipt.stderr_tail:
-        lines.extend(["", "## Submission stderr", "", "```text", receipt.stderr_tail.strip(), "```"])
-    return "\n".join(lines).rstrip()
-
-
-def _debrief_markdown(*, experiment_id: str, rows: list[str]) -> str:
-    lines = [f"# Debrief {experiment_id}", ""]
-    if not rows:
-        lines.append("No active launches found.")
-        return "\n".join(lines)
-    lines.extend(rows)
-    return "\n".join(lines)
-
-
-def _review_markdown(*, hypothesis_id: str, suggestion, saved) -> str:
-    lines = [
-        f"# Review {hypothesis_id}",
-        "",
-        f"- Current -> Suggested: {suggestion.current_state}/{suggestion.current_resolution} -> {suggestion.suggested_state}/{suggestion.suggested_resolution}",
-        f"- Final state: {saved.record.state.value}",
-        f"- Final resolution: {saved.record.resolution.value}",
-        f"- Supporting experiments: {', '.join(saved.record.supporting_experiment_ids) or '(none)'}",
-        f"- Contradicting experiments: {', '.join(saved.record.contradicting_experiment_ids) or '(none)'}",
-        f"- Reviewed experiments: {', '.join(suggestion.reviewed_experiment_ids) or '(none)'}",
-        "",
-        "## Result Summary",
-        "",
-        saved.record.result_summary or "(blank)",
-        "",
-        "## Decision Rationale",
-        "",
-        saved.record.decision_rationale or "(blank)",
-    ]
-    return "\n".join(lines)
 
 
 def _flatten_numeric_metrics(value, *, prefix: str = "", depth: int = 0, max_depth: int = 2) -> dict[str, float]:
@@ -1682,7 +707,7 @@ def _run_streaming_turn(
     skip_participants: set[str] | None = None,
     cwd_override: str | None = None,
 ) -> object | None:
-    _render_user_shell_message(query, attachments=attachments)
+    render_user_shell_message(console, query, attachments=attachments)
     # Temporarily filter out muted participants for this turn
     effective_session = session
     if skip_participants:
@@ -1720,7 +745,7 @@ def _run_streaming_turn(
             if started_at is not None and status in {"thinking", "streaming"}:
                 status_text = f"{status} · {time.monotonic() - started_at:.1f}s"
             panels.append(
-                _agent_panel(
+                agent_panel(
                     participant.name,
                     state["provider"],
                     state["content"],
@@ -1739,7 +764,7 @@ def _run_streaming_turn(
             participant_state[participant.name]["content"] = ""
             participant_state[participant.name]["status"] = "thinking"
             participant_state[participant.name]["started_at"] = time.monotonic()
-            participant_state[participant.name]["thinking"] = _ThinkingIndicator()
+            participant_state[participant.name]["thinking"] = ThinkingIndicator()
         _refresh_live()
 
     def _on_reply_delta(participant, content: str) -> None:
@@ -1782,7 +807,7 @@ def _run_streaming_turn(
     if result is not None and result.replies:
         for reply in result.replies:
             console.print(
-                _agent_panel(
+                agent_panel(
                     reply.participant.name,
                     reply.participant.provider.value,
                     reply.message.content,
@@ -2114,26 +1139,6 @@ def _get_scope_diff(pathspecs: list[str], git_root: Path | None = None) -> str:
     return "\n\n".join(parts) if parts else "(no changes detected)"
 
 
-def _render_dev_decision(dev_session: DevLoopSession) -> None:
-    """Render a decision prompt for the user."""
-    decision = dev_session.pending_decision
-    if not decision:
-        return
-    lines = [f"[bold]{decision.question}[/bold]\n"]
-    for i, opt in enumerate(decision.options):
-        letter = chr(ord("A") + i)
-        rec = " [bold green](recommended)[/bold green]" if decision.recommended == i else ""
-        lines.append(f"  [{letter}] {opt}{rec}")
-    if decision.rationale:
-        lines.append(f"\n[dim]Reason: {decision.rationale}[/dim]")
-    lines.append(f"\n[dim]Asked by: {decision.asked_by}[/dim]")
-    console.print(Panel(
-        "\n".join(lines),
-        title="[bold yellow]Decision needed[/bold yellow]",
-        border_style="yellow",
-    ))
-
-
 def _run_dev_loop(
     *,
     service: ChatService,
@@ -2193,6 +1198,7 @@ def _run_dev_loop(
             "\nYou are the WRITER. Read the codebase, implement the change, and summarize what you did."
             "\nFollow the session's project boundary rules from the system prompt."
             f"\nWork only within this /dev scope: {scope_label}."
+            "\nIMPORTANT: Do NOT run `git commit` yourself. Labit handles all commits automatically."
             "\nIf you hit a genuine architecture/design fork requiring user input, output:\n"
             "DECISION_NEEDED\nquestion: ...\noption_a: ...\noption_b: ...\nrecommended: a\nreason: ..."
         )
@@ -2236,7 +1242,7 @@ def _run_dev_loop(
             dev_session.pending_decision = decision
             dev_session.status = "waiting_decision"
             dev_session.history.append(dev_round)
-            _render_dev_decision(dev_session)
+            render_dev_decision(console,dev_session)
             return dev_session
 
         # ── Reviewer turn ──
@@ -2308,7 +1314,7 @@ def _run_dev_loop(
             dev_session.pending_decision = decision
             dev_session.status = "waiting_decision"
             dev_session.history.append(dev_round)
-            _render_dev_decision(dev_session)
+            render_dev_decision(console,dev_session)
             return dev_session
 
         # Parse findings
@@ -2331,47 +1337,15 @@ def _run_dev_loop(
     return dev_session
 
 
-def _render_dev_status(dev_session: DevLoopSession) -> None:
-    """Render current dev loop status."""
-    lines = [
-        f"[bold]Task[/bold]: {dev_session.task}",
-        f"[bold]Writer[/bold]: {dev_session.writer_name}",
-        f"[bold]Reviewer[/bold]: {dev_session.reviewer_name}",
-        f"[bold]Round[/bold]: {dev_session.current_round}/{dev_session.max_rounds}",
-        f"[bold]Status[/bold]: {dev_session.status}",
-        f"[bold]Test mode[/bold]: {dev_session.test_mode}",
-        f"[bold]Scope[/bold]: {dev_session.scope_label or 'repository'}",
-        f"[bold]Git root[/bold]: {dev_session.scope_git_root or '(default)'}",
-        f"[bold]Branch repo[/bold]: {dev_session.branch_repo_root or dev_session.scope_git_root or '(default)'}",
-        f"[bold]Worktree[/bold]: {dev_session.worktree_path or '(none)'}",
-        f"[bold]Branch[/bold]: {dev_session.dev_branch or '(none)'}",
-    ]
-    if dev_session.history:
-        last = dev_session.history[-1]
-        if last.changed_files:
-            lines.append(f"\n[bold]Last changed files[/bold]:")
-            for path in last.changed_files[:8]:
-                lines.append(f"  - {path}")
-        if last.findings:
-            lines.append(f"\n[bold]Last findings[/bold]:")
-            for f in last.findings[:5]:
-                lines.append(f"  - {f}")
-    console.print(Panel(
-        "\n".join(lines),
-        title="[bold]Dev Loop Status[/bold]",
-        border_style=_COMMAND_COLOR,
-    ))
-
-
 def run_chat_shell(
     *,
     session,
     service: ChatService,
 ) -> None:
-    _render_shell_header(session)
+    render_shell_header(console,session)
     transcript = service.transcript(session.session_id)
     console.print("")
-    _render_recent_messages(transcript, count=8)
+    render_recent_messages(console,transcript, count=8)
     console.print("")
 
     current_session = session
@@ -2400,19 +1374,19 @@ def run_chat_shell(
                 console.print("[dim]Leaving chat shell.[/dim]")
                 return
             if command == "/help":
-                _shell_help()
+                render_shell_help(console)
                 continue
             if command == "/list":
                 list_chats(json_output=False)
                 continue
             if command == "/show":
-                _render_session_summary(current_session)
+                render_session_summary(console,current_session)
                 console.print("")
-                _render_transcript(service.transcript(current_session.session_id))
+                render_transcript(console,service.transcript(current_session.session_id))
                 continue
             if command == "/mode":
                 if not argument:
-                    _render_session_summary(current_session)
+                    render_session_summary(console,current_session)
                     continue
                 mode_str = argument.strip().lower()
                 try:
@@ -2473,7 +1447,7 @@ def run_chat_shell(
                 try:
                     if not argument:
                         records = store.list_records(current_session.project)[:10]
-                        _render_memory_records(records)
+                        render_memory_records(console,records)
                         continue
                     token = argument.strip()
                     try:
@@ -2482,13 +1456,13 @@ def run_chat_shell(
                         kind = None
                     if kind is not None:
                         records = [record for record in store.list_records(current_session.project) if record.kind == kind][:10]
-                        _render_memory_records(records)
+                        render_memory_records(console,records)
                         continue
                     record = store.load_record(current_session.project, token)
                 except Exception as exc:
                     console.print(f"[bold red]Error:[/bold red] {exc}")
                     continue
-                _render_memory_detail(record)
+                render_memory_detail(console,record)
                 continue
             if command == "/doc":
                 doc_parts = argument.split(maxsplit=1)
@@ -2498,7 +1472,7 @@ def run_chat_shell(
                     if active_doc is None:
                         console.print("[dim]No active document session. Use /doc start <title> or /doc open <id>.[/dim]")
                     else:
-                        _render_doc_status(active_doc)
+                        render_doc_status(console,active_doc)
                     continue
                 if doc_action == "done":
                     if active_doc is None:
@@ -2599,7 +1573,7 @@ def run_chat_shell(
                             border_style="green",
                         )
                     )
-                    _print_doc_mode_hints(console, current_session)
+                    print_doc_mode_hints(console, current_session)
                     continue
                 if doc_action == "auto":
                     if active_doc is None:
@@ -2715,7 +1689,7 @@ def run_chat_shell(
 
                     if not interrupted:
                         console.print(f"[bold green]Auto-iteration complete. {active_doc.iteration} total iterations.[/bold green]")
-                    _print_doc_mode_hints(console, current_session)
+                    print_doc_mode_hints(console, current_session)
                     try:
                         service.record_session_event(
                             session_id=current_session.session_id,
@@ -2778,7 +1752,7 @@ def run_chat_shell(
                         border_style="green",
                     )
                 )
-                _print_doc_mode_hints(console, current_session)
+                print_doc_mode_hints(console, current_session)
                 try:
                     service.record_session_event(
                         session_id=current_session.session_id,
@@ -2797,113 +1771,12 @@ def run_chat_shell(
                     pass
                 continue
             if command == "/auto":
-                auto_parts = argument.split(maxsplit=1)
-                auto_action = auto_parts[0].strip().lower() if auto_parts and auto_parts[0].strip() else "status"
-                auto_argument = auto_parts[1].strip() if len(auto_parts) > 1 else ""
-                if not current_session.project:
-                    console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
-                    continue
-
-                engine = _auto_engine()
-                if auto_action in {"status", ""}:
-                    session_record, iterations = engine.status(current_session.project)
-                    _render_auto_status(console, session_record, iterations)
-                    continue
-                if auto_action == "stop":
-                    try:
-                        stopped = engine.stop_session(current_session.project)
-                    except Exception as exc:
-                        console.print(f"[bold red]Error:[/bold red] {exc}")
-                        continue
-                    console.print(f"[green]Auto session stopped.[/green] [dim]{stopped.project}[/dim]")
-                    continue
-                if auto_action == "start":
-                    design_doc = ""
-                    constraint = ""
-                    success = ""
-                    doc_path_str = auto_argument.strip()
-                    # Try to load as design doc file first
-                    if doc_path_str and "||" not in doc_path_str:
-                        doc_path = Path(doc_path_str).expanduser()
-                        if not doc_path.is_absolute():
-                            doc_path = (paths.vault_projects_dir / current_session.project / doc_path_str)
-                        if doc_path.exists() and doc_path.is_file():
-                            design_doc = doc_path.read_text(encoding="utf-8").strip()
-                            # Parse loose sections from design doc
-                            constraint, success = _parse_design_doc(design_doc)
-                        else:
-                            console.print(f"[bold red]Error:[/bold red] Design doc not found: {doc_path}")
-                            console.print("[dim]Usage: /auto start <design_doc_path> or /auto start <constraint> || <success>[/dim]")
-                            continue
-                    elif "||" in auto_argument:
-                        constraint, _, success = auto_argument.partition("||")
-                        constraint = constraint.strip()
-                        success = success.strip()
-                    if not design_doc and (not constraint or not success):
-                        console.print("[bold red]Usage:[/bold red] /auto start <design_doc_path> or /auto start <constraint> || <success criteria>")
-                        continue
-                    try:
-                        session_record = engine.start_session(
-                            project=current_session.project,
-                            constraint=constraint,
-                            success_criteria=success,
-                            design_doc=design_doc,
-                        )
-                    except Exception as exc:
-                        console.print(f"[bold red]Error:[/bold red] {exc}")
-                        continue
-                    body = (
-                        f"[bold]Constraint[/bold]: {session_record.constraint}\n"
-                        f"[bold]Success[/bold]: {session_record.success_criteria}\n"
-                        f"[bold]Supervisor[/bold]: {session_record.supervisor_agent}\n"
-                        f"[bold]Rounds[/bold]: {session_record.max_iterations}\n"
-                        f"[bold]Poll Seconds[/bold]: {session_record.poll_seconds}"
-                    )
-                    if design_doc:
-                        body += f"\n[bold]Design Doc[/bold]: {doc_path_str}"
-                    console.print(
-                        Panel(body, title="[bold green]Auto Iteration Started[/bold green]", border_style="green")
-                    )
-                    console.print("[dim]Run /auto run [N] to execute rounds, /auto log [N] for detail, /auto stop to halt.[/dim]")
-                    continue
-                if auto_action == "run":
-                    rounds = 1
-                    if auto_argument:
-                        try:
-                            rounds = max(1, int(auto_argument))
-                        except ValueError:
-                            console.print("[bold red]Usage:[/bold red] /auto run [N]")
-                            continue
-                    try:
-                        session_record, _ = engine.status(current_session.project)
-                        if session_record is None:
-                            console.print("[bold red]Error:[/bold red] No active auto session. Use /auto start first.")
-                            continue
-                        actors = _auto_iteration_actors(current_session, supervisor_agent=session_record.supervisor_agent)
-                        for _ in range(rounds):
-                            if session_record.current_iteration >= session_record.max_iterations:
-                                console.print("[yellow]Auto session already hit max_iterations.[/yellow]")
-                                break
-                            with console.status("[bold blue]Running auto-iteration round...[/bold blue]"):
-                                entry = engine.run_iteration(project=current_session.project, actors=actors)
-                            _render_auto_log(console, [entry], n=1)
-                            session_record, _ = engine.status(current_session.project)
-                            if session_record is None or session_record.status.value in {"done", "needs_human", "stopped"}:
-                                break
-                    except Exception as exc:
-                        console.print(f"[bold red]Error:[/bold red] {exc}")
-                    continue
-                if auto_action == "log":
-                    n = 3
-                    if auto_argument:
-                        try:
-                            n = max(1, int(auto_argument))
-                        except ValueError:
-                            pass
-                    _, iterations = engine.status(current_session.project)
-                    _render_auto_log(console, iterations, n=n)
-                    continue
-                console.print("[bold red]Usage:[/bold red] /auto start <doc_path> | /auto run [N] | /auto log [N] | /auto status | /auto stop")
+                handle_auto_command(
+                    console=console,
+                    paths=paths,
+                    current_session=current_session,
+                    argument=argument,
+                )
                 continue
             if command in {"/paste-image", "/image"}:
                 query = argument.strip() or "Please inspect the attached image and describe anything important."
@@ -2992,7 +1865,7 @@ def run_chat_shell(
                     continue
 
                 console.print("")
-                _render_synthesis_preview(draft)
+                render_synthesis_preview(console,draft)
                 if not _confirm_in_shell("Save this synthesis to working memory?", default=True):
                     console.print("[dim]Cancelled synthesis.[/dim]")
                     continue
@@ -3032,7 +1905,7 @@ def run_chat_shell(
 
                 if related:
                     console.print("")
-                    _render_related_reports(related)
+                    render_related_reports(console,related)
                     if not _confirm_in_shell("Investigate further?", default=True):
                         console.print("[dim]Cancelled investigation.[/dim]")
                         continue
@@ -3062,7 +1935,7 @@ def run_chat_shell(
                     continue
 
                 console.print("")
-                _render_investigation_result(result)
+                render_investigation_result(console,result)
                 try:
                     service.record_session_event(
                         session_id=current_session.session_id,
@@ -3122,7 +1995,7 @@ def run_chat_shell(
                     except Exception as exc:
                         console.print(f"[bold red]Error:[/bold red] {exc}")
                         continue
-                    _render_capture_records(kind, records)
+                    render_capture_records(console,kind, records)
                     continue
 
                 if kind == "idea":
@@ -3140,7 +2013,7 @@ def run_chat_shell(
                         continue
 
                     console.print("")
-                    _render_idea_preview(draft)
+                    render_idea_preview(console,draft)
                     if not _confirm_in_shell("Save this idea?", default=True):
                         console.print("[dim]Cancelled idea capture.[/dim]")
                         continue
@@ -3271,8 +2144,8 @@ def run_chat_shell(
                         console.print(f"[bold red]Error:[/bold red] {exc}")
                         continue
                     console.print("")
-                    _render_hypothesis_preview(h_draft, project=current_session.project)
-                    _print_hypothesis_mode_hints(console, current_session, h_id)
+                    render_hypothesis_preview(console,h_draft, project=current_session.project)
+                    print_hypothesis_mode_hints(console, current_session, h_id)
                     continue
 
                 # ── /hypothesis [idea] — draft new hypothesis ──
@@ -3330,7 +2203,7 @@ def run_chat_shell(
                     continue
 
                 console.print("")
-                _render_hypothesis_preview(draft, project=current_session.project)
+                render_hypothesis_preview(console,draft, project=current_session.project)
                 console.print(
                     Panel(
                         (
@@ -3341,7 +2214,7 @@ def run_chat_shell(
                         border_style="green",
                     )
                 )
-                _print_hypothesis_mode_hints(console, current_session, detail.record.hypothesis_id)
+                print_hypothesis_mode_hints(console, current_session, detail.record.hypothesis_id)
                 try:
                     service.record_session_event(
                         session_id=current_session.session_id,
@@ -3388,7 +2261,7 @@ def run_chat_shell(
                     if active_launch_exp is None:
                         console.print("[dim]Not in experiment planning mode.[/dim]")
                     else:
-                        _render_launch_exp_status(active_launch_exp)
+                        render_launch_exp_status(console,active_launch_exp)
                     continue
 
                 if sub_arg == "approve-tasks":
@@ -3412,7 +2285,7 @@ def run_chat_shell(
                             border_style="green",
                         )
                     )
-                    _print_launch_exp_hints(console, active_launch_exp)
+                    print_launch_exp_hints(console, active_launch_exp)
                     continue
 
                 if sub_arg.startswith("approve-task"):
@@ -3436,11 +2309,11 @@ def run_chat_shell(
                                 border_style="green",
                             )
                         )
-                        _print_launch_exp_hints(console, active_launch_exp)
+                        print_launch_exp_hints(console, active_launch_exp)
                     else:
                         ct = active_launch_exp.current_task
                         console.print(f"[green]Task {task_id} approved.[/green] Next: [bold]{ct.id}: {ct.name}[/bold]" if ct else f"[green]Task {task_id} approved.[/green]")
-                        _print_launch_exp_hints(console, active_launch_exp)
+                        print_launch_exp_hints(console, active_launch_exp)
                     continue
 
                 if sub_arg.startswith("reopen-task"):
@@ -3504,7 +2377,7 @@ def run_chat_shell(
                                 border_style="green",
                             )
                         )
-                        _print_launch_exp_hints(console, active_launch_exp)
+                        print_launch_exp_hints(console, active_launch_exp)
                     except Exception as exc:
                         console.print(f"[bold red]Error:[/bold red] {exc}")
                     continue
@@ -3710,7 +2583,7 @@ def run_chat_shell(
                                 border_style="cyan",
                             )
                         )
-                        _print_launch_exp_hints(console, active_launch_exp)
+                        print_launch_exp_hints(console, active_launch_exp)
                     except Exception as exc:
                         console.print(f"[bold red]Error:[/bold red] {exc}")
                     continue
@@ -3758,8 +2631,8 @@ def run_chat_shell(
                     continue
 
                 # Display task breakdown
-                _render_task_breakdown(active_launch_exp)
-                _print_launch_exp_hints(console, active_launch_exp)
+                render_task_breakdown(console,active_launch_exp)
+                print_launch_exp_hints(console, active_launch_exp)
                 continue
             if command == "/debrief":
                 if not current_session.project:
@@ -3957,10 +2830,10 @@ def run_chat_shell(
                         console.print(row)
                     for experiment_id, experiment_rows in rows_by_experiment.items():
                         try:
-                            experiment_service.write_debrief_markdown(
+                            experiment_service.writedebrief_markdown(
                                 project=current_session.project,
                                 experiment_id=experiment_id,
-                                content=_debrief_markdown(
+                                content=debrief_markdown(
                                     experiment_id=experiment_id,
                                     rows=experiment_rows,
                                 ),
@@ -4221,7 +3094,7 @@ def run_chat_shell(
                     continue
 
                 console.print("")
-                _render_review_suggestion(suggestion)
+                render_review_suggestion(console,suggestion)
                 if not _confirm_in_shell("Write this review decision back to the hypothesis?", default=False):
                     console.print("[dim]Kept as suggestion only.[/dim]")
                     continue
@@ -4255,14 +3128,14 @@ def run_chat_shell(
                     console.print(f"[bold red]Error:[/bold red] {exc}")
                     continue
 
-                review_markdown = _review_markdown(
+                review_markdown = review_markdown(
                     hypothesis_id=hypothesis_id,
                     suggestion=suggestion,
                     saved=saved,
                 )
                 for experiment_id in suggestion.reviewed_experiment_ids:
                     try:
-                        experiment_service.write_review_markdown(
+                        experiment_service.writereview_markdown(
                             project=current_session.project,
                             experiment_id=experiment_id,
                             content=review_markdown,
@@ -4341,7 +3214,7 @@ def run_chat_shell(
                     console.print(f"[bold red]Error:[/bold red] {exc}")
                     continue
                 console.print("")
-                _render_shell_header(current_session)
+                render_shell_header(console,current_session)
                 continue
             if command == "/switch":
                 if not argument:
@@ -4357,9 +3230,9 @@ def run_chat_shell(
                     console.print(f"[bold red]Error:[/bold red] {exc}")
                     continue
                 console.print("")
-                _render_shell_header(current_session)
+                render_shell_header(console,current_session)
                 console.print("")
-                _render_recent_messages(service.transcript(current_session.session_id), count=8)
+                render_recent_messages(console,service.transcript(current_session.session_id), count=8)
                 continue
 
             if command == "/dev":
@@ -4372,7 +3245,7 @@ def run_chat_shell(
                     if active_dev is None:
                         console.print("[dim]No active dev loop.[/dim]")
                     else:
-                        _render_dev_status(active_dev)
+                        render_dev_status(console,active_dev)
                     continue
 
                 if dev_action == "stop":
@@ -4482,7 +3355,7 @@ def run_chat_shell(
                         continue
                     if active_dev.status == "waiting_decision":
                         console.print("[bold red]Decision pending. Reply with your choice first.[/bold red]")
-                        _render_dev_decision(active_dev)
+                        render_dev_decision(console,active_dev)
                         continue
                     if active_dev.status in ("completed", "stopped"):
                         console.print("[dim]Dev loop already finished. Use /dev start for a new one.[/dim]")
@@ -4714,7 +3587,7 @@ def run_chat_shell(
                         console.print(f"[yellow]Warning:[/yellow] {dep_err}")
                     active_launch_exp = exp_service.save_task_plans(active_launch_exp, revised_tasks)
                     exp_service.log_agent_revision(active_launch_exp, f"Revised task breakdown: {len(revised_tasks)} tasks", first_participant.name if first_participant else "")
-                    _render_task_breakdown(active_launch_exp)
+                    render_task_breakdown(console,active_launch_exp)
 
                 elif phase == LaunchExpPhase.TASK_PLANNING:
                     # User is iterating on current task's detail
@@ -4737,7 +3610,7 @@ def run_chat_shell(
                         )
                     active_launch_exp = exp_service.update_task_detail(active_launch_exp, detailed_task)
                     exp_service.log_agent_revision(active_launch_exp, f"Planned {ct.id}: {ct.name}", first_participant.name if first_participant else "")
-                    _render_task_detail(detailed_task)
+                    render_task_detail(console,detailed_task)
 
                 elif phase == LaunchExpPhase.SCRIPT_GENERATION:
                     # User is iterating on run.sh
@@ -5062,7 +3935,7 @@ def open_chat(
     if json_output:
         _emit(session.model_dump(mode="json"), as_json=True)
         return
-    _render_session_summary(session)
+    render_session_summary(console,session)
     run_chat_shell(session=session, service=service)
 
 
@@ -5077,7 +3950,7 @@ def list_chats(
     if not sessions:
         console.print("[dim]No chat sessions yet.[/dim]")
         return
-    table = Table(title="Chat Sessions", show_header=True, header_style=f"bold {_COMMAND_COLOR}")
+    table = Table(title="Chat Sessions", show_header=True, header_style=f"bold {COMMAND_COLOR}")
     table.add_column("Session")
     table.add_column("Title")
     table.add_column("Mode")
@@ -5119,9 +3992,9 @@ def show_chat(
         )
         return
 
-    _render_session_summary(session)
+    render_session_summary(console,session)
     console.print("")
-    _render_transcript(transcript)
+    render_transcript(console,transcript)
 
 
 @chat_app.command("ask")
@@ -5155,14 +4028,14 @@ def ask_chat(
         )
         return
 
-    _render_session_summary(result.session)
+    render_session_summary(console,result.session)
     console.print("")
     console.print(f"[bold][turn {result.user_message.turn_index}] user[/bold]")
     console.print(result.user_message.content)
     console.print("")
     for reply in result.replies:
         console.print(f"[cyan][turn {reply.message.turn_index}] {reply.participant.name}[/cyan]")
-        console.print(_md(reply.message.content))
+        console.print(md(reply.message.content))
         console.print("")
 
 
