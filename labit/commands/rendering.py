@@ -21,7 +21,6 @@ CHAT_SHELL_COMMANDS = (
     "/list",
     "/show",
     "/mode",
-    "/long-term-memory",
     "/idea",
     "/todo",
     "/doc",
@@ -178,7 +177,6 @@ def render_console_header(
         + " · ".join(
             [
                 command_chip("/help"),
-                command_chip("/long-term-memory"),
                 command_chip("/exit"),
             ]
         )
@@ -217,7 +215,6 @@ def render_shell_help(console: Console) -> None:
     table.add_row("/mode [mode]", "Show or switch mode (single, round_robin, parallel).")
     table.add_row("/swap", "Swap the response order of participants (e.g. claude,codex → codex,claude).")
     table.add_row("/mute <name>", "Mute an agent for the next turn only. Toggle: run again to unmute.")
-    table.add_row("/long-term-memory <question>", "Run a deep long-term memory search for this turn, then answer from the richer retrieved context.")
     table.add_row("/idea [text]", "Save a lightweight project idea. With no text, show saved ideas.")
     table.add_row("/todo [text]", "Save an actionable project todo. With no text, show saved todos.")
     table.add_row("/doc start <title>", "Enter document mode and write a design doc to docs/designs/.")

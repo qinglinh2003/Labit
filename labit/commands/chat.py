@@ -596,21 +596,6 @@ def run_chat_shell(
                     muted_next_turn.add(agent_name)
                     console.print(f"[bold #0080ff]{agent_name} muted for next turn.[/bold #0080ff] (auto-unmutes after one turn)")
                 continue
-            if command == "/long-term-memory":
-                query = argument.strip()
-                if not query:
-                    console.print("[bold red]Usage:[/bold red] /long-term-memory <question>")
-                    continue
-                result = _run_streaming_turn(
-                    service=service,
-                    session=current_session,
-                    query=query,
-                    attachments=attachments,
-                    force_deep_context=True,
-                )
-                if result is not None:
-                    current_session = result.session
-                continue
             if command == "/debrief":
                 if not current_session.project:
                     console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
