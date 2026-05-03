@@ -457,11 +457,12 @@ def print_doc_mode_hints(console: Console, session) -> None:
 
     lines = [
         "[dim]──── Document Mode ────[/dim]",
-        "[dim]  Type feedback to revise the document (agent writes to file, not chat).[/dim]",
+        "[dim]  Normal input: discuss the document with the model (no file changes)[/dim]",
+        "[dim]  /edit <instruction> - revise the document (agent writes to file)[/dim]",
         "[dim]  /doc status   — show current document info[/dim]",
         "[dim]  /doc auto [N] — auto-iterate N rounds (default 5, max 10); Ctrl+C to stop[/dim]",
         "[dim]  /doc done     — leave document mode (status unchanged)[/dim]",
-        "[dim]  /doc publish   — mark document as active (usable after /doc done)[/dim]",
+        "[dim]  /doc publish  — mark document as active (usable after /doc done)[/dim]",
         "[dim]  Ctrl+C        — interrupt current revision[/dim]",
     ]
     if session.mode == ChatMode.ROUND_ROBIN and len(session.participants) >= 2:

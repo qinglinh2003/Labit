@@ -514,7 +514,9 @@ def run_chat_shell(
         attachments = composer_result.attachments
         if not raw:
             continue
-        if raw.startswith("/"):
+        raw_lower = raw.lower()
+        is_doc_edit = active_doc is not None and (raw_lower == "/edit" or raw_lower.startswith("/edit "))
+        if raw.startswith("/") and not is_doc_edit:
             parts = raw.split(maxsplit=1)
             command = parts[0]
             argument = parts[1].strip() if len(parts) > 1 else ""
@@ -1194,24 +1196,26 @@ def run_chat_shell(
             console.print(f"[bold red]Unknown command:[/bold red] {command}")
             continue
 
-        if active_doc is not None:
+        # Doc mode: /edit triggers revision; normal input remains conversation.
+        if is_doc_edit:
+            edit_instruction = raw[len("/edit"):].strip()
+            if not edit_instruction:
+                console.print("[bold red]Usage:[/bold red] /edit <instruction>")
+                continue
             if attachments:
-                console.print("[bold red]Error:[/bold red] Document mode does not support image attachments yet.")
+                console.print("[bold red]Error:[/bold red] Document edit does not support image attachments yet.")
                 continue
             doc_service = _document_service()
             drafter = _doc_drafter()
             author = current_session.participants[0]
-            # Round-robin: second participant is reviewer
             reviewer = (
                 current_session.participants[1]
                 if current_session.mode == ChatMode.ROUND_ROBIN and len(current_session.participants) >= 2
                 else None
             )
             try:
-                # Capture pre-revision markdown for diff
                 old_markdown = doc_service.read_document(active_doc)
 
-                # Step 1: Author revises
                 with console.status(f"[bold blue]{author.name} updating document...[/bold blue]"):
                     update = drafter.revise_document(
                         session=current_session,
@@ -1219,7 +1223,7 @@ def run_chat_shell(
                         context_snapshot=service.context_snapshot(current_session.session_id),
                         doc_title=active_doc.title,
                         current_markdown=old_markdown,
-                        user_instruction=raw,
+                        user_instruction=edit_instruction,
                         interaction_log=doc_service.interaction_excerpt(active_doc),
                         author_name=author.name,
                         provider=author.provider,
@@ -1227,7 +1231,7 @@ def run_chat_shell(
                     active_doc = doc_service.revise_document(
                         doc_session=active_doc,
                         update=update,
-                        user_instruction=raw,
+                        user_instruction=edit_instruction,
                     )
 
                 console.print(
@@ -1243,7 +1247,6 @@ def run_chat_shell(
                     )
                 )
 
-                # Step 2: Reviewer adds inline review blocks (round-robin only)
                 if reviewer is not None:
                     from labit.documents.drafter import compute_changed_sections
 
@@ -1254,7 +1257,7 @@ def run_chat_shell(
                         review_update = drafter.review_document(
                             current_markdown=new_markdown,
                             revision_summary=update.summary,
-                            user_instruction=raw,
+                            user_instruction=edit_instruction,
                             reviewer_name=reviewer.name,
                             changed_sections=changed_sections,
                             provider=reviewer.provider,
