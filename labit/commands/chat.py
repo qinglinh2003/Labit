@@ -19,6 +19,8 @@ from rich.text import Text
 from labit.capture.drafter import IdeaDrafter
 from labit.capture.service import CaptureService
 from labit.commands.auto import handle_auto_command
+from labit.commands.context import ChatContext
+from labit.commands.dispatch import SlashCommandDispatcher
 from labit.commands.rendering import (
     CHAT_SHELL_COMMANDS,
     COMMAND_COLOR,
@@ -1355,6 +1357,8 @@ def run_chat_shell(
     active_launch_exp: LaunchExpSession | None = None
     active_dev: DevLoopSession | None = None
     muted_next_turn: set[str] = set()  # agent names to skip on next turn only
+    dispatcher = SlashCommandDispatcher()
+    dispatcher.register("/auto", lambda ctx, arg: handle_auto_command(ctx=ctx, argument=arg))
     while True:
         try:
             composer_result = _prompt_in_box(current_session)
@@ -1369,10 +1373,18 @@ def run_chat_shell(
             parts = raw.split(maxsplit=1)
             command = parts[0]
             argument = parts[1].strip() if len(parts) > 1 else ""
+            ctx = ChatContext(
+                console=console,
+                paths=RepoPaths.discover(),
+                service=service,
+                session=current_session,
+            )
 
             if command == "/exit":
                 console.print("[dim]Leaving chat shell.[/dim]")
                 return
+            if dispatcher.handle(command, ctx, argument):
+                continue
             if command == "/help":
                 render_shell_help(console)
                 continue
@@ -1769,14 +1781,6 @@ def run_chat_shell(
                     )
                 except Exception:
                     pass
-                continue
-            if command == "/auto":
-                handle_auto_command(
-                    console=console,
-                    paths=paths,
-                    current_session=current_session,
-                    argument=argument,
-                )
                 continue
             if command in {"/paste-image", "/image"}:
                 query = argument.strip() or "Please inspect the attached image and describe anything important."

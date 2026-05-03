@@ -8,16 +8,17 @@ from rich.panel import Panel
 from rich.table import Table
 
 from labit.automation import AutoActor, AutoIterationEngine
-from labit.paths import RepoPaths
+from labit.commands.context import ChatContext
 
 
 def handle_auto_command(
     *,
-    console: Console,
-    paths: RepoPaths,
-    current_session,
+    ctx: ChatContext,
     argument: str,
 ) -> None:
+    console = ctx.console
+    paths = ctx.paths
+    current_session = ctx.session
     auto_parts = argument.split(maxsplit=1)
     auto_action = auto_parts[0].strip().lower() if auto_parts and auto_parts[0].strip() else "status"
     auto_argument = auto_parts[1].strip() if len(auto_parts) > 1 else ""
