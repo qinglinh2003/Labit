@@ -25,15 +25,9 @@ CHAT_SHELL_COMMANDS = (
     "/memory",
     "/paste-image",
     "/image",
-    "/think",
-    "/think-long-term",
-    "/think-ltm",
     "/long-term-memory",
     "/ltm",
-    "/synthesize",
-    "/investigate",
     "/idea",
-    "/note",
     "/todo",
     "/doc",
     "/doc auto",
@@ -211,8 +205,6 @@ def render_console_header(
         + " · ".join(
             [
                 command_chip("/help"),
-                command_chip("/think"),
-                command_chip("/think-ltm"),
                 command_chip("/ltm"),
                 command_chip("/image"),
                 command_chip("/exit"),
@@ -227,7 +219,6 @@ def render_console_header(
                 command_chip("/idea"),
                 command_chip("/todo"),
                 command_chip("/doc"),
-                command_chip("/investigate"),
                 command_chip("/hypothesis"),
             ]
         )
@@ -258,20 +249,15 @@ def render_shell_help(console: Console) -> None:
     table.add_row("/swap", "Swap the response order of participants (e.g. claude,codex → codex,claude).")
     table.add_row("/mute <name>", "Mute an agent for the next turn only. Toggle: run again to unmute.")
     table.add_row("/memory [id|kind]", "Show recent project memory, one memory by id, or filter by memory kind.")
-    table.add_row("/think <question>", "Ask the next turn with the highest reasoning effort, while keeping the normal chat context shape.")
     table.add_row("/long-term-memory <question>", "Run a deep long-term memory search for this turn, then answer from the richer retrieved context.")
-    table.add_row("/think-long-term <question>", "Run the next turn with both deep long-term memory search and the highest reasoning effort.")
     table.add_row("/paste-image [question]", "Read one image from the system clipboard, save it under .labit/, and send it as this turn's image input.")
     table.add_row("/idea [text]", "Save a lightweight project idea. With no text, show saved ideas.")
-    table.add_row("/note [text]", "Save a lightweight project note. With no text, show saved notes.")
     table.add_row("/todo [text]", "Save an actionable project todo. With no text, show saved todos.")
     table.add_row("/doc start <title>", "Enter document mode and write a design doc to docs/designs/.")
     table.add_row("/doc open <doc_id>", "Re-open an existing document for editing.")
     table.add_row("/doc status|done", "Show or leave the active document editing session.")
     table.add_row("/doc publish <doc_id>", "Promote a document from draft to active.")
     table.add_row("/doc list", "List all documents in the current project.")
-    table.add_row("/synthesize [hint]", "Distill the current discussion into consensus, disagreements, and follow-ups.")
-    table.add_row("/investigate <topic>", "Investigate a topic from the current session and write a report.")
     table.add_row("/hypothesis [idea]", "Draft a hypothesis and enter editing mode for iterative refinement.")
     table.add_row("/hypothesis open <id>", "Re-open an existing hypothesis for editing.")
     table.add_row("/hypothesis status", "Show current hypothesis being edited.")
@@ -498,23 +484,6 @@ def render_idea_preview(console: Console, draft) -> None:
     )
 
 
-def render_synthesis_preview(console: Console, draft) -> None:
-    parts = [f"[bold]Summary[/bold]:\n{draft.summary}"]
-    if draft.consensus:
-        parts.append("[bold]Consensus[/bold]:\n" + "\n".join(f"- {item}" for item in draft.consensus))
-    if draft.disagreements:
-        parts.append("[bold]Disagreements[/bold]:\n" + "\n".join(f"- {item}" for item in draft.disagreements))
-    if draft.followups:
-        parts.append("[bold]Follow-ups[/bold]:\n" + "\n".join(f"- {item}" for item in draft.followups))
-    console.print(
-        Panel(
-            "\n\n".join(parts),
-            title="[bold green]Discussion Synthesis[/bold green]",
-            border_style="green",
-        )
-    )
-
-
 def render_capture_records(console: Console, kind: str, records) -> None:
     label_map = {
         "idea": "Ideas",
@@ -529,14 +498,6 @@ def render_capture_records(console: Console, kind: str, records) -> None:
     for item in records:
         console.print(f"- [bold]{item.title}[/bold] [dim]({item.created_at or 'unknown date'})[/dim]")
         console.print(f"  [dim]{item.path}[/dim]")
-
-
-def render_related_reports(console: Console, reports) -> None:
-    console.print("[bold]Related reports[/bold]")
-    for item in reports:
-        summary = item.summary or "(no summary)"
-        console.print(f"- [bold]{item.title}[/bold] [dim]({item.path})[/dim]")
-        console.print(f"  {summary}")
 
 
 def render_memory_records(console: Console, records) -> None:
@@ -570,21 +531,6 @@ def render_memory_detail(console: Console, record) -> None:
         Panel(
             body,
             title=f"[bold green]{record.memory_id} · {record.title}[/bold green]",
-            border_style="green",
-        )
-    )
-
-
-def render_investigation_result(console: Console, result) -> None:
-    console.print(
-        Panel(
-            (
-                f"[bold]Title[/bold]: {result.title}\n"
-                f"[bold]Path[/bold]: {result.report_path}\n"
-                f"[bold]Run[/bold]: {result.run_id}\n"
-                f"[bold]Summary[/bold]: {result.summary or '(blank)'}"
-            ),
-            title="[bold green]Investigation complete[/bold green]",
             border_style="green",
         )
     )

@@ -55,7 +55,6 @@ from labit.commands.rendering import (
 from labit.chat.clipboard import ClipboardImageError, capture_clipboard_image
 from labit.chat.composer import ComposerResult, prompt_toolkit_available, prompt_with_clipboard_image
 from labit.chat.models import ChatMode
-from labit.chat.commands import handle_synthesize_command
 from labit.chat.service import ChatService
 from labit.context.events import SessionEventKind
 from labit.documents.commands import handle_document_command
@@ -84,7 +83,6 @@ from labit.hypotheses.commands import handle_hypothesis_command
 from labit.hypotheses.models import HypothesisDraft
 from labit.hypotheses.models import HypothesisResolution, HypothesisState, utc_now_iso
 from labit.hypotheses.service import HypothesisService
-from labit.investigations.commands import handle_investigate_command
 from labit.memory.commands import handle_memory_command
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
@@ -517,7 +515,7 @@ def run_chat_shell(
     dispatcher = SlashCommandDispatcher()
     dispatcher.register("/auto", lambda ctx, arg: handle_auto_command(ctx=ctx, argument=arg))
 
-    for capture_command in ("/idea", "/note", "/todo"):
+    for capture_command in ("/idea", "/todo"):
         dispatcher.register(
             capture_command,
             lambda ctx, arg, command=capture_command: handle_capture_command(
@@ -538,8 +536,6 @@ def run_chat_shell(
 
     dispatcher.register("/hypothesis", _handle_hypothesis)
     dispatcher.register("/memory", lambda ctx, arg: handle_memory_command(ctx=ctx, argument=arg))
-    dispatcher.register("/synthesize", lambda ctx, arg: handle_synthesize_command(ctx=ctx, argument=arg))
-    dispatcher.register("/investigate", lambda ctx, arg: handle_investigate_command(ctx=ctx, argument=arg))
 
     def _handle_document(ctx: ChatContext, arg: str) -> None:
         nonlocal active_doc
@@ -687,37 +683,6 @@ def run_chat_shell(
                     session=current_session,
                     query=query,
                     attachments=[attachment],
-                )
-                if result is not None:
-                    current_session = result.session
-                continue
-            if command == "/think":
-                query = argument.strip()
-                if not query:
-                    console.print("[bold red]Usage:[/bold red] /think <question>")
-                    continue
-                result = _run_streaming_turn(
-                    service=service,
-                    session=current_session,
-                    query=query,
-                    attachments=attachments,
-                    reasoning_effort=ChatService.THINK_REASONING_EFFORT,
-                )
-                if result is not None:
-                    current_session = result.session
-                continue
-            if command in {"/think-long-term", "/think-ltm"}:
-                query = argument.strip()
-                if not query:
-                    console.print("[bold red]Usage:[/bold red] /think-long-term <question>")
-                    continue
-                result = _run_streaming_turn(
-                    service=service,
-                    session=current_session,
-                    query=query,
-                    attachments=attachments,
-                    force_deep_context=True,
-                    reasoning_effort=ChatService.THINK_REASONING_EFFORT,
                 )
                 if result is not None:
                     current_session = result.session

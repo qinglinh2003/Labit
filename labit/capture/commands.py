@@ -19,7 +19,6 @@ def handle_capture_command(
     current_session = ctx.session
     kind_map = {
         "/idea": "idea",
-        "/note": "note",
         "/todo": "todo",
     }
     kind = kind_map[command]
@@ -32,8 +31,6 @@ def handle_capture_command(
         try:
             if kind == "idea":
                 records = capture_service.list_ideas(current_session.project)
-            elif kind == "note":
-                records = capture_service.list_notes(current_session.project)
             else:
                 records = capture_service.list_todos(current_session.project)
         except Exception as exc:
@@ -74,18 +71,11 @@ def handle_capture_command(
             return
     else:
         try:
-            if kind == "note":
-                record = capture_service.save_note(
-                    project=current_session.project,
-                    content=argument,
-                    session=current_session,
-                )
-            else:
-                record = capture_service.save_todo(
-                    project=current_session.project,
-                    content=argument,
-                    session=current_session,
-                )
+            record = capture_service.save_todo(
+                project=current_session.project,
+                content=argument,
+                session=current_session,
+            )
         except Exception as exc:
             console.print(f"[bold red]Error:[/bold red] {exc}")
             return
@@ -103,7 +93,6 @@ def handle_capture_command(
     )
     event_kind_map = {
         "idea": SessionEventKind.ARTIFACT_IDEA_CREATED,
-        "note": SessionEventKind.ARTIFACT_NOTE_CREATED,
         "todo": SessionEventKind.ARTIFACT_TODO_CREATED,
     }
     try:

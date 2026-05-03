@@ -7,7 +7,6 @@ from labit.capture.models import CaptureRecord
 from labit.capture.service import CaptureService
 from labit.codebase.map import CodeMapBuilder
 from labit.context.assembler import ContextSection
-from labit.investigations.service import InvestigationService
 from labit.papers.service import PaperService
 from labit.paths import RepoPaths
 
@@ -37,7 +36,6 @@ class ContextMapBuilder:
         self.paths = paths
         self.capture_service = CaptureService(paths)
         self.paper_service = PaperService(paths)
-        self.investigation_service = InvestigationService(paths)
         self.code_map_builder = CodeMapBuilder(paths)
 
     def build_sections(
@@ -64,10 +62,6 @@ class ContextMapBuilder:
         )
         if paper_section is not None:
             sections.append(paper_section)
-
-        report_section = self._build_report_section(project=project, query=query, allow_fallback=allow_fallback)
-        if report_section is not None:
-            sections.append(report_section)
 
         docs_section = self._build_docs_section(project=project, query=query, allow_fallback=allow_fallback)
         if docs_section is not None:
@@ -172,31 +166,6 @@ class ContextMapBuilder:
             title="Related Project Papers",
             source="map:papers",
             priority=60,
-            content="\n".join(lines),
-        )
-
-    def _build_report_section(self, *, project: str, query: str, allow_fallback: bool) -> ContextSection | None:
-        reports = self.investigation_service.find_related_reports(project, query, limit=4)
-        if not reports and allow_fallback:
-            reports = self.investigation_service.list_reports(project)[:3]
-        if not reports:
-            return None
-
-        lines: list[str] = []
-        for report in reports:
-            header = f"- {report.title}"
-            if report.date:
-                header = f"{header} ({report.date})"
-            lines.append(header)
-            if report.topic:
-                lines.append(f"  topic: {report.topic}")
-            if report.summary:
-                lines.append(f"  summary: {self._clip(report.summary, 220)}")
-            lines.append(f"  path: {report.path}")
-        return ContextSection(
-            title="Related Reports",
-            source="map:reports",
-            priority=58,
             content="\n".join(lines),
         )
 

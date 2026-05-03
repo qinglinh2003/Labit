@@ -17,7 +17,6 @@ from labit.context.events import SessionEventKind
 from labit.context.store import SessionContextStore
 from labit.experiments.service import ExperimentService
 from labit.hypotheses.service import HypothesisService
-from labit.investigations.service import InvestigationService
 from labit.memory.store import MemoryStore
 from labit.papers.service import PaperService
 from labit.paths import RepoPaths
@@ -45,7 +44,6 @@ class DailySummaryService:
         hypothesis_service: HypothesisService | None = None,
         experiment_service: ExperimentService | None = None,
         capture_service: CaptureService | None = None,
-        investigation_service: InvestigationService | None = None,
         paper_service: PaperService | None = None,
         memory_store: MemoryStore | None = None,
         session_context_store: SessionContextStore | None = None,
@@ -56,7 +54,6 @@ class DailySummaryService:
         self.hypothesis_service = hypothesis_service or HypothesisService(paths)
         self.experiment_service = experiment_service or ExperimentService(paths)
         self.capture_service = capture_service or CaptureService(paths)
-        self.investigation_service = investigation_service or InvestigationService(paths)
         self.paper_service = paper_service or PaperService(paths)
         self.memory_store = memory_store or MemoryStore(paths)
         self.session_context_store = session_context_store or SessionContextStore(paths)
@@ -100,7 +97,7 @@ class DailySummaryService:
         ]
         hypotheses_created, hypotheses_updated, hypotheses_closed = self._collect_hypotheses(project=resolved, target_date=target_date)
         experiments_created, experiments_updated, tasks_submitted, tasks_finished = self._collect_experiments(project=resolved, target_date=target_date)
-        reports = self._collect_reports(project=resolved, target_date=target_date)
+        reports: list[DailyActivityItem] = []
         ideas = self._collect_capture_items(project=resolved, kind="idea", target_date=target_date)
         notes = self._collect_capture_items(project=resolved, kind="note", target_date=target_date)
         todos = self._collect_capture_items(project=resolved, kind="todo", target_date=target_date)
@@ -443,23 +440,6 @@ Inputs:
                         )
                     )
         return created, updated, submitted, finished
-
-    def _collect_reports(self, *, project: str, target_date: date) -> list[DailyActivityItem]:
-        items: list[DailyActivityItem] = []
-        for report in self.investigation_service.list_reports(project):
-            if not self._matches_date(report.date, target_date):
-                continue
-            items.append(
-                DailyActivityItem(
-                    title=report.title,
-                    summary=report.summary,
-                    path=report.path,
-                    status=report.status,
-                    created_at=report.date,
-                    refs=[f"report:{report.path}"],
-                )
-            )
-        return items
 
     def _collect_capture_items(self, *, project: str, kind: str, target_date: date) -> list[DailyActivityItem]:
         if kind == "idea":
