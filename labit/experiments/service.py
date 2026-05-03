@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import shlex
 import subprocess
 from collections.abc import Iterable
 from pathlib import Path
@@ -23,15 +22,11 @@ from labit.experiments.models import (
     ExperimentRecord,
     ExperimentSummary,
     ExperimentTaskPlan,
-    FrozenLaunchSpec,
     HypothesisReviewSuggestion,
     HypothesisSnapshot,
-    LaunchArtifact,
     LaunchExpPhase,
     LaunchExpSession,
-    LaunchStatus,
     ResearchRole,
-    SubmissionReceipt,
     TaskDraft,
     TaskKind,
     TaskRecord,
@@ -44,7 +39,6 @@ from labit.experiments.models import (
 from labit.experiments.lifecycle import inspect_experiment_dir, summarize_task_statuses
 from labit.hypotheses.service import HypothesisService
 from labit.paths import RepoPaths
-from labit.services.compute_service import ComputeService
 from labit.services.project_service import ProjectService
 
 
@@ -54,12 +48,10 @@ class ExperimentService:
         paths: RepoPaths,
         *,
         project_service: ProjectService | None = None,
-        compute_service: ComputeService | None = None,
         hypothesis_service: HypothesisService | None = None,
     ):
         self.paths = paths
         self.project_service = project_service or ProjectService(paths)
-        self.compute_service = compute_service or ComputeService(paths)
         self.hypothesis_service = hypothesis_service or HypothesisService(paths)
 
     def list_experiments(self, project: str) -> list[ExperimentSummary]:
@@ -250,75 +242,6 @@ class ExperimentService:
             details.append(self.load_experiment(resolved, summary.experiment_id))
         return details
 
-    def latest_launch_artifact(self, project: str, experiment_id: str) -> LaunchArtifact | None:
-        """Return the most recent launch artifact for an experiment, or None."""
-        resolved = self._require_project(project)
-        launches_dir = self.tasks_dir(resolved, experiment_id) / "launches"
-        if not launches_dir.exists():
-            return None
-        launch_ids = sorted(
-            (p.name for p in launches_dir.iterdir() if re.fullmatch(r"l\d+", p.name)),
-            reverse=True,
-        )
-        for lid in launch_ids:
-            try:
-                return self.load_launch_artifact(resolved, experiment_id, lid)
-            except Exception:
-                continue
-        return None
-
-    def collect_experiment_results(
-        self,
-        *,
-        project: str,
-        hypothesis_id: str,
-    ) -> list[dict]:
-        """Collect remote results for all experiments under a hypothesis.
-
-        Returns a list of dicts: {experiment_id, title, status, assessment, collected}
-        where collected is the raw dict from executor.collect().
-        """
-        from labit.experiments.executors.ssh import SSHExecutor
-
-        experiments = self.list_experiments_for_hypothesis(project, hypothesis_id)
-        results: list[dict] = []
-        for exp_detail in experiments:
-            entry: dict = {
-                "experiment_id": exp_detail.record.experiment_id,
-                "title": exp_detail.record.title,
-                "status": exp_detail.record.status.value,
-                "assessment": exp_detail.record.assessment.value,
-                "collected": None,
-            }
-            artifact = self.latest_launch_artifact(project, exp_detail.record.experiment_id)
-            if artifact:
-                if artifact.submission:
-                    try:
-                        executor = SSHExecutor()
-                        collected = executor.collect(artifact)
-                        entry["collected"] = collected
-                    except Exception:
-                        pass
-                elif artifact.launch_dir:
-                    entry["collected"] = self._read_local_results(Path(artifact.launch_dir))
-            else:
-                # No artifact found — scan launch dirs on disk as final fallback
-                launches_dir = self.tasks_dir(
-                    self._require_project(project), exp_detail.record.experiment_id
-                ) / "launches"
-                if launches_dir.exists():
-                    launch_ids = sorted(
-                        (p.name for p in launches_dir.iterdir() if re.fullmatch(r"l\d+", p.name)),
-                        reverse=True,
-                    )
-                    for lid in launch_ids:
-                        local = self._read_local_results(launches_dir / lid)
-                        if local:
-                            entry["collected"] = local
-                            break
-            results.append(entry)
-        return results
-
     def update_assessment(
         self, *, project: str, experiment_id: str, assessment: ExperimentAssessment
     ) -> ExperimentRecord:
@@ -326,21 +249,6 @@ class ExperimentService:
         detail = self.load_experiment(project, experiment_id)
         updated = detail.record.model_copy(update={"assessment": assessment})
         return self.save_experiment_record(project=project, record=updated)
-
-    @staticmethod
-    def _read_local_results(launch_path: Path) -> dict | None:
-        """Read result files from a local launch directory."""
-        try:
-            local_files: dict[str, str] = {}
-            for candidate in ["experiment_results.json", "summary.json", "results.json"]:
-                fpath = launch_path / candidate
-                if fpath.is_file():
-                    local_files[candidate] = fpath.read_text()[:10000]
-            if local_files:
-                return {"status": "stopped", "files": local_files}
-        except Exception:
-            pass
-        return None
 
     def suggest_hypothesis_review(self, *, project: str, hypothesis_id: str) -> HypothesisReviewSuggestion:
         resolved = self._require_project(project)
@@ -413,156 +321,6 @@ class ExperimentService:
             next_steps=next_steps,
         )
 
-    def materialize_launch_artifact(
-        self,
-        *,
-        project: str,
-        experiment_id: str,
-        task_id: str,
-        run_python: str | None = None,
-        code_snapshot: CodeSnapshot | None = None,
-        receipt: SubmissionReceipt | None = None,
-    ) -> LaunchArtifact:
-        resolved = self._require_project(project)
-        detail = self.load_experiment(resolved, experiment_id)
-        task = self.load_task(resolved, experiment_id, task_id)
-        launch_id = self._next_launch_id(resolved, experiment_id)
-        launch_dir = self.launch_dir(resolved, experiment_id, launch_id)
-        launch_dir.mkdir(parents=True, exist_ok=False)
-
-        frozen_spec = FrozenLaunchSpec(
-            command=self._render_command(task),
-            workdir=detail.record.execution.workdir,
-            output_dir=task.spec.output_dir,
-            env=task.spec.env,
-        )
-        run_sh = self._render_run_sh(frozen_spec, detail.record.execution)
-        run_sh_path = launch_dir / "run.sh"
-        self._atomic_write_text(run_sh_path, run_sh)
-
-        run_py_path: Path | None = None
-        if run_python and run_python.strip():
-            run_py_path = launch_dir / "run.py"
-            self._atomic_write_text(run_py_path, run_python.strip() + "\n")
-
-        env_json_path = launch_dir / "env.json"
-        self._atomic_write_text(env_json_path, json.dumps(frozen_spec.env, indent=2, sort_keys=True) + "\n")
-
-        snapshot = code_snapshot or self.build_code_snapshot(resolved, branch_hint=task.spec.branch)
-        code_snapshot_path = launch_dir / "code_snapshot.json"
-        self._atomic_write_text(code_snapshot_path, json.dumps(snapshot.model_dump(mode="json"), indent=2, sort_keys=True) + "\n")
-
-        artifact = LaunchArtifact(
-            launch_id=launch_id,
-            task_id=task.task_id,
-            experiment_id=experiment_id,
-            project=resolved,
-            executor=detail.record.execution.backend,
-            remote_user=detail.record.execution.user,
-            remote_host=detail.record.execution.host,
-            remote_port=detail.record.execution.port,
-            ssh_key=detail.record.execution.ssh_key,
-            frozen_spec=frozen_spec,
-            code_snapshot=snapshot,
-            submission=receipt,
-            run_sh_path=str(run_sh_path.relative_to(self.paths.root)),
-            run_py_path=str(run_py_path.relative_to(self.paths.root)) if run_py_path else None,
-            env_json_path=str(env_json_path.relative_to(self.paths.root)),
-            code_snapshot_path=str(code_snapshot_path.relative_to(self.paths.root)),
-            status=self._derive_launch_status(receipt),
-        )
-        self._atomic_write_yaml(launch_dir / "launch.yaml", artifact.model_dump(mode="json"))
-        if receipt is not None:
-            self._atomic_write_yaml(launch_dir / "receipt.yaml", receipt.model_dump(mode="json"))
-
-        task_status = task.status
-        task_runtime = task.runtime
-        if receipt is not None:
-            if receipt.accepted:
-                task_status = TaskStatus.QUEUED
-            if receipt.remote_job_id is not None or receipt.pid is not None or receipt.log_path is not None:
-                task_runtime = task.runtime.model_copy(
-                    update={
-                        "remote_job_id": receipt.remote_job_id,
-                        "pid": receipt.pid,
-                        "assigned_gpu": receipt.assigned_gpu,
-                        "log_path": receipt.log_path,
-                        "submitted_at": receipt.created_at,
-                    }
-                )
-        updated_task = task.model_copy(
-            update={
-                "latest_launch_id": launch_id,
-                "status": task_status,
-                "runtime": task_runtime,
-                "updated_at": utc_now_iso(),
-            }
-        )
-        self._atomic_write_yaml(self.task_path(resolved, experiment_id, task_id), updated_task.model_dump(mode="json"))
-        self.update_experiment_status(resolved, experiment_id)
-        return artifact
-
-    def load_task(self, project: str, experiment_id: str, task_id: str) -> TaskRecord:
-        resolved = self._require_project(project)
-        path = self.task_path(resolved, experiment_id, task_id)
-        if not path.exists():
-            raise FileNotFoundError(f"Task '{task_id}' not found in experiment '{experiment_id}'.")
-        return TaskRecord.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")) or {})
-
-    def load_launch_artifact(self, project: str, experiment_id: str, launch_id: str) -> LaunchArtifact:
-        resolved = self._require_project(project)
-        path = self.launch_dir(resolved, experiment_id, launch_id) / "launch.yaml"
-        if not path.exists():
-            raise FileNotFoundError(f"Launch '{launch_id}' not found in experiment '{experiment_id}'.")
-        return LaunchArtifact.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")) or {})
-
-    def record_submission_receipt(
-        self,
-        *,
-        project: str,
-        experiment_id: str,
-        launch_id: str,
-        receipt: SubmissionReceipt,
-    ) -> LaunchArtifact:
-        resolved = self._require_project(project)
-        artifact = self.load_launch_artifact(resolved, experiment_id, launch_id)
-        updated_artifact = artifact.model_copy(
-            update={
-                "submission": receipt,
-                "status": self._derive_launch_status(receipt),
-                "updated_at": utc_now_iso(),
-            }
-        )
-        launch_dir = self.launch_dir(resolved, experiment_id, launch_id)
-        self._atomic_write_yaml(launch_dir / "launch.yaml", updated_artifact.model_dump(mode="json"))
-        self._atomic_write_yaml(launch_dir / "receipt.yaml", receipt.model_dump(mode="json"))
-
-        task = self.load_task(resolved, experiment_id, updated_artifact.task_id)
-        task_status = task.status
-        task_runtime = task.runtime
-        if receipt.accepted:
-            task_status = TaskStatus.QUEUED
-        if receipt.remote_job_id is not None or receipt.pid is not None or receipt.log_path is not None:
-            task_runtime = task.runtime.model_copy(
-                update={
-                    "remote_job_id": receipt.remote_job_id,
-                    "pid": receipt.pid,
-                    "assigned_gpu": receipt.assigned_gpu,
-                    "log_path": receipt.log_path,
-                    "submitted_at": receipt.created_at,
-                }
-            )
-        updated_task = task.model_copy(
-            update={
-                "status": task_status,
-                "runtime": task_runtime,
-                "updated_at": utc_now_iso(),
-            }
-        )
-        self._atomic_write_yaml(self.task_path(resolved, experiment_id, task.task_id), updated_task.model_dump(mode="json"))
-        self.update_experiment_status(resolved, experiment_id)
-        return updated_artifact
-
     def update_experiment_status(self, project: str, experiment_id: str) -> ExperimentRecord:
         resolved = self._require_project(project)
         detail = self.load_experiment(resolved, experiment_id)
@@ -599,23 +357,10 @@ class ExperimentService:
 
     def build_default_execution_profile(self, project: str) -> ExperimentExecutionProfile:
         resolved = self._require_project(project)
-        spec = self.project_service.load_project(resolved)
-        compute_name = spec.compute_profile.strip()
-        if not compute_name:
-            raise ValueError(
-                f"Project '{resolved}' is not connected to a compute profile. Run 'labit project edit {resolved}' to attach one."
-            )
-        compute = self.compute_service.load_compute(compute_name)
         return ExperimentExecutionProfile(
-            backend=ExecutionBackend.SSH,
-            profile=compute.name,
-            user=compute.connection.user,
-            host=compute.connection.host,
-            port=compute.connection.port,
-            ssh_key=compute.connection.ssh_key or "",
-            workdir=compute.workspace.workdir,
-            datadir=compute.workspace.datadir or "",
-            setup_script=compute.setup.script,
+            backend=ExecutionBackend.LOCAL,
+            profile="local",
+            workdir=str(self.project_service.project_code_dir(resolved)),
         )
 
     def build_code_snapshot(self, project: str, *, branch_hint: str = "") -> CodeSnapshot:
@@ -967,97 +712,6 @@ class ExperimentService:
         self._refresh_index(resolved)
         return self.load_experiment(resolved, experiment_id)
 
-    def submit_experiment(
-        self,
-        session: LaunchExpSession,
-        env_overrides: dict[str, str] | None = None,
-    ) -> SubmissionReceipt:
-        """Submit the experiment-level run.sh via SSH."""
-        from labit.experiments.executors.ssh import SSHExecutor
-
-        resolved = session.project
-        experiment_id = session.experiment_id
-        experiment_dir = self.experiment_dir(resolved, experiment_id)
-        run_sh_path = experiment_dir / "run.sh"
-
-        if not run_sh_path.exists():
-            return SubmissionReceipt(
-                accepted=False,
-                phase=SubmissionPhase.SUBMIT,
-                backend=ExecutionBackend.SSH,
-                stderr_tail="run.sh not found in experiment directory.",
-                error_kind=SubmissionErrorKind.TASK_SPEC_ERROR,
-            )
-
-        execution = self.build_default_execution_profile(resolved)
-        code_snapshot = self.build_code_snapshot(resolved)
-
-        # Create a launch directory for this submission
-        launch_id = self._next_launch_id(resolved, experiment_id)
-        launch_dir = self.launch_dir(resolved, experiment_id, launch_id)
-        launch_dir.mkdir(parents=True, exist_ok=True)
-
-        # Wrap the experiment's run.sh with the compute profile's setup
-        # script so that venv, git pull, and cd workdir happen first.
-        raw_command = run_sh_path.read_text(encoding="utf-8")
-        launch_env = {str(k): str(v) for k, v in (env_overrides or {}).items() if str(v).strip()}
-        frozen_spec = FrozenLaunchSpec(
-            command=raw_command,
-            workdir=execution.workdir,
-            output_dir=f"outputs/experiments/{experiment_id}",
-            env=launch_env,
-        )
-        wrapped_run_sh = self._render_run_sh(frozen_spec, execution)
-        wrapped_path = launch_dir / "run.sh"
-        wrapped_path.write_text(wrapped_run_sh, encoding="utf-8")
-
-        artifact = LaunchArtifact(
-            launch_id=launch_id,
-            task_id="experiment",
-            experiment_id=experiment_id,
-            project=resolved,
-            executor=execution.backend,
-            remote_user=execution.user,
-            remote_host=execution.host,
-            remote_port=execution.port,
-            ssh_key=execution.ssh_key,
-            frozen_spec=frozen_spec,
-            code_snapshot=code_snapshot,
-            run_sh_path=str(wrapped_path.relative_to(self.paths.root)),
-        )
-
-        executor = SSHExecutor(self.paths)
-        receipt = executor.submit(artifact)
-
-        # Save launch artifact with receipt
-        artifact = artifact.model_copy(update={
-            "submission": receipt,
-            "status": LaunchStatus.SUBMITTED if receipt.accepted else LaunchStatus.REJECTED,
-        })
-        self._atomic_write_yaml(launch_dir / "launch.yaml", artifact.model_dump(mode="json"))
-        if receipt is not None:
-            self._atomic_write_yaml(launch_dir / "receipt.yaml", receipt.model_dump(mode="json"))
-
-        # Update experiment status
-        detail = self.load_experiment(resolved, experiment_id)
-        updated_record = detail.record.model_copy(update={
-            "status": ExperimentStatus.QUEUED if receipt.accepted else ExperimentStatus.PLANNED,
-            "updated_at": utc_now_iso(),
-        })
-        self._atomic_write_yaml(
-            self.experiment_dir(resolved, experiment_id) / "experiment.yaml",
-            updated_record.model_dump(mode="json"),
-        )
-
-        self._log_planning_event(session, "experiment_submitted", {
-            "experiment_id": experiment_id,
-            "launch_id": launch_id,
-            "accepted": receipt.accepted,
-            "remote_host": execution.host,
-            "pid": receipt.pid,
-        })
-        return receipt
-
     def validate_dependency_graph(self, tasks: list[ExperimentTaskPlan]) -> str | None:
         """Check for circular dependencies. Returns error message or None."""
         task_ids = {t.id for t in tasks}
@@ -1337,41 +991,11 @@ class ExperimentService:
             return TaskKind.TRAIN
         if "eval" in lowered:
             return TaskKind.EVAL
-        if "sync" in lowered:
-            return TaskKind.SYNC
         if "analysis" in lowered or "analyze" in lowered:
             return TaskKind.ANALYSIS
         if "prep" in lowered or "prepare" in lowered:
             return TaskKind.DATA_PREP
         return TaskKind.CUSTOM
-
-    def _render_run_sh(self, spec: FrozenLaunchSpec, execution: ExperimentExecutionProfile) -> str:
-        lines = ["#!/usr/bin/env bash", "set -euo pipefail"]
-        lines.extend(self._render_runtime_preamble(execution))
-        for key, value in spec.env.items():
-            lines.append(f"export {key}={shlex.quote(value)}")
-        lines.append(spec.command)
-        return "\n".join(lines).rstrip() + "\n"
-
-    def _next_launch_id(self, project: str, experiment_id: str) -> str:
-        launches_dir = self.tasks_dir(project, experiment_id) / "launches"
-        highest = 0
-        if launches_dir.exists():
-            for path in launches_dir.iterdir():
-                match = re.fullmatch(r"l(\d+)", path.name)
-                if not match:
-                    continue
-                highest = max(highest, int(match.group(1)))
-        return f"l{highest + 1:03d}"
-
-    def _derive_launch_status(self, receipt: SubmissionReceipt | None):
-        if receipt is None:
-            return LaunchStatus.PREPARED
-        if receipt.accepted:
-            return LaunchStatus.SUBMITTED
-        if receipt.error_kind and receipt.error_kind.value == "task_spec_error":
-            return LaunchStatus.REJECTED
-        return LaunchStatus.FAILED
 
     def _experiment_sort_key(self, experiment_id: str) -> tuple[int, str]:
         match = re.fullmatch(r"e(\d+)", experiment_id)
@@ -1383,24 +1007,6 @@ class ExperimentService:
         if not path.exists():
             return ""
         return path.read_text(encoding="utf-8").strip()
-
-    def _render_runtime_preamble(self, execution: ExperimentExecutionProfile) -> list[str]:
-        lines: list[str] = []
-        if execution.setup_script:
-            lines.extend(execution.setup_script.splitlines())
-        if execution.workdir:
-            lines.append(f'cd "{self._shell_path(execution.workdir)}"')
-        if execution.datadir:
-            escaped = self._shell_path(execution.datadir).replace('"', '\\"')
-            lines.append(f'export LABIT_DATA_DIR="{escaped}"')
-        return lines
-
-    def _shell_path(self, value: str) -> str:
-        if value == "~":
-            return "$HOME"
-        if value.startswith("~/"):
-            return f"$HOME/{value[2:]}"
-        return value
 
     def _git_output(self, cwd: Path, args: list[str]) -> str | None:
         try:

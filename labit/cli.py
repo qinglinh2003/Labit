@@ -9,19 +9,13 @@ from rich.table import Table
 
 from labit import __version__
 from labit.commands.chat import chat_app
-from labit.commands.compute import compute_app
 from labit.commands.project import project_app
-from labit.commands.storage import storage_app
-from labit.commands.sync import sync_app
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
 from labit.web.command import launch_dashboard
 
 app = typer.Typer(help="LABIT: local-first control plane for research workflows.", invoke_without_command=True)
 app.add_typer(project_app, name="project")
-app.add_typer(compute_app, name="compute")
-app.add_typer(storage_app, name="storage")
-app.add_typer(sync_app, name="sync")
 app.add_typer(chat_app, name="chat")
 
 console = Console()

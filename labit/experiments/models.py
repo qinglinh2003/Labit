@@ -16,7 +16,7 @@ class ExperimentParentType(str, Enum):
 
 
 class ExecutionBackend(str, Enum):
-    SSH = "ssh"
+    LOCAL = "local"
 
 
 class ExecutionRuntime(str, Enum):
@@ -50,7 +50,6 @@ class TaskKind(str, Enum):
     TRAIN = "train"
     EVAL = "eval"
     ANALYSIS = "analysis"
-    SYNC = "sync"
     CUSTOM = "custom"
 
 
@@ -114,23 +113,16 @@ class HypothesisSnapshot(BaseModel):
 
 
 class ExperimentExecutionProfile(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     backend: ExecutionBackend
     profile: str = "default"
-    user: str = "root"
-    host: str = ""
-    port: int = 22
-    ssh_key: str = ""
     workdir: str = ""
     datadir: str = ""
     setup_script: str = ""
 
     @field_validator(
         "profile",
-        "user",
-        "host",
-        "ssh_key",
         "workdir",
         "datadir",
         "setup_script",
@@ -146,11 +138,6 @@ class ExperimentExecutionProfile(BaseModel):
 
     @model_validator(mode="after")
     def validate_runtime_requirements(self) -> "ExperimentExecutionProfile":
-        if self.backend == ExecutionBackend.SSH:
-            if not self.user or not self.host or not self.workdir:
-                raise ValueError("SSH execution requires user, host, and workdir.")
-        if self.port < 1 or self.port > 65535:
-            raise ValueError("SSH execution requires a valid port.")
         return self
 
 
@@ -215,9 +202,8 @@ class TaskSpec(BaseModel):
 
 
 class TaskRuntime(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
-    remote_job_id: str | None = None
     pid: str | None = None
     assigned_gpu: str | None = None
     log_path: str | None = None
@@ -227,7 +213,6 @@ class TaskRuntime(BaseModel):
     finished_at: str | None = None
 
     @field_validator(
-        "remote_job_id",
         "pid",
         "assigned_gpu",
         "log_path",
@@ -522,22 +507,19 @@ class CodeSnapshot(BaseModel):
 
 
 class SubmissionReceipt(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     accepted: bool
     phase: SubmissionPhase
     backend: ExecutionBackend
-    remote_host: str = ""
-    remote_job_id: str | None = None
     pid: str | None = None
     assigned_gpu: str | None = None
     log_path: str | None = None
-    ssh_exit_code: int | None = None
     stderr_tail: str = ""
     error_kind: SubmissionErrorKind | None = None
     created_at: str = Field(default_factory=utc_now_iso)
 
-    @field_validator("remote_host", "remote_job_id", "pid", "assigned_gpu", "log_path", "stderr_tail", mode="before")
+    @field_validator("pid", "assigned_gpu", "log_path", "stderr_tail", mode="before")
     @classmethod
     def strip_text(cls, value: object) -> object:
         if value is None:
@@ -548,17 +530,13 @@ class SubmissionReceipt(BaseModel):
 
 
 class LaunchArtifact(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     launch_id: str
     task_id: str
     experiment_id: str
     project: str
     executor: ExecutionBackend
-    remote_user: str = "root"
-    remote_host: str = ""
-    remote_port: int = 22
-    ssh_key: str = ""
     status: LaunchStatus = LaunchStatus.PREPARED
     frozen_spec: FrozenLaunchSpec
     code_snapshot: CodeSnapshot = Field(default_factory=CodeSnapshot)
@@ -575,9 +553,6 @@ class LaunchArtifact(BaseModel):
         "task_id",
         "experiment_id",
         "project",
-        "remote_user",
-        "remote_host",
-        "ssh_key",
         "run_sh_path",
         "run_py_path",
         "env_json_path",

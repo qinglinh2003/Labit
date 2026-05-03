@@ -826,8 +826,7 @@ Reply as `{participant.name}` only. Use plain text or markdown.
         """Build a static platform-awareness block that agents must always know."""
         lines = [
             "Platform (LABIT):",
-            "- LABIT is a research operating system that manages projects, hypotheses, experiments, documents, and remote compute.",
-            "- LABIT can manage remote compute via compute profiles and experiment services when available; prefer Labit tooling over ad-hoc SSH when possible.",
+            "- LABIT is a lightweight research workspace for projects, documents, and multi-agent discussion.",
             "- The LABIT codebase itself is a separate git repo. Do NOT commit, push, or modify LABIT source code from a project chat.",
         ]
         if project:
@@ -837,9 +836,6 @@ Reply as `{participant.name}` only. Use plain text or markdown.
                 f"- Git operations (commit, push, branch) should only target the project's files, never LABIT's own source code.",
             ])
             try:
-                spec = self.project_service.load_project(project)
-                if spec.compute_profile:
-                    lines.append(f"- This project uses compute profile '{spec.compute_profile}'. Use `labit compute test {spec.compute_profile}` to verify connectivity.")
                 code_dir = self.project_service.project_code_dir(project)
                 if code_dir.exists():
                     lines.append(f"- Project code directory: {code_dir.relative_to(self.paths.root)}")

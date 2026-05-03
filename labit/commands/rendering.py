@@ -33,8 +33,6 @@ CHAT_SHELL_COMMANDS = (
     "/doc list",
     "/swap",
     "/mute",
-    "/debrief",
-    "/review-results",
     "/new",
     "/switch",
     "/exit",
@@ -202,7 +200,6 @@ def render_console_header(
         )
     )
 
-
 def render_shell_help(console: Console) -> None:
     table = Table(show_header=True, header_style=f"bold {COMMAND_COLOR}")
     table.add_column("Command", style=f"bold {COMMAND_COLOR}")
@@ -222,8 +219,6 @@ def render_shell_help(console: Console) -> None:
     table.add_row("/doc status|done", "Show or leave the active document editing session.")
     table.add_row("/doc publish <doc_id>", "Promote a document from draft to active.")
     table.add_row("/doc list", "List all documents in the current project.")
-    table.add_row("/debrief", "Inspect active experiment launches and show their latest runtime state.")
-    table.add_row("/review-results <hypothesis_id>", "Summarize experiments linked to a hypothesis, suggest a resolution, and optionally write the decision back.")
     table.add_row("/exit", "Leave the chat shell.")
     console.print(Panel(table, title="LABIT Chat Commands", border_style=COMMAND_COLOR))
 
@@ -422,31 +417,6 @@ def render_capture_records(console: Console, kind: str, records) -> None:
         console.print(f"  [dim]{item.path}[/dim]")
 
 
-def render_review_suggestion(console: Console, suggestion) -> None:
-    body = (
-        f"[bold]Hypothesis[/bold]: {suggestion.hypothesis_id}\n"
-        f"[bold]Current[/bold]: {suggestion.current_state}/{suggestion.current_resolution}\n"
-        f"[bold]Suggested[/bold]: {suggestion.suggested_state}/{suggestion.suggested_resolution}\n"
-        f"[bold]Supporting[/bold]: {', '.join(suggestion.supporting_experiment_ids) or '(none)'}\n"
-        f"[bold]Contradicting[/bold]: {', '.join(suggestion.contradicting_experiment_ids) or '(none)'}\n"
-        f"[bold]Pending[/bold]: {', '.join(suggestion.pending_experiment_ids) or '(none)'}\n"
-        f"[bold]Reviewed[/bold]: {', '.join(suggestion.reviewed_experiment_ids) or '(none)'}\n\n"
-        f"[bold]Result summary[/bold]: {suggestion.result_summary or '(blank)'}\n\n"
-        f"[bold]Decision rationale[/bold]: {suggestion.decision_rationale or '(blank)'}"
-    )
-    console.print(
-        Panel(
-            body,
-            title=f"[bold green]Review Results · {suggestion.title}[/bold green]",
-            border_style="green",
-        )
-    )
-    if suggestion.next_steps:
-        console.print("[bold]Next steps[/bold]")
-        for item in suggestion.next_steps:
-            console.print(f"- {item}")
-
-
 # ---------------------------------------------------------------------------
 # Mode hints
 # ---------------------------------------------------------------------------
@@ -489,39 +459,3 @@ def render_doc_status(console: Console, doc_session: DocSession) -> None:
             border_style="green",
         )
     )
-
-
-# ---------------------------------------------------------------------------
-# Markdown generators (pure string → string, no console)
-# ---------------------------------------------------------------------------
-
-
-def debrief_markdown(*, experiment_id: str, rows: list[str]) -> str:
-    lines = [f"# Debrief {experiment_id}", ""]
-    if not rows:
-        lines.append("No active launches found.")
-        return "\n".join(lines)
-    lines.extend(rows)
-    return "\n".join(lines)
-
-
-def review_markdown(*, hypothesis_id: str, suggestion, saved) -> str:
-    lines = [
-        f"# Review {hypothesis_id}",
-        "",
-        f"- Current -> Suggested: {suggestion.current_state}/{suggestion.current_resolution} -> {suggestion.suggested_state}/{suggestion.suggested_resolution}",
-        f"- Final state: {saved.record.state.value}",
-        f"- Final resolution: {saved.record.resolution.value}",
-        f"- Supporting experiments: {', '.join(saved.record.supporting_experiment_ids) or '(none)'}",
-        f"- Contradicting experiments: {', '.join(saved.record.contradicting_experiment_ids) or '(none)'}",
-        f"- Reviewed experiments: {', '.join(suggestion.reviewed_experiment_ids) or '(none)'}",
-        "",
-        "## Result Summary",
-        "",
-        saved.record.result_summary or "(blank)",
-        "",
-        "## Decision Rationale",
-        "",
-        saved.record.decision_rationale or "(blank)",
-    ]
-    return "\n".join(lines)

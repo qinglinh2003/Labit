@@ -11,9 +11,7 @@ from rich.table import Table
 
 from labit.models import ProjectSpec
 from labit.paths import RepoPaths
-from labit.services.compute_service import ComputeService
 from labit.services.project_service import ProjectService
-from labit.services.storage_service import StorageService
 
 project_app = typer.Typer(help="Manage project state and project specs.")
 console = Console()
@@ -22,14 +20,6 @@ T = TypeVar("T")
 
 def _service() -> ProjectService:
     return ProjectService(RepoPaths.discover())
-
-
-def _compute_service() -> ComputeService:
-    return ComputeService(RepoPaths.discover())
-
-
-def _storage_service() -> StorageService:
-    return StorageService(RepoPaths.discover())
 
 
 def _emit(data: object, *, as_json: bool) -> None:
@@ -73,34 +63,6 @@ def _prompt_edit_csv(label: str, *, default: list[str] | None = None) -> list[st
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
-def _prompt_compute_profile(*, default: str = "") -> str:
-    service = _compute_service()
-    names = service.list_compute_names()
-    if not names:
-        raise typer.Exit(code=_fail("No compute profiles found. Run 'labit compute add' first.", as_json=False))
-    console.print("Available compute profiles: " + ", ".join(names))
-    while True:
-        value = typer.prompt("Compute profile", default=default or names[0], show_default=True).strip()
-        resolved = service.resolve_compute_name(value)
-        if resolved is not None:
-            return resolved
-        console.print(f"[bold red]Choose one of:[/bold red] {', '.join(names)}")
-
-
-def _prompt_storage_profile(*, default: str = "") -> str:
-    service = _storage_service()
-    names = service.list_storage_names()
-    if not names:
-        raise typer.Exit(code=_fail("No storage profiles found. Run 'labit storage add' first.", as_json=False))
-    console.print("Available storage profiles: " + ", ".join(names))
-    while True:
-        value = typer.prompt("Storage profile", default=default or names[0], show_default=True).strip()
-        resolved = service.resolve_storage_name(value)
-        if resolved is not None:
-            return resolved
-        console.print(f"[bold red]Choose one of:[/bold red] {', '.join(names)}")
-
-
 def _run_step(label: str, *, step: int, total: int, as_json: bool, fn: Callable[[], T]) -> T:
     if as_json:
         return fn()
@@ -131,11 +93,6 @@ def _prompt_project_fields_for_edit(spec: ProjectSpec) -> ProjectSpec:
     keywords = _prompt_edit_csv("Keywords (comma-separated)", default=spec.keywords)
     arxiv_categories = _prompt_edit_csv("arXiv categories (comma-separated)", default=spec.arxiv_categories)
     relevance_criteria = _prompt_edit_text("Relevance criteria", default=spec.relevance_criteria)
-    console.print("\n[bold]Compute[/bold]")
-    compute_profile = _prompt_compute_profile(default=spec.compute_profile)
-    console.print("\n[bold]Storage[/bold]")
-    storage_profile = _prompt_storage_profile(default=spec.storage_profile)
-    sync_dirs = _prompt_edit_csv("Sync directories (comma-separated)", default=spec.sync_dirs)
 
     return ProjectSpec.model_validate(
         {
@@ -145,9 +102,6 @@ def _prompt_project_fields_for_edit(spec: ProjectSpec) -> ProjectSpec:
             "keywords": keywords,
             "arxiv_categories": arxiv_categories,
             "relevance_criteria": relevance_criteria,
-            "compute_profile": compute_profile,
-            "storage_profile": storage_profile,
-            "sync_dirs": sync_dirs,
         }
     )
 
@@ -162,9 +116,6 @@ def _render_spec_review(spec: ProjectSpec) -> None:
     table.add_row("Keywords", ", ".join(spec.keywords) or "(blank)")
     table.add_row("arXiv Categories", ", ".join(spec.arxiv_categories) or "(blank)")
     table.add_row("Relevance", spec.relevance_criteria or "(blank)")
-    table.add_row("Compute Profile", spec.compute_profile)
-    table.add_row("Storage Profile", spec.storage_profile)
-    table.add_row("Sync Dirs", ", ".join(spec.sync_dirs) or "(blank)")
     console.print(table)
 
 
@@ -189,12 +140,6 @@ def new_project(json_output: bool = typer.Option(False, "--json", help="Emit JSO
     arxiv_categories = _prompt_csv("arXiv categories (comma-separated)")
     relevance_criteria = _prompt_text("Relevance criteria")
 
-    console.print("\n[bold]Compute[/bold]")
-    compute_profile = _prompt_compute_profile()
-    console.print("\n[bold]Storage[/bold]")
-    storage_profile = _prompt_storage_profile()
-    sync_dirs = _prompt_csv("Sync directories (comma-separated)")
-
     try:
         project_spec = ProjectSpec.model_validate(
             {
@@ -204,9 +149,6 @@ def new_project(json_output: bool = typer.Option(False, "--json", help="Emit JSO
                 "keywords": keywords,
                 "arxiv_categories": arxiv_categories,
                 "relevance_criteria": relevance_criteria,
-                "compute_profile": compute_profile,
-                "storage_profile": storage_profile,
-                "sync_dirs": sync_dirs,
             }
         )
     except ValidationError as exc:
@@ -273,9 +215,6 @@ def new_project(json_output: bool = typer.Option(False, "--json", help="Emit JSO
         ("Name", created["name"]),
         ("Config", created["config_path"]),
         ("Workspace", created["project_dir"]),
-        ("Compute", project_spec.compute_profile),
-        ("Storage", project_spec.storage_profile),
-        ("Sync dirs", ", ".join(project_spec.sync_dirs) or "(blank)"),
     ]
     if set_active:
         rows.append(("Active project", created["name"]))
@@ -301,9 +240,6 @@ def current(json_output: bool = typer.Option(False, "--json", help="Emit JSON ou
 
     payload = summary.model_dump()
     payload["active_project"] = payload.pop("name")
-    payload["compute_profile"] = spec.compute_profile
-    payload["storage_profile"] = spec.storage_profile
-    payload["sync_dirs"] = spec.sync_dirs
     if json_output:
         _emit(payload, as_json=True)
         return
@@ -313,9 +249,6 @@ def current(json_output: bool = typer.Option(False, "--json", help="Emit JSON ou
     table.add_column("Value")
     table.add_row("Name", payload["active_project"])
     table.add_row("Description", payload["description"])
-    table.add_row("Compute", payload["compute_profile"])
-    table.add_row("Storage", payload["storage_profile"])
-    table.add_row("Sync dirs", ", ".join(payload["sync_dirs"]) or "(blank)")
     table.add_row("Keywords", str(payload["keyword_count"]))
     table.add_row("Papers", str(payload["paper_count"]))
     table.add_row("Hypotheses", str(payload["hypothesis_count"]))
@@ -366,9 +299,6 @@ def show_project(
     table.add_column("Field")
     table.add_column("Value")
     table.add_row("Description", summary.description or "(blank)")
-    table.add_row("Compute profile", spec.compute_profile)
-    table.add_row("Storage profile", spec.storage_profile)
-    table.add_row("Sync dirs", ", ".join(spec.sync_dirs) or "(blank)")
     table.add_row("Repo", spec.repo or "(blank)")
     table.add_row("Keywords", ", ".join(spec.keywords) or "(blank)")
     table.add_row("arXiv Categories", ", ".join(spec.arxiv_categories) or "(blank)")
@@ -425,9 +355,6 @@ def edit_project(
             ("Name", result["name"]),
             ("Config", result["config_path"]),
             ("Workspace", result["project_dir"]),
-            ("Compute", updated_spec.compute_profile),
-            ("Storage", updated_spec.storage_profile),
-            ("Sync dirs", ", ".join(updated_spec.sync_dirs) or "(blank)"),
             ("Next", f"labit project show {result['name']}"),
         ],
     )
@@ -554,9 +481,6 @@ def draft_project(
 
     console.print(f"[bold green]Drafted project spec[/bold green]: {project_spec.name}")
     console.print(f"Description: {project_draft.description}")
-    console.print(f"Compute profile: {project_spec.compute_profile}")
-    console.print(f"Storage profile: {project_spec.storage_profile}")
-    console.print("Sync dirs: " + (", ".join(project_spec.sync_dirs) or "(blank)"))
     if output is not None:
         console.print(f"Wrote spec draft: {output.resolve()}")
 
@@ -600,9 +524,6 @@ def create_project(
         ("Name", result["name"]),
         ("Config", result["config_path"]),
         ("Workspace", result["project_dir"]),
-        ("Compute", project_spec.compute_profile),
-        ("Storage", project_spec.storage_profile),
-        ("Sync dirs", ", ".join(project_spec.sync_dirs) or "(blank)"),
     ]
     if set_active:
         rows.append(("Active project", result["name"]))
@@ -721,9 +642,6 @@ def init_project(
         ("Name", created["name"]),
         ("Config", created["config_path"]),
         ("Workspace", created["project_dir"]),
-        ("Compute", project_spec.compute_profile),
-        ("Storage", project_spec.storage_profile),
-        ("Sync dirs", ", ".join(project_spec.sync_dirs) or "(blank)"),
     ]
     if set_active:
         rows.append(("Active project", created["name"]))
