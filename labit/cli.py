@@ -12,7 +12,6 @@ from labit.commands.chat import chat_app
 from labit.commands.compute import compute_app
 from labit.commands.daily_summary import daily_summary_app
 from labit.commands.experiment import experiment_app
-from labit.commands.hypothesis import hypothesis_app
 from labit.commands.memory import memory_app
 from labit.commands.palace import palace_app
 from labit.commands.paper import paper_app
@@ -29,7 +28,6 @@ app.add_typer(project_app, name="project")
 app.add_typer(compute_app, name="compute")
 app.add_typer(storage_app, name="storage")
 app.add_typer(paper_app, name="paper")
-app.add_typer(hypothesis_app, name="hypothesis")
 app.add_typer(experiment_app, name="experiment")
 app.add_typer(memory_app, name="memory")
 app.add_typer(palace_app, name="palace")

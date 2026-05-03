@@ -13,7 +13,6 @@ from rich.theme import Theme
 
 if TYPE_CHECKING:
     from labit.documents.models import DocSession
-    from labit.experiments.models import ExperimentTaskPlan, LaunchExpPhase, LaunchExpSession
 
 COMMAND_COLOR = "#0080ff"
 
@@ -23,8 +22,6 @@ CHAT_SHELL_COMMANDS = (
     "/show",
     "/mode",
     "/memory",
-    "/paste-image",
-    "/image",
     "/long-term-memory",
     "/ltm",
     "/idea",
@@ -37,18 +34,8 @@ CHAT_SHELL_COMMANDS = (
     "/doc status",
     "/doc publish",
     "/doc list",
-    "/hypothesis",
-    "/launch-exp",
     "/swap",
     "/mute",
-    "/launch-exp resume",
-    "/launch-exp approve-tasks",
-    "/launch-exp approve-task",
-    "/launch-exp reopen-task",
-    "/launch-exp generate-script",
-    "/launch-exp run-task",
-    "/launch-exp status",
-    "/launch-exp done",
     "/auto",
     "/auto start",
     "/auto run",
@@ -57,12 +44,6 @@ CHAT_SHELL_COMMANDS = (
     "/auto stop",
     "/debrief",
     "/review-results",
-    "/dev",
-    "/dev start",
-    "/dev status",
-    "/dev continue",
-    "/dev stop",
-    "/dev finish",
     "/new",
     "/switch",
     "/exit",
@@ -206,7 +187,6 @@ def render_console_header(
             [
                 command_chip("/help"),
                 command_chip("/ltm"),
-                command_chip("/image"),
                 command_chip("/exit"),
             ]
         )
@@ -219,7 +199,6 @@ def render_console_header(
                 command_chip("/idea"),
                 command_chip("/todo"),
                 command_chip("/doc"),
-                command_chip("/hypothesis"),
             ]
         )
     )
@@ -230,7 +209,6 @@ def render_console_header(
                 command_chip("/mode"),
                 command_chip("/swap"),
                 command_chip("/mute"),
-                command_chip("/dev"),
             ]
         )
     )
@@ -250,7 +228,6 @@ def render_shell_help(console: Console) -> None:
     table.add_row("/mute <name>", "Mute an agent for the next turn only. Toggle: run again to unmute.")
     table.add_row("/memory [id|kind]", "Show recent project memory, one memory by id, or filter by memory kind.")
     table.add_row("/long-term-memory <question>", "Run a deep long-term memory search for this turn, then answer from the richer retrieved context.")
-    table.add_row("/paste-image [question]", "Read one image from the system clipboard, save it under .labit/, and send it as this turn's image input.")
     table.add_row("/idea [text]", "Save a lightweight project idea. With no text, show saved ideas.")
     table.add_row("/todo [text]", "Save an actionable project todo. With no text, show saved todos.")
     table.add_row("/doc start <title>", "Enter document mode and write a design doc to docs/designs/.")
@@ -258,19 +235,6 @@ def render_shell_help(console: Console) -> None:
     table.add_row("/doc status|done", "Show or leave the active document editing session.")
     table.add_row("/doc publish <doc_id>", "Promote a document from draft to active.")
     table.add_row("/doc list", "List all documents in the current project.")
-    table.add_row("/hypothesis [idea]", "Draft a hypothesis and enter editing mode for iterative refinement.")
-    table.add_row("/hypothesis open <id>", "Re-open an existing hypothesis for editing.")
-    table.add_row("/hypothesis status", "Show current hypothesis being edited.")
-    table.add_row("/hypothesis done", "Leave hypothesis editing mode.")
-    table.add_row("/launch-exp <hypothesis_id>", "Start interactive experiment planning from a hypothesis.")
-    table.add_row("/launch-exp resume <experiment_id>", "Resume a failed/existing experiment for revision or resubmission.")
-    table.add_row("/launch-exp approve-tasks", "Approve the current task breakdown and move to detailed planning.")
-    table.add_row("/launch-exp approve-task <id>", "Approve a specific task's detailed plan.")
-    table.add_row("/launch-exp reopen-task <id>", "Reopen a previously approved task for re-planning.")
-    table.add_row("/launch-exp generate-script", "Generate run.sh from approved task plans.")
-    table.add_row("/launch-exp run-task <id>", "Submit only one task from the run.sh, reusing earlier outputs.")
-    table.add_row("/launch-exp status", "Show current experiment planning status.")
-    table.add_row("/launch-exp done", "Finalize the experiment and exit planning mode.")
     table.add_row("/auto start <doc_path>", "Start auto-iteration from a design doc (or <constraint> || <success>).")
     table.add_row("/auto run [N]", "Run N auto-iteration rounds.")
     table.add_row("/auto log [N]", "Show detailed view of last N iterations.")
@@ -278,11 +242,6 @@ def render_shell_help(console: Console) -> None:
     table.add_row("/auto stop", "Stop the current auto-iteration session.")
     table.add_row("/debrief", "Inspect active experiment launches and show their latest runtime state.")
     table.add_row("/review-results <hypothesis_id>", "Summarize experiments linked to a hypothesis, suggest a resolution, and optionally write the decision back.")
-    table.add_row("/dev start <task>", "Start autonomous dev loop in an isolated worktree (writer+reviewer auto-iterate).")
-    table.add_row("/dev status", "Show current dev loop status.")
-    table.add_row("/dev continue", "Resume dev loop after a decision point.")
-    table.add_row("/dev finish", "Merge, keep, or discard the dev worktree branch.")
-    table.add_row("/dev stop", "Stop the current dev loop.")
     table.add_row("/exit", "Leave the chat shell.")
     console.print(Panel(table, title="LABIT Chat Commands", border_style=COMMAND_COLOR))
 
@@ -452,25 +411,6 @@ def box_bottom(width: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-def render_hypothesis_preview(console: Console, draft, *, project: str) -> None:
-    body = (
-        f"[bold]Project[/bold]: {project}\n"
-        f"[bold]Claim[/bold]: {draft.claim}\n"
-        f"[bold]Independent variable[/bold]: {draft.independent_variable or '(blank)'}\n"
-        f"[bold]Dependent variable[/bold]: {draft.dependent_variable or '(blank)'}\n"
-        f"[bold]Success criteria[/bold]: {draft.success_criteria or '(blank)'}\n"
-        f"[bold]Failure criteria[/bold]: {draft.failure_criteria or '(blank)'}\n"
-        f"[bold]Source papers[/bold]: {', '.join(draft.source_paper_ids) or '(none)'}"
-    )
-    console.print(Panel(body, title=f"[bold green]Hypothesis Draft · {draft.title}[/bold green]", border_style="green"))
-    if draft.motivation:
-        console.print(Panel(draft.motivation, title="Motivation", border_style="cyan"))
-    if draft.rationale_markdown:
-        console.print(Panel(md(draft.rationale_markdown, sanitize=False), title="Rationale", border_style="blue"))
-    if draft.experiment_plan_markdown:
-        console.print(Panel(md(draft.experiment_plan_markdown, sanitize=False), title="Experiment Plan", border_style="magenta"))
-
-
 def render_idea_preview(console: Console, draft) -> None:
     console.print(
         Panel(
@@ -536,34 +476,6 @@ def render_memory_detail(console: Console, record) -> None:
     )
 
 
-def render_experiment_launch_preview(
-    console: Console,
-    *,
-    hypothesis_id: str,
-    defaults: dict[str, str],
-    execution,
-) -> None:
-    body = (
-        f"[bold]Hypothesis[/bold]: {hypothesis_id}\n"
-        f"[bold]Title[/bold]: {defaults.get('title') or '(blank)'}\n"
-        f"[bold]Objective[/bold]: {defaults.get('objective') or '(blank)'}\n"
-        f"[bold]Task kind[/bold]: {defaults.get('task_kind') or '(blank)'}\n"
-        f"[bold]Research role[/bold]: {defaults.get('research_role') or '(blank)'}\n"
-        f"[bold]Branch[/bold]: {defaults.get('branch') or '(blank)'}\n"
-        f"[bold]Config[/bold]: {defaults.get('config_ref') or '(blank)'}\n"
-        f"[bold]GPU[/bold]: {defaults.get('gpu') or '(blank)'}\n"
-        f"[bold]Output dir[/bold]: {defaults.get('output_dir') or '(blank)'}\n"
-        f"[bold]Command[/bold]: {defaults.get('command') or '(blank)'}\n\n"
-        f"[bold]Compute[/bold]: {execution.profile}\n"
-        f"[bold]Backend[/bold]: {execution.backend.value}\n"
-        f"[bold]User[/bold]: {execution.user or '(blank)'}\n"
-        f"[bold]Host[/bold]: {execution.host or '(blank)'}\n"
-        f"[bold]Workdir[/bold]: {execution.workdir or '(blank)'}\n"
-        f"[bold]Setup[/bold]: {'configured' if execution.setup_script else '(blank)'}"
-    )
-    console.print(Panel(body, title="[bold green]Launch Experiment Preview[/bold green]", border_style="green"))
-
-
 def render_review_suggestion(console: Console, suggestion) -> None:
     body = (
         f"[bold]Hypothesis[/bold]: {suggestion.hypothesis_id}\n"
@@ -594,24 +506,6 @@ def render_review_suggestion(console: Console, suggestion) -> None:
 # ---------------------------------------------------------------------------
 
 
-def print_hypothesis_mode_hints(console: Console, session, hypothesis_id: str) -> None:
-    from labit.chat.models import ChatMode
-
-    lines = [
-        f"[dim]──── Hypothesis Mode · {hypothesis_id} ────[/dim]",
-        "[dim]  Type feedback to revise the hypothesis (agent updates files, not chat).[/dim]",
-        "[dim]  /hypothesis status  — show current hypothesis info[/dim]",
-        "[dim]  /hypothesis done    — leave hypothesis editing mode[/dim]",
-        "[dim]  Ctrl+C              — interrupt current revision[/dim]",
-    ]
-    if session.mode == ChatMode.ROUND_ROBIN and len(session.participants) >= 2:
-        author = session.participants[0].name
-        reviewer = session.participants[1].name
-        lines.append(f"[dim]  Round-robin: {author} revises → {reviewer} reviews[/dim]")
-    console.print("\n".join(lines))
-    console.print("")
-
-
 def print_doc_mode_hints(console: Console, session) -> None:
     from labit.chat.models import ChatMode
 
@@ -630,118 +524,6 @@ def print_doc_mode_hints(console: Console, session) -> None:
         lines.append(f"[dim]  Round-robin: {author} revises → {reviewer} reviews (review blocks in doc)[/dim]")
     console.print("\n".join(lines))
     console.print("")
-
-
-def print_launch_exp_hints(console: Console, session: LaunchExpSession) -> None:
-    from labit.experiments.models import LaunchExpPhase
-
-    phase_label = {
-        LaunchExpPhase.TASK_BREAKDOWN: "Task Breakdown",
-        LaunchExpPhase.TASK_PLANNING: "Task Planning",
-        LaunchExpPhase.SCRIPT_GENERATION: "Script Generation",
-    }.get(session.phase, session.phase.value)
-    lines = [
-        f"[dim]──── Experiment Planning Mode ({phase_label}) ────[/dim]",
-        "[dim]  Type feedback to iterate on the current phase.[/dim]",
-    ]
-    if session.phase == LaunchExpPhase.TASK_BREAKDOWN:
-        lines.append("[dim]  /launch-exp approve-tasks   — approve task list, move to detailed planning[/dim]")
-    elif session.phase == LaunchExpPhase.TASK_PLANNING:
-        ct = session.current_task
-        if ct:
-            lines.append(f"[dim]  Current task: {ct.id} — {ct.name}[/dim]")
-        lines.append("[dim]  /launch-exp approve-task     — approve current task's detail[/dim]")
-        lines.append("[dim]  /launch-exp reopen-task <id> — reopen a previously approved task[/dim]")
-    elif session.phase == LaunchExpPhase.SCRIPT_GENERATION:
-        lines.append("[dim]  /launch-exp generate-script  — generate run.sh[/dim]")
-        if session.run_sh_content:
-            lines.append("[dim]  /launch-exp run-task <id>    — submit only one task, reusing prior outputs[/dim]")
-            lines.append("[dim]  /launch-exp done              — finalize and exit planning mode[/dim]")
-        else:
-            lines.append("[dim]  Generate script first, then /launch-exp done to finalize.[/dim]")
-    lines.append("[dim]  /launch-exp status            — show planning progress[/dim]")
-    lines.append("[dim]  Ctrl+C                        — interrupt current operation[/dim]")
-    console.print("\n".join(lines))
-    console.print("")
-
-
-# ---------------------------------------------------------------------------
-# Experiment planning rendering
-# ---------------------------------------------------------------------------
-
-
-def render_task_breakdown(console: Console, session: LaunchExpSession) -> None:
-    table = Table(title="Task Breakdown", show_header=True, border_style="blue")
-    table.add_column("ID", style="bold")
-    table.add_column("Name")
-    table.add_column("Goal")
-    table.add_column("Depends On")
-    table.add_column("Status")
-    for t in session.task_plans:
-        status = "[green]approved[/green]" if t.approved else "[dim]pending[/dim]"
-        deps = ", ".join(t.depends_on) if t.depends_on else "-"
-        table.add_row(t.id, t.name, t.goal[:80] if t.goal else "-", deps, status)
-    console.print(table)
-    console.print("")
-
-
-def render_task_detail(console: Console, task: ExperimentTaskPlan) -> None:
-    parts = [
-        f"[bold]ID[/bold]: {task.id}",
-        f"[bold]Name[/bold]: {task.name}",
-        f"[bold]Goal[/bold]: {task.goal}",
-    ]
-    if task.depends_on:
-        parts.append(f"[bold]Depends on[/bold]: {', '.join(task.depends_on)}")
-    if task.entry_hint:
-        parts.append(f"[bold]Entry hint[/bold]: {task.entry_hint}")
-    if task.inputs:
-        parts.append(f"[bold]Inputs[/bold]: {task.inputs}")
-    if task.outputs:
-        parts.append(f"[bold]Outputs[/bold]: {task.outputs}")
-    if task.checkpoint:
-        parts.append(f"[bold]Checkpoint[/bold]: {task.checkpoint}")
-    if task.failure_modes:
-        parts.append(f"[bold]Failure modes[/bold]: {task.failure_modes}")
-    console.print(
-        Panel(
-            "\n".join(parts),
-            title=f"[bold cyan]Task Detail: {task.id}[/bold cyan]",
-            border_style="cyan",
-        )
-    )
-
-
-def render_launch_exp_status(console: Console, session: LaunchExpSession) -> None:
-    from labit.experiments.models import LaunchExpPhase
-
-    phase_label = {
-        LaunchExpPhase.TASK_BREAKDOWN: "Task Breakdown",
-        LaunchExpPhase.TASK_PLANNING: "Task Planning",
-        LaunchExpPhase.SCRIPT_GENERATION: "Script Generation",
-    }.get(session.phase, session.phase.value)
-    approved = sum(1 for t in session.task_plans if t.approved)
-    total = len(session.task_plans)
-    parts = [
-        f"[bold]Hypothesis[/bold]: {session.hypothesis_id}",
-        f"[bold]Experiment[/bold]: {session.experiment_id}",
-        f"[bold]Phase[/bold]: {phase_label}",
-        f"[bold]Tasks[/bold]: {approved}/{total} approved",
-    ]
-    if session.phase == LaunchExpPhase.TASK_PLANNING:
-        ct = session.current_task
-        if ct:
-            parts.append(f"[bold]Current task[/bold]: {ct.id}: {ct.name}")
-    if session.run_sh_content:
-        parts.append(f"[bold]run.sh[/bold]: {len(session.run_sh_content.splitlines())} lines")
-    console.print(
-        Panel(
-            "\n".join(parts),
-            title="[bold blue]Experiment Planning Status[/bold blue]",
-            border_style="blue",
-        )
-    )
-
 
 def render_doc_status(console: Console, doc_session: DocSession) -> None:
     console.print(
@@ -765,46 +547,6 @@ def render_doc_status(console: Console, doc_session: DocSession) -> None:
 # ---------------------------------------------------------------------------
 # Markdown generators (pure string → string, no console)
 # ---------------------------------------------------------------------------
-
-
-def launch_markdown(
-    *,
-    hypothesis_id: str,
-    experiment_id: str,
-    task_id: str,
-    launch_id: str,
-    defaults: dict[str, str],
-    execution,
-    receipt,
-) -> str:
-    lines = [
-        f"# Launch {experiment_id}",
-        "",
-        f"- Hypothesis: {hypothesis_id}",
-        f"- Task: {task_id}",
-        f"- Launch: {launch_id}",
-        f"- Accepted: {'yes' if receipt.accepted else 'no'}",
-        f"- Compute: {execution.profile}",
-        f"- Backend: {execution.backend.value}",
-        f"- User: {execution.user or '(blank)'}",
-        f"- Host: {receipt.remote_host or execution.host or '(blank)'}",
-        f"- Setup: {'configured' if execution.setup_script else '(blank)'}",
-        f"- Branch: {defaults.get('branch') or '(blank)'}",
-        f"- Config: {defaults.get('config_ref') or '(blank)'}",
-        f"- GPU: {defaults.get('gpu') or '(blank)'}",
-        f"- Output dir: {defaults.get('output_dir') or '(blank)'}",
-        f"- PID: {receipt.pid or '(none)'}",
-        f"- Log: {receipt.log_path or '(none)'}",
-        "",
-        "## Command",
-        "",
-        "```bash",
-        defaults.get("command", "").strip(),
-        "```",
-    ]
-    if receipt.stderr_tail:
-        lines.extend(["", "## Submission stderr", "", "```text", receipt.stderr_tail.strip(), "```"])
-    return "\n".join(lines).rstrip()
 
 
 def debrief_markdown(*, experiment_id: str, rows: list[str]) -> str:
@@ -836,58 +578,3 @@ def review_markdown(*, hypothesis_id: str, suggestion, saved) -> str:
         saved.record.decision_rationale or "(blank)",
     ]
     return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Dev loop rendering
-# ---------------------------------------------------------------------------
-
-
-def render_dev_decision(console: Console, dev_session) -> None:
-    decision = dev_session.pending_decision
-    if not decision:
-        return
-    lines = [f"[bold]{decision.question}[/bold]\n"]
-    for i, opt in enumerate(decision.options):
-        letter = chr(ord("A") + i)
-        rec = " [bold green](recommended)[/bold green]" if decision.recommended == i else ""
-        lines.append(f"  [{letter}] {opt}{rec}")
-    if decision.rationale:
-        lines.append(f"\n[dim]Reason: {decision.rationale}[/dim]")
-    lines.append(f"\n[dim]Asked by: {decision.asked_by}[/dim]")
-    console.print(Panel(
-        "\n".join(lines),
-        title="[bold yellow]Decision needed[/bold yellow]",
-        border_style="yellow",
-    ))
-
-
-def render_dev_status(console: Console, dev_session) -> None:
-    lines = [
-        f"[bold]Task[/bold]: {dev_session.task}",
-        f"[bold]Writer[/bold]: {dev_session.writer_name}",
-        f"[bold]Reviewer[/bold]: {dev_session.reviewer_name}",
-        f"[bold]Round[/bold]: {dev_session.current_round}/{dev_session.max_rounds}",
-        f"[bold]Status[/bold]: {dev_session.status}",
-        f"[bold]Test mode[/bold]: {dev_session.test_mode}",
-        f"[bold]Scope[/bold]: {dev_session.scope_label or 'repository'}",
-        f"[bold]Git root[/bold]: {dev_session.scope_git_root or '(default)'}",
-        f"[bold]Branch repo[/bold]: {dev_session.branch_repo_root or dev_session.scope_git_root or '(default)'}",
-        f"[bold]Worktree[/bold]: {dev_session.worktree_path or '(none)'}",
-        f"[bold]Branch[/bold]: {dev_session.dev_branch or '(none)'}",
-    ]
-    if dev_session.history:
-        last = dev_session.history[-1]
-        if last.changed_files:
-            lines.append(f"\n[bold]Last changed files[/bold]:")
-            for path in last.changed_files[:8]:
-                lines.append(f"  - {path}")
-        if last.findings:
-            lines.append(f"\n[bold]Last findings[/bold]:")
-            for f in last.findings[:5]:
-                lines.append(f"  - {f}")
-    console.print(Panel(
-        "\n".join(lines),
-        title="[bold]Dev Loop Status[/bold]",
-        border_style=COMMAND_COLOR,
-    ))

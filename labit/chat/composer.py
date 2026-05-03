@@ -98,7 +98,7 @@ def prompt_with_clipboard_image(
         HTML(f"<prompt>{prompt_prefix}</prompt>"),
         key_bindings=bindings,
         style=style,
-        placeholder=HTML("<placeholder>Ask a question or paste an image...</placeholder>"),
+        placeholder=HTML("<placeholder>Ask a question...</placeholder>"),
         show_frame=True,
         editing_mode=EditingMode.EMACS,
         multiline=True,

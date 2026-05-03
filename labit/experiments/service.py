@@ -94,8 +94,8 @@ class ExperimentService:
             snapshot = inspect_experiment_dir(experiment_dir)
             if snapshot.state.value == "draft":
                 raise FileNotFoundError(
-                    f"Experiment '{experiment_id}' is still a launch-exp draft in project '{resolved}'. "
-                    "Finalize it with /launch-exp done before loading it as a finalized experiment."
+                    f"Experiment '{experiment_id}' is still a draft in project '{resolved}'. "
+                    "Finalize it before loading it as a finalized experiment."
                 )
             raise FileNotFoundError(f"Experiment '{experiment_id}' not found in project '{resolved}'.")
         return self._load_detail(experiment_dir)

@@ -33,13 +33,11 @@ from labit.commands.rendering import (
     box_width,
     clip_box_text,
     debrief_markdown,
-    launch_markdown,
     md,
     message_body,
     print_doc_mode_hints,
     render_compact_transcript,
     render_console_header,
-    render_experiment_launch_preview,
     render_message_block,
     render_recent_messages,
     render_review_suggestion,
@@ -52,7 +50,6 @@ from labit.commands.rendering import (
     sanitize_markdown,
     transcript_preview_text,
 )
-from labit.chat.clipboard import ClipboardImageError, capture_clipboard_image
 from labit.chat.composer import ComposerResult, prompt_toolkit_available, prompt_with_clipboard_image
 from labit.chat.models import ChatMode
 from labit.chat.service import ChatService
@@ -61,26 +58,11 @@ from labit.documents.commands import handle_document_command
 from labit.documents.drafter import DocDrafter
 from labit.documents.models import DocSession
 from labit.documents.service import DocumentService
-from labit.devloop.commands import handle_dev_command
-from labit.devloop.engine import run_dev_loop
-from labit.devloop.models import DevLoopSession
 from labit.experiments.executors.ssh import SSHExecutor
-from labit.experiments.commands import handle_launch_exp_command, handle_launch_exp_instruction
 from labit.experiments.models import (
-    ExperimentDraft,
-    ExperimentTaskPlan,
-    LaunchExpSession,
-    ResearchRole,
-    TaskDraft,
-    TaskKind,
-    TaskResources,
-    TaskSpec,
     TaskStatus,
 )
 from labit.experiments.service import ExperimentService
-from labit.hypotheses.drafter import HypothesisDrafter
-from labit.hypotheses.commands import handle_hypothesis_command
-from labit.hypotheses.models import HypothesisDraft
 from labit.hypotheses.models import HypothesisResolution, HypothesisState, utc_now_iso
 from labit.hypotheses.service import HypothesisService
 from labit.memory.commands import handle_memory_command
@@ -105,10 +87,6 @@ def _project_service() -> ProjectService:
 
 def _hypothesis_service() -> HypothesisService:
     return HypothesisService(RepoPaths.discover())
-
-
-def _hypothesis_drafter() -> HypothesisDrafter:
-    return HypothesisDrafter(RepoPaths.discover())
 
 
 def _experiment_service() -> ExperimentService:
@@ -492,8 +470,6 @@ def _run_streaming_turn(
     return result
 
 
-# /dev auto-development loop lives in labit.devloop.
-
 def run_chat_shell(
     *,
     session,
@@ -507,10 +483,6 @@ def run_chat_shell(
 
     current_session = session
     active_doc: DocSession | None = None
-    # Hypothesis editing mode state: (hypothesis_id, project, current_draft)
-    active_hypothesis: tuple[str, str, HypothesisDraft] | None = None
-    active_launch_exp: LaunchExpSession | None = None
-    active_dev: DevLoopSession | None = None
     muted_next_turn: set[str] = set()  # agent names to skip on next turn only
     dispatcher = SlashCommandDispatcher()
     dispatcher.register("/auto", lambda ctx, arg: handle_auto_command(ctx=ctx, argument=arg))
@@ -525,16 +497,6 @@ def run_chat_shell(
             ),
         )
 
-    def _handle_hypothesis(ctx: ChatContext, arg: str) -> None:
-        nonlocal active_hypothesis
-        result = handle_hypothesis_command(
-            ctx=ctx,
-            argument=arg,
-            active_hypothesis=active_hypothesis,
-        )
-        active_hypothesis = result.active_hypothesis
-
-    dispatcher.register("/hypothesis", _handle_hypothesis)
     dispatcher.register("/memory", lambda ctx, arg: handle_memory_command(ctx=ctx, argument=arg))
 
     def _handle_document(ctx: ChatContext, arg: str) -> None:
@@ -547,28 +509,6 @@ def run_chat_shell(
         active_doc = result.active_doc
 
     dispatcher.register("/doc", _handle_document)
-
-    def _handle_launch_exp(ctx: ChatContext, arg: str) -> None:
-        nonlocal active_launch_exp
-        result = handle_launch_exp_command(
-            ctx=ctx,
-            argument=arg,
-            active_launch_exp=active_launch_exp,
-        )
-        active_launch_exp = result.active_launch_exp
-
-    dispatcher.register("/launch-exp", _handle_launch_exp)
-
-    def _handle_dev(ctx: ChatContext, arg: str) -> None:
-        nonlocal active_dev
-        active_dev = handle_dev_command(
-            ctx=ctx,
-            argument=arg,
-            active_dev=active_dev,
-            run_streaming_turn=_run_streaming_turn,
-        )
-
-    dispatcher.register("/dev", _handle_dev)
     while True:
         try:
             composer_result = _prompt_in_box(current_session)
@@ -660,32 +600,6 @@ def run_chat_shell(
                         continue
                     muted_next_turn.add(agent_name)
                     console.print(f"[bold #0080ff]{agent_name} muted for next turn.[/bold #0080ff] (auto-unmutes after one turn)")
-                continue
-            if command in {"/paste-image", "/image"}:
-                query = argument.strip() or "Please inspect the attached image and describe anything important."
-                try:
-                    attachment = capture_clipboard_image(
-                        paths=RepoPaths.discover(),
-                        session_id=current_session.session_id,
-                    )
-                except ClipboardImageError as exc:
-                    console.print(f"[bold red]Error:[/bold red] {exc}")
-                    continue
-                console.print(
-                    Panel(
-                        f"[bold]Saved[/bold]: {attachment.label or attachment.path}\n[bold]Path[/bold]: {attachment.path}",
-                        title="[bold green]Clipboard image attached[/bold green]",
-                        border_style="green",
-                    )
-                )
-                result = _run_streaming_turn(
-                    service=service,
-                    session=current_session,
-                    query=query,
-                    attachments=[attachment],
-                )
-                if result is not None:
-                    current_session = result.session
                 continue
             if command in {"/long-term-memory", "/ltm"}:
                 query = argument.strip()
@@ -1275,9 +1189,6 @@ def run_chat_shell(
                         project=_project_service().active_project_name(),
                     )
                     active_doc = None
-                    active_hypothesis = None
-                    active_launch_exp = None
-                    active_dev = None
                 except Exception as exc:
                     console.print(f"[bold red]Error:[/bold red] {exc}")
                     continue
@@ -1291,9 +1202,6 @@ def run_chat_shell(
                 try:
                     current_session = service.load_session(argument)
                     active_doc = None
-                    active_hypothesis = None
-                    active_launch_exp = None
-                    active_dev = None
                 except Exception as exc:
                     console.print(f"[bold red]Error:[/bold red] {exc}")
                     continue
@@ -1304,154 +1212,6 @@ def run_chat_shell(
                 continue
 
             console.print(f"[bold red]Unknown command:[/bold red] {command}")
-            continue
-
-        # ── Dev loop decision handling ──
-        if active_dev is not None and active_dev.status == "waiting_decision":
-            # User is answering a decision question
-            decision = active_dev.pending_decision
-            if decision:
-                # Check if it's a letter choice
-                choice = raw.strip().upper()
-                if len(choice) == 1 and "A" <= choice <= chr(ord("A") + len(decision.options) - 1):
-                    idx = ord(choice) - ord("A")
-                    active_dev.user_decision = f"Option {choice}: {decision.options[idx]}"
-                else:
-                    active_dev.user_decision = raw.strip()
-
-                active_dev.pending_decision = None
-                active_dev.status = "active"
-                console.print(f"[bold green]Decision recorded:[/bold green] {active_dev.user_decision}")
-                active_dev = run_dev_loop(
-                    service=service,
-                    session=current_session,
-                    dev_session=active_dev,
-                    console=console,
-                    run_streaming_turn=_run_streaming_turn,
-                )
-            continue
-
-        # ── Launch-exp planning mode ──
-        if active_launch_exp is not None:
-            if attachments:
-                console.print("[bold red]Error:[/bold red] Experiment planning mode does not support image attachments yet.")
-                continue
-            active_launch_exp = handle_launch_exp_instruction(
-                ctx=ChatContext(
-                    console=console,
-                    paths=RepoPaths.discover(),
-                    service=service,
-                    session=current_session,
-                ),
-                raw=raw,
-                active_launch_exp=active_launch_exp,
-            )
-            continue
-
-        # ── Hypothesis editing mode ──
-        if active_hypothesis is not None:
-            if attachments:
-                console.print("[bold red]Error:[/bold red] Hypothesis mode does not support image attachments yet.")
-                continue
-            h_id, h_proj, h_draft = active_hypothesis
-            hyp_drafter = _hypothesis_drafter()
-            hyp_svc = _hypothesis_service()
-            author = current_session.participants[0]
-            try:
-                # Log user instruction
-                hyp_svc.log_event(h_proj, h_id, "user_instruction", content=raw)
-
-                # Step 1: Author revises hypothesis
-                with console.status(f"[bold blue]{author.name} revising hypothesis...[/bold blue]"):
-                    revised_draft = hyp_drafter.revise_hypothesis(
-                        current_draft=h_draft,
-                        session=current_session,
-                        transcript=service.transcript(current_session.session_id),
-                        context_snapshot=service.context_snapshot(current_session.session_id),
-                        user_instruction=raw,
-                        interaction_log=hyp_svc.interaction_excerpt(h_proj, h_id),
-                        provider=author.provider,
-                    )
-                    detail = hyp_svc.revise_hypothesis_files(
-                        project=h_proj,
-                        hypothesis_id=h_id,
-                        draft=revised_draft,
-                        user_instruction=raw,
-                        agent_name=author.name,
-                    )
-
-                # Update active state
-                active_hypothesis = (h_id, h_proj, revised_draft)
-
-                # Show revision summary
-                console.print(
-                    Panel(
-                        (
-                            f"[bold]ID[/bold]: {h_id}\n"
-                            f"[bold]Title[/bold]: {revised_draft.title}\n"
-                            f"[bold]Claim[/bold]: {revised_draft.claim}\n"
-                            f"[bold]Success criteria[/bold]: {revised_draft.success_criteria or '(blank)'}\n"
-                            f"[bold]Failure criteria[/bold]: {revised_draft.failure_criteria or '(blank)'}"
-                        ),
-                        title=f"[bold green]{author.name} · Hypothesis revised[/bold green]",
-                        border_style="green",
-                    )
-                )
-
-                # Step 2: Reviewer refines (round-robin only)
-                if (
-                    current_session.mode == ChatMode.ROUND_ROBIN
-                    and len(current_session.participants) >= 2
-                ):
-                    reviewer = current_session.participants[1]
-                    with console.status(f"[bold cyan]{reviewer.name} reviewing hypothesis...[/bold cyan]"):
-                        refined_draft = hyp_drafter.refine_draft(
-                            draft=revised_draft,
-                            session=current_session,
-                            transcript=service.transcript(current_session.session_id),
-                            context_snapshot=service.context_snapshot(current_session.session_id),
-                            user_intent=raw,
-                            provider=reviewer.provider,
-                        )
-                        hyp_svc.revise_hypothesis_files(
-                            project=h_proj,
-                            hypothesis_id=h_id,
-                            draft=refined_draft,
-                            user_instruction=f"Review refinement based on: {raw}",
-                            agent_name=reviewer.name,
-                        )
-                    active_hypothesis = (h_id, h_proj, refined_draft)
-
-                    # Show what changed
-                    changes: list[str] = []
-                    if refined_draft.claim != revised_draft.claim:
-                        changes.append(f"Claim: {refined_draft.claim}")
-                    if refined_draft.success_criteria != revised_draft.success_criteria:
-                        changes.append(f"Success criteria: {refined_draft.success_criteria}")
-                    if refined_draft.failure_criteria != revised_draft.failure_criteria:
-                        changes.append(f"Failure criteria: {refined_draft.failure_criteria}")
-                    change_text = "\n".join(changes) if changes else "Minor refinements only."
-                    console.print(
-                        Panel(
-                            change_text,
-                            title=f"[bold cyan]{reviewer.name} · Review refinement[/bold cyan]",
-                            border_style="cyan",
-                        )
-                    )
-            except Exception as exc:
-                console.print(f"[bold red]Error:[/bold red] {exc}")
-                continue
-            try:
-                service.record_session_event(
-                    session_id=current_session.session_id,
-                    kind=SessionEventKind.ARTIFACT_HYPOTHESIS_UPDATED,
-                    actor="labit",
-                    summary=f"Hypothesis revised: {h_id}",
-                    payload={"hypothesis_id": h_id},
-                    evidence_refs=_session_evidence_refs(current_session) + [f"hypothesis:{h_id}"],
-                )
-            except Exception:
-                pass
             continue
 
         if active_doc is not None:

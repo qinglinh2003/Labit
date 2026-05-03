@@ -827,7 +827,7 @@ Reply as `{participant.name}` only. Use plain text or markdown.
         lines = [
             "Platform (LABIT):",
             "- LABIT is a research operating system that manages projects, hypotheses, experiments, documents, and remote compute.",
-            "- LABIT can manage remote compute via compute profiles and `/launch-exp` (SSH may still be relevant, but prefer Labit tooling by default).",
+            "- LABIT can manage remote compute via compute profiles and experiment services when available; prefer Labit tooling over ad-hoc SSH when possible.",
             "- The LABIT codebase itself is a separate git repo. Do NOT commit, push, or modify LABIT source code from a project chat.",
         ]
         if project:
@@ -839,7 +839,7 @@ Reply as `{participant.name}` only. Use plain text or markdown.
             try:
                 spec = self.project_service.load_project(project)
                 if spec.compute_profile:
-                    lines.append(f"- This project uses compute profile '{spec.compute_profile}'. Use `labit compute test {spec.compute_profile}` to verify connectivity, and `/launch-exp` to submit experiments.")
+                    lines.append(f"- This project uses compute profile '{spec.compute_profile}'. Use `labit compute test {spec.compute_profile}` to verify connectivity.")
                 code_dir = self.project_service.project_code_dir(project)
                 if code_dir.exists():
                     lines.append(f"- Project code directory: {code_dir.relative_to(self.paths.root)}")
