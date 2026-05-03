@@ -42,16 +42,13 @@ from labit.commands.rendering import (
     render_console_header,
     render_doc_status,
     render_experiment_launch_preview,
-    render_investigation_result,
     render_launch_exp_status,
     render_message_block,
     render_recent_messages,
-    render_related_reports,
     render_review_suggestion,
     render_session_summary,
     render_shell_header,
     render_shell_help,
-    render_synthesis_preview,
     render_task_breakdown,
     render_task_detail,
     render_transcript,
@@ -63,8 +60,8 @@ from labit.commands.rendering import (
 from labit.chat.clipboard import ClipboardImageError, capture_clipboard_image
 from labit.chat.composer import ComposerResult, prompt_toolkit_available, prompt_with_clipboard_image
 from labit.chat.models import ChatMode
+from labit.chat.commands import handle_synthesize_command
 from labit.chat.service import ChatService
-from labit.chat.synthesizer import DiscussionSynthesizer
 from labit.context.events import SessionEventKind
 from labit.documents.drafter import DocDrafter
 from labit.documents.models import DocSession, DocStatus
@@ -92,7 +89,7 @@ from labit.hypotheses.commands import handle_hypothesis_command
 from labit.hypotheses.models import HypothesisDraft
 from labit.hypotheses.models import HypothesisResolution, HypothesisState, utc_now_iso
 from labit.hypotheses.service import HypothesisService
-from labit.investigations.service import InvestigationService
+from labit.investigations.commands import handle_investigate_command
 from labit.memory.commands import handle_memory_command
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
@@ -131,14 +128,6 @@ def _doc_drafter() -> DocDrafter:
 
 def _document_service() -> DocumentService:
     return DocumentService(RepoPaths.discover())
-
-
-def _investigation_service() -> InvestigationService:
-    return InvestigationService(RepoPaths.discover())
-
-
-def _discussion_synthesizer() -> DiscussionSynthesizer:
-    return DiscussionSynthesizer(RepoPaths.discover())
 
 
 def _emit(data: object, *, as_json: bool) -> None:
@@ -634,35 +623,6 @@ def _extract_log_hint(log_tail: str, *, max_len: int = 140) -> str:
     return lines[-1][:max_len]
 
 
-def _transcript_excerpt(messages, *, limit: int = 16, max_chars: int = 6000) -> str:
-    if not messages:
-        return ""
-    lines: list[str] = []
-    for message in messages[-limit:]:
-        speaker = message.speaker
-        if message.provider:
-            speaker = f"{speaker} ({message.provider.value})"
-        line = f"{speaker}: {message.content.strip()}"
-        if getattr(message, "attachments", None):
-            attachment_labels = ", ".join(
-                attachment.label or attachment.path.rsplit("/", 1)[-1] for attachment in message.attachments
-            )
-            line = f"{line} [attachments: {attachment_labels}]"
-        lines.append(line)
-    text = "\n".join(lines).strip()
-    return text[:max_chars].strip()
-
-
-def _context_snapshot_excerpt(snapshot, *, max_blocks: int = 6, max_chars: int = 5000) -> str:
-    pieces: list[str] = []
-    for block in snapshot.blocks[:max_blocks]:
-        pieces.append(f"[{block.title}]\n{block.content.strip()}")
-    for memory in snapshot.memory[:max_blocks]:
-        pieces.append(f"[{memory.title}]\n{memory.content.strip()}")
-    text = "\n\n".join(piece for piece in pieces if piece).strip()
-    return text[:max_chars].strip()
-
-
 def _session_evidence_refs(session) -> list[str]:
     refs: list[str] = []
     if session.project:
@@ -850,6 +810,8 @@ def run_chat_shell(
 
     dispatcher.register("/hypothesis", _handle_hypothesis)
     dispatcher.register("/memory", lambda ctx, arg: handle_memory_command(ctx=ctx, argument=arg))
+    dispatcher.register("/synthesize", lambda ctx, arg: handle_synthesize_command(ctx=ctx, argument=arg))
+    dispatcher.register("/investigate", lambda ctx, arg: handle_investigate_command(ctx=ctx, argument=arg))
 
     def _handle_dev(ctx: ChatContext, arg: str) -> None:
         nonlocal active_dev
@@ -1330,129 +1292,6 @@ def run_chat_shell(
                 )
                 if result is not None:
                     current_session = result.session
-                continue
-            if command == "/synthesize":
-                try:
-                    with console.status("[bold blue]Synthesizing current discussion...[/bold blue]"):
-                        draft = _discussion_synthesizer().synthesize_from_session(
-                            session=current_session,
-                            transcript=service.transcript(current_session.session_id),
-                            context_snapshot=service.context_snapshot(current_session.session_id),
-                            user_intent=argument,
-                            provider=current_session.participants[0].provider,
-                        )
-                except Exception as exc:
-                    console.print(f"[bold red]Error:[/bold red] {exc}")
-                    continue
-
-                console.print("")
-                render_synthesis_preview(console,draft)
-                if not _confirm_in_shell("Save this synthesis to working memory?", default=True):
-                    console.print("[dim]Cancelled synthesis.[/dim]")
-                    continue
-
-                try:
-                    service.record_discussion_synthesis(
-                        session_id=current_session.session_id,
-                        summary=draft.summary,
-                        consensus=draft.consensus,
-                        disagreements=draft.disagreements,
-                        followups=draft.followups,
-                        evidence_refs=_session_evidence_refs(current_session),
-                    )
-                except Exception as exc:
-                    console.print(f"[bold red]Error:[/bold red] {exc}")
-                    continue
-
-                console.print("[green]Discussion synthesis saved.[/green]")
-                continue
-            if command == "/investigate":
-                topic = argument.strip()
-                if not topic:
-                    console.print("[bold red]Usage:[/bold red] /investigate <topic>")
-                    continue
-                if not current_session.project:
-                    console.print("[bold red]Error:[/bold red] This session is not attached to a project.")
-                    continue
-
-                transcript = service.transcript(current_session.session_id)
-                snapshot = service.context_snapshot(current_session.session_id)
-                investigation_service = _investigation_service()
-                try:
-                    related = investigation_service.find_related_reports(current_session.project, topic)
-                except Exception as exc:
-                    console.print(f"[bold red]Error:[/bold red] {exc}")
-                    continue
-
-                if related:
-                    console.print("")
-                    render_related_reports(console,related)
-                    if not _confirm_in_shell("Investigate further?", default=True):
-                        console.print("[dim]Cancelled investigation.[/dim]")
-                        continue
-
-                primary_provider = current_session.participants[0].provider.value
-                second_provider = (
-                    current_session.participants[1].provider.value
-                    if len(current_session.participants) > 1
-                    else primary_provider
-                )
-
-                try:
-                    with console.status("[bold blue]Investigating current topic...[/bold blue]"):
-                        result = investigation_service.investigate(
-                            project=current_session.project,
-                            topic=topic,
-                            mode=current_session.mode,
-                            provider=primary_provider,
-                            second_provider=second_provider,
-                            source_session_id=current_session.session_id,
-                            session_title=current_session.title,
-                            transcript_excerpt=_transcript_excerpt(transcript),
-                            session_context=_context_snapshot_excerpt(snapshot),
-                        )
-                except Exception as exc:
-                    console.print(f"[bold red]Error:[/bold red] {exc}")
-                    continue
-
-                console.print("")
-                render_investigation_result(console,result)
-                try:
-                    service.record_session_event(
-                        session_id=current_session.session_id,
-                        kind=SessionEventKind.ARTIFACT_REPORT_CREATED,
-                        actor="labit",
-                        summary=f"Investigation report created: {result.title}",
-                        payload={
-                            "title": result.title,
-                            "topic": result.topic,
-                            "mode": result.mode.value,
-                            "run_id": result.run_id,
-                            "report_path": result.report_path,
-                            "summary": result.summary,
-                        },
-                        evidence_refs=_session_evidence_refs(current_session) + [f"report:{result.report_path}"],
-                    )
-                except Exception:
-                    pass
-                try:
-                    consensus = [result.summary] if result.summary else [f"Investigation completed on topic: {result.topic}"]
-                    followups = ["Review the report and decide whether follow-up experiments are needed."]
-                    disagreements: list[str] = []
-                    if result.mode == ChatMode.ROUND_ROBIN:
-                        disagreements.append("Round-robin investigation revised an earlier draft; inspect the run artifacts for any unresolved differences.")
-                    elif result.mode == ChatMode.PARALLEL:
-                        disagreements.append("Parallel investigation merged two independent drafts; inspect the run artifacts for competing framings.")
-                    service.record_discussion_synthesis(
-                        session_id=current_session.session_id,
-                        summary=f"Investigation discussion synthesized around topic: {result.topic}",
-                        consensus=consensus,
-                        disagreements=disagreements,
-                        followups=followups,
-                        evidence_refs=_session_evidence_refs(current_session) + [f"report:{result.report_path}"],
-                    )
-                except Exception:
-                    pass
                 continue
             if command == "/launch-exp":
                 sub_arg = argument.strip()
