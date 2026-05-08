@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
+from pathlib import Path
 from typing import Callable, TypeVar
 
 import typer
@@ -72,6 +75,28 @@ def _run_step(label: str, *, step: int, total: int, as_json: bool, fn: Callable[
         result = fn()
     console.print(f"[green]done[/green] {label}")
     return result
+
+
+def _clone_repo(repo: str, code_dir: str) -> dict:
+    git = shutil.which("git")
+    if git is None:
+        raise RuntimeError("git is not installed; cannot clone project repository.")
+
+    code_path = Path(code_dir)
+    code_path.mkdir(parents=True, exist_ok=True)
+    if any(code_path.iterdir()):
+        raise RuntimeError(f"Project code directory is not empty: {code_path}")
+
+    completed = subprocess.run(
+        [git, "clone", "--", repo, str(code_path)],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(f"git clone failed for {repo}: {detail}")
+    return {"repo": repo, "code_dir": str(code_path)}
 
 
 def _print_kv_summary(title: str, rows: list[tuple[str, str]]) -> None:
@@ -163,17 +188,29 @@ def new_project(json_output: bool = typer.Option(False, "--json", help="Emit JSO
 
     set_active = typer.confirm("Set as active project?", default=True)
     try:
+        total_steps = 2 if project_spec.repo else 1
         created = _run_step(
             "Creating project files",
             step=1,
-            total=1,
+            total=total_steps,
             as_json=json_output,
             fn=lambda: service.save_project(project_spec, set_active=set_active),
         )
-    except (FileExistsError, FileNotFoundError) as exc:
+        clone_result = None
+        if project_spec.repo:
+            clone_result = _run_step(
+                "Cloning repository",
+                step=2,
+                total=total_steps,
+                as_json=json_output,
+                fn=lambda: _clone_repo(project_spec.repo or "", str(service.project_code_dir(project_spec.name))),
+            )
+    except (FileExistsError, FileNotFoundError, RuntimeError) as exc:
         raise typer.Exit(code=_fail(str(exc), as_json=json_output))
 
     payload = {"initialized": True, "created": created}
+    if clone_result is not None:
+        payload["clone"] = clone_result
     if json_output:
         _emit(payload, as_json=True)
         return
@@ -185,6 +222,9 @@ def new_project(json_output: bool = typer.Option(False, "--json", help="Emit JSO
     ]
     if set_active:
         rows.append(("Active project", created["name"]))
+    if clone_result is not None:
+        rows.append(("Cloned repo", clone_result["repo"]))
+        rows.append(("Code", clone_result["code_dir"]))
     rows.append(("Next", f"labit project show {created['name']}"))
     _print_kv_summary("Project ready", rows)
 

@@ -30,6 +30,8 @@ labit project switch <name>
 labit project show
 ```
 
+When `labit project new` is given a repository URL or local git path, LABIT automatically clones it into the project's `code/` directory.
+
 Attach optional SSH compute profiles to a project:
 
 ```bash
