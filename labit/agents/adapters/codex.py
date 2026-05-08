@@ -97,10 +97,16 @@ class CodexAdapter(AgentAdapter):
         request: AgentRequest,
         *,
         on_text: Callable[[str], None] | None = None,
+        on_status: Callable[[str], None] | None = None,
         cancel_event: threading.Event | None = None,
     ) -> AgentResponse:
         if request.output_schema:
-            return super().run_stream(request, on_text=on_text, cancel_event=cancel_event)
+            return super().run_stream(
+                request,
+                on_text=on_text,
+                on_status=on_status,
+                cancel_event=cancel_event,
+            )
 
         prompt = request.prompt
         if request.system_prompt:
@@ -129,6 +135,10 @@ class CodexAdapter(AgentAdapter):
         session_id = request.session_id
         emitted = False
 
+        def _emit_status(message: str) -> None:
+            if on_status is not None and message:
+                on_status(message)
+
         def _handle_stdout(line: str) -> None:
             nonlocal raw_output, session_id, emitted
             stripped = line.strip()
@@ -142,11 +152,32 @@ class CodexAdapter(AgentAdapter):
             payload_type = payload.get("type")
             if payload_type == "thread.started":
                 session_id = str(payload.get("thread_id") or session_id)
+                _emit_status("started")
+                return
+
+            if payload_type == "turn.started":
+                _emit_status("thinking")
+                return
+
+            if payload_type == "turn.completed":
+                _emit_status("finishing")
+                return
+
+            if payload_type in {"message.delta", "agent_message.delta", "response.delta"}:
+                chunk = _extract_codex_text_delta(payload)
+                if chunk and on_text is not None:
+                    on_text(chunk)
+                    emitted = True
+                return
+
+            if payload_type in {"item.created", "item.started"}:
+                _emit_status(_describe_codex_item(payload.get("item"), prefix="running"))
                 return
 
             if payload_type == "item.completed":
                 item = payload.get("item") or {}
                 if item.get("type") != "agent_message":
+                    _emit_status(_describe_codex_item(item, prefix="completed"))
                     return
                 text = str(item.get("text", ""))
                 raw_output = text.strip() or raw_output
@@ -179,3 +210,42 @@ class CodexAdapter(AgentAdapter):
             session_id=session_id,
             command=cmd,
         )
+
+
+def _describe_codex_item(item: object, *, prefix: str) -> str:
+    if not isinstance(item, dict):
+        return prefix
+
+    item_type = str(item.get("type") or "item").replace("_", " ")
+    if item_type == "command execution":
+        command = _compact_status_text(str(item.get("command") or "command"))
+        return f"{prefix} command: {command}"
+    if item_type == "function call":
+        name = str(item.get("name") or item.get("function") or "tool")
+        return f"{prefix} tool: {name}"
+    if item_type == "function call output":
+        return f"{prefix} tool output"
+    if item_type == "reasoning":
+        return f"{prefix} reasoning"
+    if item_type == "agent message":
+        return f"{prefix} response"
+    return f"{prefix} {item_type}"
+
+
+def _compact_status_text(value: str, *, limit: int = 80) -> str:
+    value = " ".join(value.split())
+    if len(value) <= limit:
+        return value
+    return f"{value[: limit - 1]}..."
+
+
+def _extract_codex_text_delta(payload: dict) -> str:
+    for key in ("text", "delta", "content"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            nested = value.get("text") or value.get("content")
+            if isinstance(nested, str):
+                return nested
+    return ""

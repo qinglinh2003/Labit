@@ -134,6 +134,7 @@ class ChatService:
         reasoning_effort: str | None = None,
         on_reply_start: Callable[[ChatParticipant], None] | None = None,
         on_reply_delta: Callable[[ChatParticipant, str], None] | None = None,
+        on_reply_status: Callable[[ChatParticipant, str], None] | None = None,
         on_reply_complete: Callable[[ChatParticipant, str], None] | None = None,
         cancel_event: threading.Event | None = None,
         skip_participants: set[str] | None = None,
@@ -147,6 +148,7 @@ class ChatService:
             reasoning_effort=reasoning_effort,
             on_reply_start=on_reply_start,
             on_reply_delta=on_reply_delta,
+            on_reply_status=on_reply_status,
             on_reply_complete=on_reply_complete,
             cancel_event=cancel_event,
             skip_participants=skip_participants,
@@ -163,6 +165,7 @@ class ChatService:
         reasoning_effort: str | None = None,
         on_reply_start: Callable[[ChatParticipant], None] | None = None,
         on_reply_delta: Callable[[ChatParticipant, str], None] | None = None,
+        on_reply_status: Callable[[ChatParticipant, str], None] | None = None,
         on_reply_complete: Callable[[ChatParticipant, str], None] | None = None,
         cancel_event: threading.Event | None = None,
         skip_participants: set[str] | None = None,
@@ -221,6 +224,7 @@ class ChatService:
                             reasoning_effort=reasoning_effort,
                             on_reply_start=on_reply_start,
                             on_reply_delta=on_reply_delta,
+                            on_reply_status=on_reply_status,
                             on_reply_complete=on_reply_complete,
                             cancel_event=cancel_event,
                             persist=False,
@@ -276,6 +280,7 @@ class ChatService:
                         reasoning_effort=reasoning_effort,
                         on_reply_start=on_reply_start,
                         on_reply_delta=on_reply_delta,
+                        on_reply_status=on_reply_status,
                         on_reply_complete=on_reply_complete,
                         cancel_event=cancel_event,
                         cwd_override=cwd_override,
@@ -381,6 +386,7 @@ class ChatService:
         reasoning_effort: str | None = None,
         on_reply_start: Callable[[ChatParticipant], None] | None = None,
         on_reply_delta: Callable[[ChatParticipant, str], None] | None = None,
+        on_reply_status: Callable[[ChatParticipant, str], None] | None = None,
         on_reply_complete: Callable[[ChatParticipant, str], None] | None = None,
         cancel_event: threading.Event | None = None,
         persist: bool = True,
@@ -411,11 +417,20 @@ class ChatService:
             if on_reply_delta is not None:
                 on_reply_delta(participant, accumulated)
 
+        def _handle_status(status: str) -> None:
+            if on_reply_status is not None:
+                on_reply_status(participant, status)
+
         if on_reply_start is not None:
             on_reply_start(participant)
 
         if on_reply_delta is not None or on_reply_start is not None or on_reply_complete is not None:
-            response = adapter.run_stream(request, on_text=_handle_delta, cancel_event=cancel_event)
+            response = adapter.run_stream(
+                request,
+                on_text=_handle_delta,
+                on_status=_handle_status,
+                cancel_event=cancel_event,
+            )
         else:
             response = adapter.run(request)
 

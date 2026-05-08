@@ -124,6 +124,7 @@ class AgentAdapter(ABC):
         request: AgentRequest,
         *,
         on_text: Callable[[str], None] | None = None,
+        on_status: Callable[[str], None] | None = None,
         cancel_event: threading.Event | None = None,
     ) -> AgentResponse:
         response = self.run(request)

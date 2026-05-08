@@ -64,10 +64,16 @@ class ClaudeAdapter(AgentAdapter):
         request: AgentRequest,
         *,
         on_text: Callable[[str], None] | None = None,
+        on_status: Callable[[str], None] | None = None,
         cancel_event: threading.Event | None = None,
     ) -> AgentResponse:
         if request.output_schema:
-            return super().run_stream(request, on_text=on_text, cancel_event=cancel_event)
+            return super().run_stream(
+                request,
+                on_text=on_text,
+                on_status=on_status,
+                cancel_event=cancel_event,
+            )
 
         request = request.model_copy(update={"prompt": self._augment_prompt(request)})
         cmd = self._build_command(request, stream=True)
@@ -93,6 +99,12 @@ class ClaudeAdapter(AgentAdapter):
             payload_type = payload.get("type")
             if payload_type == "stream_event":
                 event = payload.get("event") or {}
+                if on_status is not None and event.get("type") in {
+                    "message_start",
+                    "content_block_start",
+                    "content_block_stop",
+                }:
+                    on_status(str(event.get("type")).replace("_", " "))
                 if event.get("type") != "content_block_delta":
                     return
                 delta = event.get("delta") or {}

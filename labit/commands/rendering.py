@@ -121,11 +121,15 @@ class ThinkingIndicator:
     def __init__(self) -> None:
         self._start = time.monotonic()
         self._spinner = Spinner("dots", style="dim")
+        self.message = "Thinking"
+
+    def set_message(self, message: str) -> None:
+        self.message = message.strip() or "Thinking"
 
     def __rich_console__(self, console: Console, options: object):  # noqa: ANN001
         elapsed = time.monotonic() - self._start
         text = self._spinner.render(time.monotonic())
-        text.append(f" Thinking… {elapsed:.1f}s", style="dim")
+        text.append(f" {self.message}… {elapsed:.1f}s", style="dim")
         yield text
 
 

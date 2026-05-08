@@ -244,6 +244,7 @@ def _run_streaming_turn(
             "provider": participant.provider.value,
             "content": "",
             "status": "queued",
+            "activity": "",
             "started_at": None,
             "thinking": None,
         }
@@ -269,6 +270,8 @@ def _run_streaming_turn(
             status_text = status
             if started_at is not None and status in {"thinking", "streaming"}:
                 status_text = f"{status} · {time.monotonic() - started_at:.1f}s"
+            if state.get("activity") and status in {"thinking", "streaming"}:
+                status_text = f"{status_text} · {state['activity']}"
             panels.append(
                 agent_panel(
                     participant.name,
@@ -288,20 +291,33 @@ def _run_streaming_turn(
         with state_lock:
             participant_state[participant.name]["content"] = ""
             participant_state[participant.name]["status"] = "thinking"
+            participant_state[participant.name]["activity"] = "starting"
             participant_state[participant.name]["started_at"] = time.monotonic()
             participant_state[participant.name]["thinking"] = ThinkingIndicator()
+            participant_state[participant.name]["thinking"].set_message("starting")
         _refresh_live()
 
     def _on_reply_delta(participant, content: str) -> None:
         with state_lock:
             participant_state[participant.name]["content"] = content
             participant_state[participant.name]["status"] = "streaming" if content.strip() else "thinking"
+            if content.strip():
+                participant_state[participant.name]["activity"] = "writing"
+        _refresh_live()
+
+    def _on_reply_status(participant, status: str) -> None:
+        with state_lock:
+            participant_state[participant.name]["activity"] = status
+            thinking = participant_state[participant.name].get("thinking")
+            if thinking is not None:
+                thinking.set_message(status)
         _refresh_live()
 
     def _on_reply_complete(participant, content: str) -> None:
         with state_lock:
             participant_state[participant.name]["content"] = content
             participant_state[participant.name]["status"] = "done"
+            participant_state[participant.name]["activity"] = ""
             participant_state[participant.name]["thinking"] = None
         _refresh_live()
 
@@ -317,6 +333,7 @@ def _run_streaming_turn(
                 reasoning_effort=reasoning_effort,
                 on_reply_start=_on_reply_start,
                 on_reply_delta=_on_reply_delta,
+                on_reply_status=_on_reply_status,
                 on_reply_complete=_on_reply_complete,
                 cancel_event=cancel_event,
                 skip_participants=skip_participants,
