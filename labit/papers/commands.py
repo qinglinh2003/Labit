@@ -67,9 +67,11 @@ def _render_paper_added(console, record: PaperRecord) -> None:
             f"[bold]Title[/bold]: {record.title}",
             f"[bold]Authors[/bold]: {authors or '(unknown)'}",
             f"[bold]Metadata[/bold]: {record.local_metadata_path}",
-            f"[bold]HTML[/bold]: {record.local_html_path}",
+            f"[bold]HTML[/bold]: {record.local_html_path or '(not cached)'}",
         ]
     )
+    if record.html_fetch_error:
+        body += f"\n[bold yellow]HTML warning[/bold yellow]: {record.html_fetch_error}"
     console.print(Panel(body, title="[bold green]Paper saved[/bold green]", border_style="green"))
 
 
@@ -87,7 +89,7 @@ def _render_paper_list(console, records: list[PaperRecord]) -> None:
             record.arxiv_id,
             record.title,
             _clip(record.abstract, 220),
-            record.local_html_path,
+            record.local_html_path or "(not cached)",
         )
     console.print(Panel(table, title="Project Papers", border_style="#0080ff"))
 

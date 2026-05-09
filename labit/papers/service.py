@@ -8,6 +8,7 @@ import xml.etree.ElementTree as ET
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from time import sleep
 
 import yaml
 
@@ -22,6 +23,7 @@ ARXIV_HTML_URL = "https://arxiv.org/html/{arxiv_id}"
 AR5IV_HTML_URL = "https://ar5iv.labs.arxiv.org/html/{arxiv_id}"
 ARXIV_PDF_URL = "https://arxiv.org/pdf/{arxiv_id}"
 ARXIV_ID_RE = re.compile(r"(?P<id>\d{4}\.\d{4,5}(?:v\d+)?)")
+RETRYABLE_HTTP_STATUS = {429, 503}
 
 
 class PaperService:
@@ -33,7 +35,13 @@ class PaperService:
         resolved = self._require_project(project)
         arxiv_id = self.parse_arxiv_id(reference)
         metadata = self._fetch_arxiv_metadata(arxiv_id)
-        html, html_url = self._fetch_html(arxiv_id)
+        html = ""
+        html_url = ARXIV_HTML_URL.format(arxiv_id=arxiv_id)
+        html_fetch_error = ""
+        try:
+            html, html_url = self._fetch_html(arxiv_id)
+        except Exception as exc:
+            html_fetch_error = str(exc)
 
         target_dir = self._paper_dir(resolved)
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -48,13 +56,15 @@ class PaperService:
             abstract=metadata["abstract"],
             source_url=ARXIV_ABS_URL.format(arxiv_id=arxiv_id),
             html_url=html_url,
+            html_fetch_error=html_fetch_error,
             pdf_url=ARXIV_PDF_URL.format(arxiv_id=arxiv_id),
-            local_html_path=str(html_path.relative_to(self.paths.root)),
+            local_html_path=str(html_path.relative_to(self.paths.root)) if html else "",
             local_metadata_path=str(metadata_path.relative_to(self.paths.root)),
             added_at=now,
         )
 
-        self._atomic_write(html_path, html)
+        if html:
+            self._atomic_write(html_path, html)
         yaml_text = yaml.safe_dump(record.model_dump(mode="json"), sort_keys=False, allow_unicode=True)
         self._atomic_write(metadata_path, yaml_text)
         return record
@@ -156,14 +166,43 @@ class PaperService:
                 "User-Agent": "labit/0.1 (+https://github.com/qinglinh2003)",
             },
         )
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                charset = response.headers.get_content_charset() or "utf-8"
-                return response.read().decode(charset, errors="replace")
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"HTTP {exc.code}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(str(exc.reason)) from exc
+        last_error: Exception | None = None
+        for attempt in range(4):
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    charset = response.headers.get_content_charset() or "utf-8"
+                    return response.read().decode(charset, errors="replace")
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                if exc.code not in RETRYABLE_HTTP_STATUS or attempt == 3:
+                    raise RuntimeError(f"HTTP {exc.code} from {url}") from exc
+                sleep(self._retry_delay(exc, attempt))
+            except urllib.error.URLError as exc:
+                last_error = exc
+                if self._is_timeout(exc.reason) and attempt < 3:
+                    sleep(3.0 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"{exc.reason} from {url}") from exc
+            except TimeoutError as exc:
+                last_error = exc
+                if attempt < 3:
+                    sleep(3.0 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"Timed out reading from {url}") from exc
+
+        raise RuntimeError(f"Failed to fetch {url}: {last_error}")
+
+    def _is_timeout(self, reason: object) -> bool:
+        return isinstance(reason, TimeoutError) or "timed out" in str(reason).lower()
+
+    def _retry_delay(self, exc: urllib.error.HTTPError, attempt: int) -> float:
+        retry_after = exc.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return min(float(retry_after), 30.0)
+            except ValueError:
+                pass
+        return 3.0 * (attempt + 1)
 
     def _xml_text(self, node: ET.Element | None) -> str:
         if node is None or node.text is None:

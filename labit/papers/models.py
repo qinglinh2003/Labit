@@ -12,6 +12,7 @@ class PaperRecord(BaseModel):
     abstract: str = ""
     source_url: str
     html_url: str
+    html_fetch_error: str = ""
     pdf_url: str
     local_html_path: str = ""
     local_metadata_path: str = ""
