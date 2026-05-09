@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import re
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import UTC, datetime
+from html import unescape
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import sleep
@@ -22,8 +24,9 @@ ARXIV_ABS_URL = "https://arxiv.org/abs/{arxiv_id}"
 ARXIV_HTML_URL = "https://arxiv.org/html/{arxiv_id}"
 AR5IV_HTML_URL = "https://ar5iv.labs.arxiv.org/html/{arxiv_id}"
 ARXIV_PDF_URL = "https://arxiv.org/pdf/{arxiv_id}"
+S2_API_URL = "https://api.semanticscholar.org/graph/v1/paper/ARXIV:{arxiv_id}"
+S2_FIELDS = "title,authors,abstract,externalIds,url"
 ARXIV_ID_RE = re.compile(r"(?P<id>\d{4}\.\d{4,5}(?:v\d+)?)")
-RETRYABLE_HTTP_STATUS = {429, 503}
 
 
 class PaperService:
@@ -34,7 +37,18 @@ class PaperService:
     def add_paper(self, *, project: str, reference: str) -> PaperRecord:
         resolved = self._require_project(project)
         arxiv_id = self.parse_arxiv_id(reference)
-        metadata = self._fetch_arxiv_metadata(arxiv_id)
+
+        # Cache-first: if we already have metadata locally, return it
+        target_dir = self._paper_dir(resolved)
+        metadata_path = target_dir / f"{arxiv_id}.yaml"
+        if metadata_path.exists():
+            raw = yaml.safe_load(metadata_path.read_text(encoding="utf-8")) or {}
+            return PaperRecord.model_validate(raw)
+
+        metadata = self._fetch_metadata(arxiv_id)
+
+        sleep(1)  # brief pause before HTML fetch
+
         html = ""
         html_url = ARXIV_HTML_URL.format(arxiv_id=arxiv_id)
         html_fetch_error = ""
@@ -120,6 +134,38 @@ class PaperService:
             raise ValueError("Only arXiv IDs and arXiv URLs are supported for now.")
         return match.group("id")
 
+    def _fetch_metadata(self, arxiv_id: str) -> dict:
+        """Try multiple metadata sources before giving up.
+
+        The arXiv API is easy to rate limit during interactive retries, while
+        the public abs page is often still reachable. Keep the abs-page parser
+        as the final fallback so a single paper can still be saved locally.
+        """
+        failures: list[str] = []
+        try:
+            return self._fetch_s2_metadata(arxiv_id)
+        except Exception as exc:
+            failures.append(f"Semantic Scholar: {exc}")
+        try:
+            return self._fetch_arxiv_metadata(arxiv_id)
+        except Exception as exc:
+            failures.append(f"arXiv API: {exc}")
+        try:
+            return self._fetch_abs_metadata(arxiv_id)
+        except Exception as exc:
+            failures.append(f"arXiv abs page: {exc}")
+        raise RuntimeError("Could not fetch paper metadata.\n" + "\n".join(failures))
+
+    def _fetch_s2_metadata(self, arxiv_id: str) -> dict:
+        url = S2_API_URL.format(arxiv_id=arxiv_id) + f"?fields={S2_FIELDS}"
+        body = self._fetch_text(url, accept="application/json")
+        data = json.loads(body)
+        title = data.get("title") or arxiv_id
+        abstract = data.get("abstract") or ""
+        authors = [a.get("name", "") for a in (data.get("authors") or [])]
+        authors = [a for a in authors if a]
+        return {"title": title, "authors": authors, "abstract": abstract}
+
     def _fetch_arxiv_metadata(self, arxiv_id: str) -> dict:
         query = urllib.parse.urlencode({"id_list": arxiv_id})
         url = f"{ARXIV_API_URL}?{query}"
@@ -145,10 +191,31 @@ class PaperService:
             "abstract": abstract,
         }
 
+    def _fetch_abs_metadata(self, arxiv_id: str) -> dict:
+        url = ARXIV_ABS_URL.format(arxiv_id=arxiv_id)
+        body = self._fetch_text(url, accept="text/html")
+        title = self._extract_html_text(body, r'<h1 class="title mathjax">(.*?)</h1>')
+        abstract = self._extract_html_text(
+            body,
+            r'<blockquote class="abstract mathjax">(.*?)</blockquote>',
+        )
+        authors_text = self._extract_html_text(body, r'<div class="authors">(.*?)</div>')
+
+        title = re.sub(r"^Title:\s*", "", title).strip() or arxiv_id
+        abstract = re.sub(r"^Abstract:\s*", "", abstract).strip()
+        authors_text = re.sub(r"^Authors?:\s*", "", authors_text).strip()
+        authors = [item.strip() for item in re.split(r"\s*,\s*", authors_text) if item.strip()]
+        return {
+            "title": title,
+            "authors": authors,
+            "abstract": abstract,
+        }
+
     def _fetch_html(self, arxiv_id: str) -> tuple[str, str]:
+        # Try ar5iv first — it's a mirror with less strict rate limiting
         urls = [
-            ARXIV_HTML_URL.format(arxiv_id=arxiv_id),
             AR5IV_HTML_URL.format(arxiv_id=arxiv_id),
+            ARXIV_HTML_URL.format(arxiv_id=arxiv_id),
         ]
         failures: list[str] = []
         for url in urls:
@@ -166,48 +233,55 @@ class PaperService:
                 "User-Agent": "labit/0.1 (+https://github.com/qinglinh2003)",
             },
         )
-        last_error: Exception | None = None
-        for attempt in range(4):
+        # At most 1 retry — don't hammer arXiv
+        for attempt in range(2):
             try:
-                with urllib.request.urlopen(request, timeout=30) as response:
+                with urllib.request.urlopen(request, timeout=60) as response:
                     charset = response.headers.get_content_charset() or "utf-8"
                     return response.read().decode(charset, errors="replace")
             except urllib.error.HTTPError as exc:
-                last_error = exc
-                if exc.code not in RETRYABLE_HTTP_STATUS or attempt == 3:
-                    raise RuntimeError(f"HTTP {exc.code} from {url}") from exc
-                sleep(self._retry_delay(exc, attempt))
-            except urllib.error.URLError as exc:
-                last_error = exc
-                if self._is_timeout(exc.reason) and attempt < 3:
-                    sleep(3.0 * (attempt + 1))
+                if exc.code == 429:
+                    if attempt == 0:
+                        delay = self._retry_delay(exc)
+                        sleep(delay)
+                        continue
+                    host = urllib.parse.urlparse(url).netloc or url
+                    raise RuntimeError(
+                        f"{host} is rate-limiting requests. Wait a few minutes and try again."
+                    ) from exc
+                if exc.code == 503 and attempt == 0:
+                    sleep(5)
                     continue
-                raise RuntimeError(f"{exc.reason} from {url}") from exc
-            except TimeoutError as exc:
-                last_error = exc
-                if attempt < 3:
-                    sleep(3.0 * (attempt + 1))
+                raise RuntimeError(f"HTTP {exc.code} from {url}") from exc
+            except (urllib.error.URLError, TimeoutError) as exc:
+                reason = getattr(exc, "reason", exc)
+                if attempt == 0:
+                    sleep(5)
                     continue
-                raise RuntimeError(f"Timed out reading from {url}") from exc
+                raise RuntimeError(f"Connection failed: {reason}") from exc
 
-        raise RuntimeError(f"Failed to fetch {url}: {last_error}")
+        raise RuntimeError(f"Failed to fetch {url}")
 
-    def _is_timeout(self, reason: object) -> bool:
-        return isinstance(reason, TimeoutError) or "timed out" in str(reason).lower()
-
-    def _retry_delay(self, exc: urllib.error.HTTPError, attempt: int) -> float:
+    def _retry_delay(self, exc: urllib.error.HTTPError) -> float:
         retry_after = exc.headers.get("Retry-After")
         if retry_after:
             try:
                 return min(float(retry_after), 30.0)
             except ValueError:
                 pass
-        return 3.0 * (attempt + 1)
+        return 5.0
 
     def _xml_text(self, node: ET.Element | None) -> str:
         if node is None or node.text is None:
             return ""
         return " ".join(node.text.split())
+
+    def _extract_html_text(self, body: str, pattern: str) -> str:
+        match = re.search(pattern, body, flags=re.DOTALL | re.IGNORECASE)
+        if match is None:
+            return ""
+        text = re.sub(r"<[^>]+>", " ", match.group(1))
+        return " ".join(unescape(text).split())
 
     def _require_project(self, project: str) -> str:
         resolved = self.project_service.resolve_project_name(project)
