@@ -23,6 +23,10 @@ CHAT_SHELL_COMMANDS = (
     "/mode",
     "/idea",
     "/todo",
+    "/paper",
+    "/paper add",
+    "/paper list",
+    "/paper remove",
     "/doc",
     "/doc auto",
     "/doc start",
@@ -189,6 +193,7 @@ def render_console_header(
             [
                 command_chip("/idea"),
                 command_chip("/todo"),
+                command_chip("/paper"),
                 command_chip("/doc"),
             ]
         )
@@ -218,6 +223,9 @@ def render_shell_help(console: Console) -> None:
     table.add_row("/mute <name>", "Mute an agent for the next turn only. Toggle: run again to unmute.")
     table.add_row("/idea [text]", "Save a lightweight project idea. With no text, show saved ideas.")
     table.add_row("/todo [text]", "Save an actionable project todo. With no text, show saved todos.")
+    table.add_row("/paper add <arxiv-id-or-url>", "Save arXiv metadata and HTML into the current project.")
+    table.add_row("/paper list", "List saved project papers with abstracts and local HTML paths.")
+    table.add_row("/paper remove <arxiv-id>", "Remove a saved project paper.")
     table.add_row("/doc start <title>", "Enter document mode and write a design doc to docs/designs/.")
     table.add_row("/doc open <doc_id>", "Re-open an existing document for editing.")
     table.add_row("/doc status|done", "Show or leave the active document editing session.")

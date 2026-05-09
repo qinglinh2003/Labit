@@ -54,6 +54,7 @@ from labit.documents.commands import handle_document_command
 from labit.documents.drafter import DocDrafter
 from labit.documents.models import DocSession
 from labit.documents.service import DocumentService
+from labit.papers.commands import handle_paper_command
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
 
@@ -393,6 +394,8 @@ def run_chat_shell(
                 argument=arg,
             ),
         )
+
+    dispatcher.register("/paper", lambda ctx, arg: handle_paper_command(ctx=ctx, argument=arg))
 
     def _handle_document(ctx: ChatContext, arg: str) -> None:
         nonlocal active_doc

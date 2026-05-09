@@ -11,7 +11,7 @@ from labit.models import ProjectSpec, ProjectSummary
 from labit.paths import RepoPaths
 
 
-PROJECT_SUBDIRS = ("digests", "sparks", "code", "docs")
+PROJECT_SUBDIRS = ("digests", "sparks", "code", "docs", "papers")
 
 
 class ProjectService:
