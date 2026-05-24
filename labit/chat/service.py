@@ -521,10 +521,52 @@ class ChatService:
             platform_context=platform_context,
             remote_compute_context=remote_compute_context,
             current_task=current_user_message,
+            stage_role=self._stage_role_context(session=session, participant=participant, transcript=transcript),
             prior_state=self._render_compact_working_memory(working_memory),
             history=recent_transcript,
             peer_input=peer_input,
             retrieval_reference=retrieval_reference,
+        )
+
+    def _stage_role_context(
+        self,
+        *,
+        session: ChatSession,
+        participant: ChatParticipant,
+        transcript: list[ChatMessage],
+    ) -> str:
+        if session.mode == ChatMode.SINGLE:
+            return "You are the only responding agent for this turn. Answer the current task directly."
+        if session.mode == ChatMode.PARALLEL:
+            return (
+                "You are responding in parallel with other agents. You cannot see their same-turn output. "
+                "Answer the current task independently, and do not assume another agent has already acted."
+            )
+        try:
+            stage_index = [item.name for item in session.participants].index(participant.name) + 1
+        except ValueError:
+            stage_index = 1
+        stage_count = len(session.participants)
+        same_turn_peer_count = self._same_turn_peer_count(transcript, participant=participant)
+        if stage_index == 1:
+            return (
+                f"You are stage {stage_index} of {stage_count} in this round_robin turn. "
+                "Later agents have not responded yet, so you cannot rely on future same-turn feedback. "
+                "If the current task asks another agent to act before you, state that ordering conflict briefly "
+                "and keep your response limited to what you can do without that future input."
+            )
+        if same_turn_peer_count:
+            return (
+                f"You are stage {stage_index} of {stage_count} in this round_robin turn. "
+                "Earlier same-turn peer output is available below as reference only. "
+                "Evaluate it against the current user task before relying on it. "
+                "If the current task assigns you to review, verify, critique, or check a prior agent's work, "
+                "perform that review now; do not merely say you will review later. "
+                "If the peer output appears to follow stale context or exceed the current task, call that out."
+            )
+        return (
+            f"You are stage {stage_index} of {stage_count} in this round_robin turn. "
+            "No earlier same-turn peer output is available. Answer the current task directly."
         )
 
     def _format_retrieval_reference(
@@ -672,6 +714,18 @@ class ChatService:
             for message in peer_messages
         )
         return self._clip_to_tokens(rendered, max_tokens=max_tokens)
+
+    def _same_turn_peer_count(self, transcript: list[ChatMessage], *, participant: ChatParticipant) -> int:
+        current_turn = self._latest_user_turn_index(transcript)
+        if current_turn is None:
+            return 0
+        return sum(
+            1
+            for message in transcript
+            if message.turn_index == current_turn
+            and message.message_type == MessageType.AGENT
+            and message.speaker != participant.name
+        )
 
     def _clip_to_tokens(self, text: str, *, max_tokens: int) -> str:
         text = text.strip()

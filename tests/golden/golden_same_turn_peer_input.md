@@ -27,6 +27,12 @@ Participants: codex, claude
 Continue the conversation naturally. Distinguish evidence from inference when it matters. Be concise and specific.
 </context_block>
 
+<context_block id="stage_role" kind="instruction" authority="high" source="turn_scheduler">
+# Stage Role
+
+You are stage 2 of 2 in this round_robin turn. Earlier same-turn peer output is available below as reference only. Evaluate it against the current user task before relying on it. If the current task assigns you to review, verify, critique, or check a prior agent's work, perform that review now; do not merely say you will review later. If the peer output appears to follow stale context or exceed the current task, call that out.
+</context_block>
+
 <context_block id="capabilities" kind="capability" authority="binding">
 # Project Boundaries And Capabilities
 
@@ -68,4 +74,3 @@ Codex implement; Claude review.
 
 Reply as `claude` only. Use plain text or markdown.
 </context_block>
-

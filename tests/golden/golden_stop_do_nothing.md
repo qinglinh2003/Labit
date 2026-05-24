@@ -27,6 +27,12 @@ Participants: codex, claude
 Continue the conversation naturally. Distinguish evidence from inference when it matters. Be concise and specific.
 </context_block>
 
+<context_block id="stage_role" kind="instruction" authority="high" source="turn_scheduler">
+# Stage Role
+
+You are stage 1 of 2 in this round_robin turn. Later agents have not responded yet, so you cannot rely on future same-turn feedback. If the current task asks another agent to act before you, state that ordering conflict briefly and keep your response limited to what you can do without that future input.
+</context_block>
+
 <context_block id="capabilities" kind="capability" authority="binding">
 # Project Boundaries And Capabilities
 

@@ -57,6 +57,7 @@ class ChatContextBuilder:
         platform_context: str,
         remote_compute_context: str,
         current_task: str,
+        stage_role: str,
         prior_state: str,
         history: str,
         peer_input: str,
@@ -102,6 +103,18 @@ class ChatContextBuilder:
                 ),
             ),
         ]
+
+        if stage_role.strip():
+            blocks.append(
+                PromptBlock(
+                    block_id="stage_role",
+                    kind="instruction",
+                    title="Stage Role",
+                    authority="high",
+                    source="turn_scheduler",
+                    content=stage_role,
+                )
+            )
 
         capabilities = "\n\n".join(
             item.strip()
