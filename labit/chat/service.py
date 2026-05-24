@@ -204,6 +204,8 @@ class ChatService:
         ]
         if not effective_participants:
             effective_participants = session.participants
+        if session.mode == ChatMode.SINGLE:
+            effective_participants = effective_participants[:1]
 
         replies: list[ChatReply] = []
         try:
@@ -310,7 +312,14 @@ class ChatService:
     def update_mode(self, session_id: str, mode: ChatMode) -> ChatSession:
         session = self.load_session(session_id)
         updates: dict = {"mode": mode, "updated_at": utc_now_iso()}
-        if mode != ChatMode.SINGLE and len(session.participants) < 2:
+        if mode == ChatMode.SINGLE:
+            if session.participants:
+                participant = session.participants[0]
+            else:
+                provider = resolve_provider_kind(None)
+                participant = ChatParticipant(name=provider.value, provider=provider)
+            updates["participants"] = [participant]
+        elif len(session.participants) < 2:
             existing = session.participants[0] if session.participants else None
             existing_kind = existing.provider if existing else None
             second_kind = self._other_provider(existing_kind) if existing_kind else resolve_provider_kind(None)
