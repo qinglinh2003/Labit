@@ -27,23 +27,6 @@ Participants: codex, claude
 Continue the conversation naturally. Distinguish evidence from inference when it matters. Be concise and specific.
 </context_block>
 
-<context_block id="stage_role" kind="instruction" authority="high" source="turn_scheduler">
-# Stage Role
-
-Stage 1 of 2
-Role: answer
-Task: Stop. Reply only OK.
-
-Allowed actions:
-- answer the current task
-
-Forbidden actions:
-- continue prior work unless the current user asks for it
-- expand scope beyond the current user task
-
-If the current task assigns this stage to review, verify, critique, or check prior work, perform that review now; do not merely say you will review later.
-</context_block>
-
 <context_block id="capabilities" kind="capability" authority="binding">
 # Project Boundaries And Capabilities
 

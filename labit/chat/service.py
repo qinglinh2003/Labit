@@ -44,17 +44,6 @@ class ChatTurnResult:
     context_snapshot: ContextSnapshot
 
 
-@dataclass(frozen=True)
-class AgentStage:
-    participant: ChatParticipant
-    stage_index: int
-    stage_count: int
-    role: str
-    task: str
-    allowed_actions: tuple[str, ...]
-    forbidden_actions: tuple[str, ...]
-
-
 class ChatService:
     DEFAULT_REASONING_EFFORT = "medium"
     THINK_REASONING_EFFORT = "high"
@@ -272,20 +261,14 @@ class ChatService:
                     raise parallel_errors[0]
             else:
                 working_transcript = list(base_transcript)
-                stages = self._plan_turn_stages(
-                    session=session,
-                    participants=effective_participants,
-                    current_task=content,
-                )
-                for stage in stages:
+                for participant in effective_participants:
                     reply = self._generate_reply(
                         session=session,
-                        participant=stage.participant,
+                        participant=participant,
                         transcript=working_transcript,
                         snapshot=snapshot,
                         turn_index=turn_index,
                         reply_to=user_message.message_id,
-                        stage=stage,
                         force_deep_context=force_deep_context,
                         reasoning_effort=reasoning_effort,
                         on_reply_start=on_reply_start,
@@ -401,7 +384,6 @@ class ChatService:
         cancel_event: threading.Event | None = None,
         persist: bool = True,
         cwd_override: str | None = None,
-        stage: AgentStage | None = None,
     ) -> ChatReply:
         adapter = self.registry.get(participant.provider)
         request = AgentRequest(
@@ -411,7 +393,6 @@ class ChatService:
                 participant=participant,
                 transcript=transcript,
                 snapshot=snapshot,
-                stage=stage,
                 force_deep_context=force_deep_context,
             ),
             cwd=cwd_override or str(self.paths.root),
@@ -457,18 +438,7 @@ class ChatService:
             provider=participant.provider,
             content=final_content,
             reply_to=reply_to,
-            metadata={
-                "command": response.command,
-                **(
-                    {
-                        "stage_index": stage.stage_index,
-                        "stage_count": stage.stage_count,
-                        "stage_role": stage.role,
-                    }
-                    if stage
-                    else {}
-                ),
-            },
+            metadata={"command": response.command},
         )
         if persist:
             self.store.append_message(message)
@@ -527,7 +497,6 @@ class ChatService:
         participant: ChatParticipant,
         transcript: list[ChatMessage],
         snapshot: ContextSnapshot,
-        stage: AgentStage | None = None,
         force_deep_context: bool = False,
     ) -> str:
         working_memory = self.session_context_store.load_working_memory(session.session_id)
@@ -551,166 +520,10 @@ class ChatService:
             platform_context=platform_context,
             remote_compute_context=remote_compute_context,
             current_task=current_user_message,
-            stage_role=self._stage_role_context(
-                session=session,
-                participant=participant,
-                transcript=transcript,
-                stage=stage,
-            ),
             prior_state=self._render_compact_working_memory(working_memory),
             history=recent_transcript,
             peer_input=peer_input,
             retrieval_reference=retrieval_reference,
-        )
-
-    def _plan_turn_stages(
-        self,
-        *,
-        session: ChatSession,
-        participants: list[ChatParticipant],
-        current_task: str,
-    ) -> list[AgentStage]:
-        if session.mode == ChatMode.SINGLE:
-            selected = participants[:1]
-        else:
-            selected = self._participant_sequence_from_task(current_task=current_task, participants=participants)
-            if not selected:
-                selected = participants
-        if not selected:
-            selected = participants
-        stage_count = len(selected)
-        return [
-            AgentStage(
-                participant=participant,
-                stage_index=index,
-                stage_count=stage_count,
-                role=self._infer_stage_role(current_task=current_task, participant=participant, stage_index=index),
-                task=current_task.strip() or "(empty user message)",
-                allowed_actions=self._allowed_actions_for_stage(current_task=current_task, participant=participant),
-                forbidden_actions=self._forbidden_actions_for_stage(current_task=current_task, participant=participant),
-            )
-            for index, participant in enumerate(selected, start=1)
-        ]
-
-    def _participant_sequence_from_task(
-        self,
-        *,
-        current_task: str,
-        participants: list[ChatParticipant],
-    ) -> list[ChatParticipant]:
-        task = current_task.lower()
-        mentions: list[tuple[int, int, ChatParticipant]] = []
-        for participant_index, participant in enumerate(participants):
-            name = participant.name.lower()
-            start = 0
-            while True:
-                position = task.find(name, start)
-                if position < 0:
-                    break
-                mentions.append((position, participant_index, participant))
-                start = position + len(name)
-        if not mentions:
-            return []
-        mentions.sort(key=lambda item: (item[0], item[1]))
-        return [participant for _, _, participant in mentions]
-
-    def _infer_stage_role(self, *, current_task: str, participant: ChatParticipant, stage_index: int) -> str:
-        task = current_task.lower()
-        participant_position = task.find(participant.name.lower())
-        nearby = task[participant_position: participant_position + 120] if participant_position >= 0 else task
-        role_hits = self._role_keyword_hits(nearby)
-        if role_hits:
-            return min(role_hits, key=lambda item: item[0])[1]
-        if stage_index > 1 and any(token in task for token in ("review", "verify", "check", "评审", "检查")):
-            return "review"
-        return "answer"
-
-    def _role_keyword_hits(self, text: str) -> list[tuple[int, str]]:
-        role_keywords = {
-            "review": ("review", "verify", "check", "critique", "评审", "检查", "审核"),
-            "implement": ("fix", "implement", "write", "edit", "修改", "修复", "写"),
-        }
-        hits: list[tuple[int, str]] = []
-        for role, keywords in role_keywords.items():
-            for keyword in keywords:
-                position = text.find(keyword)
-                if position >= 0:
-                    hits.append((position, role))
-        return hits
-
-    def _allowed_actions_for_stage(self, *, current_task: str, participant: ChatParticipant) -> tuple[str, ...]:
-        role = self._infer_stage_role(current_task=current_task, participant=participant, stage_index=1)
-        if role == "review":
-            return ("read relevant files", "run focused verification commands", "report findings")
-        if role == "implement":
-            return ("edit files that directly satisfy the current task", "run focused verification commands")
-        return ("answer the current task",)
-
-    def _forbidden_actions_for_stage(self, *, current_task: str, participant: ChatParticipant) -> tuple[str, ...]:
-        role = self._infer_stage_role(current_task=current_task, participant=participant, stage_index=1)
-        if role == "review":
-            return ("edit files unless the current user explicitly asks you to edit", "assume peer output is correct")
-        return ("continue prior work unless the current user asks for it", "expand scope beyond the current user task")
-
-    def _stage_role_context(
-        self,
-        *,
-        session: ChatSession,
-        participant: ChatParticipant,
-        transcript: list[ChatMessage],
-        stage: AgentStage | None = None,
-    ) -> str:
-        if stage is not None:
-            allowed = "\n".join(f"- {item}" for item in stage.allowed_actions)
-            forbidden = "\n".join(f"- {item}" for item in stage.forbidden_actions)
-            peer_note = ""
-            if self._same_turn_peer_count(transcript, participant=participant):
-                peer_note = (
-                    "\nEarlier same-turn peer output is available below as reference only. "
-                    "Evaluate it against the current user task and this stage role before relying on it."
-                )
-            return (
-                f"Stage {stage.stage_index} of {stage.stage_count}\n"
-                f"Role: {stage.role}\n"
-                f"Task: {stage.task}\n\n"
-                f"Allowed actions:\n{allowed}\n\n"
-                f"Forbidden actions:\n{forbidden}\n\n"
-                "If the current task assigns this stage to review, verify, critique, or check prior work, "
-                "perform that review now; do not merely say you will review later."
-                f"{peer_note}"
-            )
-        if session.mode == ChatMode.SINGLE:
-            return "You are the only responding agent for this turn. Answer the current task directly."
-        if session.mode == ChatMode.PARALLEL:
-            return (
-                "You are responding in parallel with other agents. You cannot see their same-turn output. "
-                "Answer the current task independently, and do not assume another agent has already acted."
-            )
-        try:
-            stage_index = [item.name for item in session.participants].index(participant.name) + 1
-        except ValueError:
-            stage_index = 1
-        stage_count = len(session.participants)
-        same_turn_peer_count = self._same_turn_peer_count(transcript, participant=participant)
-        if stage_index == 1:
-            return (
-                f"You are stage {stage_index} of {stage_count} in this round_robin turn. "
-                "Later agents have not responded yet, so you cannot rely on future same-turn feedback. "
-                "If the current task asks another agent to act before you, state that ordering conflict briefly "
-                "and keep your response limited to what you can do without that future input."
-            )
-        if same_turn_peer_count:
-            return (
-                f"You are stage {stage_index} of {stage_count} in this round_robin turn. "
-                "Earlier same-turn peer output is available below as reference only. "
-                "Evaluate it against the current user task before relying on it. "
-                "If the current task assigns you to review, verify, critique, or check a prior agent's work, "
-                "perform that review now; do not merely say you will review later. "
-                "If the peer output appears to follow stale context or exceed the current task, call that out."
-            )
-        return (
-            f"You are stage {stage_index} of {stage_count} in this round_robin turn. "
-            "No earlier same-turn peer output is available. Answer the current task directly."
         )
 
     def _format_retrieval_reference(
