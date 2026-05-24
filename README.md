@@ -17,7 +17,39 @@ Inside `labit chat`, the retained slash commands are:
 /doc
 /todo
 /idea
+/paper
 ```
+
+## Workspace Layout
+
+LABIT currently runs inside a self-hosting Research-OS workspace:
+
+```text
+Research-OS/                         # workspace scaffold and runtime data
+  configs/                           # workspace config
+  vault/                             # project vault
+    projects/
+      Labit/
+        code/                        # active LABIT implementation
+```
+
+The active source tree for LABIT development is:
+
+```text
+vault/projects/Labit/code/
+```
+
+The root workspace may also contain an outer `labit/` package as part of the bootstrap/scaffold layout. Treat that outer package as legacy scaffold code, not as the active implementation. New LABIT features, fixes, tests, commits, and pushes should target `vault/projects/Labit/code/`.
+
+Useful checks:
+
+```bash
+which labit
+pip show labit
+python -c "import labit; print(labit.__file__)"
+```
+
+The `labit` command should be installed from `vault/projects/Labit/code`. If a direct Python import from the workspace root resolves to the outer scaffold package, do not use that as the development source.
 
 ## Project Workflow
 
