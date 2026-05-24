@@ -206,6 +206,27 @@ class ChatContextBuilder:
         if peer_input.strip():
             blocks.append(
                 PromptBlock(
+                    block_id="round_robin_review_role",
+                    kind="instruction",
+                    title="Round-Robin Review Role",
+                    authority="high",
+                    content=(
+                        "You are responding after another agent in the same turn.\n\n"
+                        "Your default responsibility is review and verification:\n"
+                        "- Evaluate the previous agent's response against the current user message.\n"
+                        "- Check for mistakes, missing tests, unsupported assumptions, or scope drift.\n"
+                        "- If code or project files changed, prefer reviewing the change, running focused "
+                        "verification when appropriate, and identifying concrete gaps.\n"
+                        "- Build on the previous agent's response only when the current user message directly "
+                        "asks for multi-agent synthesis or continued implementation.\n"
+                        "- If the previous agent conflicts with the current user message, follow the current "
+                        "user message."
+                    ),
+                    quote_content=False,
+                )
+            )
+            blocks.append(
+                PromptBlock(
                     block_id="same_turn_peer_input",
                     kind="peer_input",
                     title="Same-Turn Peer Input - Reference Only",
