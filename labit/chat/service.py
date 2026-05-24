@@ -506,7 +506,9 @@ class ChatService:
         participants = ", ".join(item.name for item in session.participants)
         current_user_message = self._latest_user_message_text(transcript)
         platform_context = self._platform_context(session.project)
+        execution_constraints = self._execution_constraints_context(session.project)
         remote_compute_context = self._remote_compute_context(session.project)
+        include_prior_state = force_deep_context or self._current_task_requests_prior_state(current_user_message)
         retrieval_reference = self._format_retrieval_reference(
             snapshot=snapshot,
             include_memory_blocks=force_deep_context,
@@ -518,13 +520,42 @@ class ChatService:
             mode=session.mode.value,
             participants=participants,
             platform_context=platform_context,
+            execution_constraints=execution_constraints,
             remote_compute_context=remote_compute_context,
             current_task=current_user_message,
             prior_state=self._render_compact_working_memory(working_memory),
             history=recent_transcript,
             peer_input=peer_input,
             retrieval_reference=retrieval_reference,
+            include_prior_state=include_prior_state,
         )
+
+    def _current_task_requests_prior_state(self, message: str) -> bool:
+        normalized = message.casefold()
+        markers = (
+            "continue",
+            "resume",
+            "pick up",
+            "where were we",
+            "where are we",
+            "status",
+            "state",
+            "todo",
+            "open question",
+            "decision",
+            "working memory",
+            "继续",
+            "接着",
+            "恢复",
+            "上次",
+            "之前",
+            "进度",
+            "状态",
+            "待办",
+            "todo",
+            "我们现在写到哪里",
+        )
+        return any(marker in normalized for marker in markers)
 
     def _format_retrieval_reference(
         self,
@@ -720,8 +751,33 @@ class ChatService:
                 pass
         return "\n".join(lines)
 
+    def _execution_constraints_context(self, project: str | None) -> str:
+        if not project:
+            return ""
+        try:
+            spec = self.project_service.load_project(project)
+        except Exception:
+            return ""
+        if not spec.compute_profiles:
+            return ""
+        return "\n".join(
+            [
+                "Remote compute constraints:",
+                "- Only SSH into a remote machine when the user explicitly asks you to inspect, debug, run, or check something remotely.",
+                "- Prefer local project files when the question can be answered locally.",
+                "- Treat each profile's workdir as the expected remote project directory.",
+                "- When running remote shell commands for a profile with a workdir, start from that workdir using `cd <workdir> && ...` or an equivalent shell command.",
+                "- Do not create files in `$HOME`, `/tmp`, or an unspecified remote directory unless the user explicitly asks for that location.",
+                "- Before making remote changes, state the intended command or action unless the user already gave a direct instruction.",
+                "- Do not run destructive commands, package installs, process killing, or long-running jobs remotely unless explicitly requested.",
+                "- When the user asks to update remote code, use rsync from the local project code directory to the profile workdir; do not create git commits just to synchronize files.",
+                "- Rsync may include files ignored by git; call out secrets or large local artifacts before syncing when they are likely to matter.",
+                "- Do not use rsync `--delete` unless the user explicitly asks for destructive mirroring.",
+            ]
+        )
+
     def _remote_compute_context(self, project: str | None) -> str:
-        """Build the remote compute capability block for agent prompts."""
+        """Build the remote compute affordance block for agent prompts."""
         if not project:
             return ""
         try:
@@ -736,20 +792,8 @@ class ChatService:
             local_code_dir = None
 
         lines = [
-            "Remote Compute:",
+            "Remote Compute Profiles:",
             "This project has SSH access to remote machines. These machines are separate from the local LABIT workspace.",
-            "",
-            "Rules:",
-            "- Only SSH into a remote machine when the user explicitly asks you to inspect, debug, run, or check something remotely.",
-            "- Prefer local project files when the question can be answered locally.",
-            "- Treat each profile's workdir as the expected remote project directory.",
-            "- When running remote shell commands for a profile with a workdir, start from that workdir using `cd <workdir> && ...` or an equivalent shell command.",
-            "- Do not create files in `$HOME`, `/tmp`, or an unspecified remote directory unless the user explicitly asks for that location.",
-            "- Before making remote changes, state the intended command or action unless the user already gave a direct instruction.",
-            "- Do not run destructive commands, package installs, process killing, or long-running jobs remotely unless explicitly requested.",
-            "- When the user asks to update remote code, use rsync from the local project code directory to the profile workdir; do not create git commits just to synchronize files.",
-            "- Rsync may include files ignored by git; call out secrets or large local artifacts before syncing when they are likely to matter.",
-            "- Do not use rsync `--delete` unless the user explicitly asks for destructive mirroring.",
             "",
             "Profiles:",
         ]
