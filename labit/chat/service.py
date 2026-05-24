@@ -44,6 +44,12 @@ class ChatTurnResult:
     context_snapshot: ContextSnapshot
 
 
+@dataclass(frozen=True)
+class _TranscriptTurn:
+    turn_index: int
+    messages: tuple[ChatMessage, ...]
+
+
 class ChatService:
     DEFAULT_REASONING_EFFORT = "medium"
     THINK_REASONING_EFFORT = "high"
@@ -500,7 +506,15 @@ class ChatService:
         force_deep_context: bool = False,
     ) -> str:
         working_memory = self.session_context_store.load_working_memory(session.session_id)
-        recent_transcript = self._format_completed_transcript_window(transcript, max_turns=50, max_tokens=60000)
+        history_max_turns, history_max_tokens = self._history_budget(
+            force_deep_context=force_deep_context,
+            has_same_turn_peer=self._same_turn_peer_count(transcript, participant=participant) > 0,
+        )
+        recent_transcript = self._format_completed_transcript_window(
+            transcript,
+            max_turns=history_max_turns,
+            max_tokens=history_max_tokens,
+        )
         peer_input = self._format_same_turn_peer_input(transcript, participant=participant, max_tokens=15000)
         project_label = session.project or "(none)"
         participants = ", ".join(item.name for item in session.participants)
@@ -529,6 +543,13 @@ class ChatService:
             retrieval_reference=retrieval_reference,
             include_prior_state=include_prior_state,
         )
+
+    def _history_budget(self, *, force_deep_context: bool, has_same_turn_peer: bool) -> tuple[int, int]:
+        if force_deep_context:
+            return 50, 60000
+        if has_same_turn_peer:
+            return 12, 12000
+        return 20, 20000
 
     def _current_task_requests_prior_state(self, message: str) -> bool:
         normalized = message.casefold()
@@ -574,17 +595,8 @@ class ChatService:
     def _format_transcript_window(self, transcript: list[ChatMessage], *, max_turns: int, max_tokens: int) -> str:
         if not transcript:
             return "(empty conversation)"
-        recent = self._recent_turn_window(transcript, max_turns=max_turns)
-        lines: list[str] = []
-        for message in recent:
-            provider = f" ({message.provider.value})" if message.provider else ""
-            attachment_text = self._message_attachment_summary(message)
-            line = f"[turn {message.turn_index}] {message.speaker}{provider}: {message.content}"
-            if attachment_text:
-                line = f"{line}\n{attachment_text}"
-            lines.append(line)
-        rendered = "\n\n".join(lines)
-        return self._clip_to_tokens(rendered, max_tokens=max_tokens)
+        turns = self._group_transcript_turns(transcript)
+        return self._render_recent_transcript_turns(turns, max_turns=max_turns, max_tokens=max_tokens)
 
     def _recent_turn_window(self, transcript: list[ChatMessage], *, max_turns: int) -> list[ChatMessage]:
         if not transcript:
@@ -677,6 +689,135 @@ class ChatService:
             return self._format_transcript_window(transcript, max_turns=max_turns, max_tokens=max_tokens)
         completed = [message for message in transcript if message.turn_index < current_turn]
         return self._format_transcript_window(completed, max_turns=max_turns, max_tokens=max_tokens)
+
+    def _group_transcript_turns(self, transcript: list[ChatMessage]) -> list[_TranscriptTurn]:
+        grouped: dict[int, list[ChatMessage]] = {}
+        for message in transcript:
+            grouped.setdefault(message.turn_index, []).append(message)
+        return [
+            _TranscriptTurn(turn_index=turn_index, messages=tuple(messages))
+            for turn_index, messages in sorted(grouped.items(), key=lambda item: item[0])
+        ]
+
+    def _render_recent_transcript_turns(
+        self,
+        turns: list[_TranscriptTurn],
+        *,
+        max_turns: int,
+        max_tokens: int,
+    ) -> str:
+        if not turns or max_turns <= 0 or max_tokens <= 0:
+            return "(empty conversation)"
+
+        candidate_turns = turns[-max_turns:]
+        omitted_older_turns = len(turns) - len(candidate_turns)
+        selected: list[str] = []
+        used_tokens = 0
+
+        for reversed_index, turn in enumerate(reversed(candidate_turns)):
+            rendered_turn = self._render_transcript_turn(turn)
+            turn_tokens = self._estimate_tokens(rendered_turn)
+            if used_tokens + turn_tokens <= max_tokens:
+                selected.append(rendered_turn)
+                used_tokens += turn_tokens
+                continue
+
+            turn_index_in_candidates = len(candidate_turns) - 1 - reversed_index
+            if not selected:
+                clipped_turn = self._clip_transcript_turn_to_tokens(turn, max_tokens=max_tokens)
+                if clipped_turn.strip():
+                    selected.append(clipped_turn)
+                omitted_older_turns += turn_index_in_candidates
+            else:
+                omitted_older_turns += turn_index_in_candidates + 1
+            break
+
+        selected.reverse()
+        if not selected:
+            return "(empty conversation)"
+
+        lines: list[str] = []
+        if omitted_older_turns:
+            noun = "turn" if omitted_older_turns == 1 else "turns"
+            lines.append(
+                f"[older completed transcript omitted: {omitted_older_turns} {noun} "
+                "exceeded history window or budget]"
+            )
+        lines.extend(selected)
+        return "\n\n".join(lines)
+
+    def _render_transcript_turn(self, turn: _TranscriptTurn) -> str:
+        rendered_messages = [self._render_transcript_message(message) for message in turn.messages]
+        return f"[turn {turn.turn_index}]\n" + "\n\n".join(rendered_messages)
+
+    def _render_transcript_message(self, message: ChatMessage) -> str:
+        speaker = self._transcript_speaker_label(message)
+        body = message.content
+        attachment_text = self._message_attachment_summary(message)
+        if attachment_text:
+            body = f"{body}\n{attachment_text}"
+        return f"{speaker}:\n{body}"
+
+    def _transcript_speaker_label(self, message: ChatMessage) -> str:
+        provider = f" ({message.provider.value})" if message.provider else ""
+        return f"{message.speaker}{provider}"
+
+    def _clip_transcript_turn_to_tokens(self, turn: _TranscriptTurn, *, max_tokens: int) -> str:
+        rendered = self._render_transcript_turn(turn)
+        if self._estimate_tokens(rendered) <= max_tokens:
+            return rendered
+
+        max_chars = max(80, max_tokens * 4)
+        header = f"[turn {turn.turn_index}]"
+        if not turn.messages:
+            return header
+
+        first_message = turn.messages[0]
+        last_message = turn.messages[-1]
+        first_rendered = self._render_transcript_message(first_message)
+        prefix = f"{header}\n{first_rendered}\n\n" if first_message is not last_message else f"{header}\n"
+        omitted_middle_count = max(0, len(turn.messages) - 2)
+        middle_marker = (
+            f"[{omitted_middle_count} middle messages omitted to fit history budget]\n\n"
+            if omitted_middle_count
+            else ""
+        )
+        last_budget = max_chars - len(prefix) - len(middle_marker)
+        if last_budget > 120:
+            last_rendered = self._clip_transcript_message_to_chars(last_message, max_chars=last_budget)
+            candidate = f"{prefix}{middle_marker}{last_rendered}".rstrip()
+            if len(candidate) <= max_chars:
+                return candidate
+
+        last_rendered = self._clip_transcript_message_to_chars(
+            last_message,
+            max_chars=max(80, max_chars - len(header) - 1),
+        )
+        return f"{header}\n{last_rendered}".rstrip()
+
+    def _clip_transcript_message_to_chars(self, message: ChatMessage, *, max_chars: int) -> str:
+        rendered = self._render_transcript_message(message)
+        if len(rendered) <= max_chars:
+            return rendered
+
+        speaker = self._transcript_speaker_label(message)
+        body = message.content
+        attachment_text = self._message_attachment_summary(message)
+        if attachment_text:
+            body = f"{body}\n{attachment_text}"
+
+        marker_template = "[message clipped from the beginning: {count} characters omitted]\n"
+        fixed = f"{speaker}:\n"
+        marker_overhead = len(marker_template.format(count=len(body)))
+        body_budget = max(20, max_chars - len(fixed) - marker_overhead)
+        tail = body[-body_budget:].lstrip()
+        omitted = max(0, len(body) - len(tail))
+        marker = marker_template.format(count=omitted)
+        clipped = f"{fixed}{marker}{tail}"
+        if len(clipped) > max_chars:
+            clipped = clipped[-max_chars:].lstrip()
+            clipped = f"{fixed}{marker}{clipped[-body_budget:].lstrip()}"
+        return clipped
 
     def _format_same_turn_peer_input(
         self,
