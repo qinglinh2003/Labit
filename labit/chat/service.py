@@ -647,13 +647,10 @@ class ChatService:
         return ("answer the current task",)
 
     def _forbidden_actions_for_stage(self, *, current_task: str, participant: ChatParticipant) -> tuple[str, ...]:
-        task = current_task.lower()
-        if any(token in task for token in ("do nothing", "reply only", "什么都不要做", "只回复", "回复我ok")):
-            return ("inspect files", "edit files", "run shell commands", "continue previous work")
         role = self._infer_stage_role(current_task=current_task, participant=participant, stage_index=1)
         if role == "review":
             return ("edit files unless the current user explicitly asks you to edit", "assume peer output is correct")
-        return ("expand scope beyond the current user task",)
+        return ("continue prior work unless the current user asks for it", "expand scope beyond the current user task")
 
     def _stage_role_context(
         self,

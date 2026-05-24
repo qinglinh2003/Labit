@@ -100,10 +100,10 @@ def test_stop_instruction_prompt_snapshot(tmp_path: Path) -> None:
     assert prompt.count("Stop. Reply only OK.") >= 2
     assert 'id="stage_role" kind="instruction" authority="high"' in prompt
     assert "Forbidden actions:" in prompt
-    assert "- run shell commands" in prompt
+    assert "- continue prior work unless the current user asks for it" in prompt
     assert "Current goal:" not in prompt
     assert "Keep editing chapter 15" not in prompt
-    assert "Do not inspect files, edit files, run shell commands" in prompt
+    assert "If the current user requests a narrow response" in prompt
 
 
 def test_same_turn_peer_input_is_not_history_snapshot(tmp_path: Path) -> None:
