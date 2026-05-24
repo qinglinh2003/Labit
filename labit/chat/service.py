@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import math
 import shlex
 import threading
-from dataclasses import dataclass
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue
 
@@ -27,11 +28,8 @@ from labit.chat.models import (
 )
 from labit.chat.prompt import ChatContextBuilder
 from labit.chat.store import ChatStore
-from labit.context.assembler import ContextAssembler, ContextSection
-from labit.context.budget import TokenBudget
 from labit.context.condenser import ResearchRollingCondenser, SessionCondenser
 from labit.context.events import SessionEvent, SessionEventKind, WorkingMemorySnapshot
-from labit.context.maps import ContextMapBuilder
 from labit.context.store import SessionContextStore
 from labit.models import ComputeProfile
 from labit.paths import RepoPaths
@@ -60,8 +58,6 @@ class ChatService:
         project_service: ProjectService | None = None,
         session_context_store: SessionContextStore | None = None,
         condenser: SessionCondenser | None = None,
-        assembler: ContextAssembler | None = None,
-        context_map_builder: ContextMapBuilder | None = None,
     ):
         self.paths = paths
         self.store = store or ChatStore(paths)
@@ -70,10 +66,6 @@ class ChatService:
         self.project_service = project_service or ProjectService(paths)
         self.session_context_store = session_context_store or SessionContextStore(paths)
         self.condenser = condenser or ResearchRollingCondenser()
-        self.assembler = assembler or ContextAssembler(
-            budget=TokenBudget(total_tokens=120000, reserve_tokens=20000)
-        )
-        self.context_map_builder = context_map_builder or ContextMapBuilder(paths)
         self.prompt_builder = ChatContextBuilder()
 
     def open_session(
@@ -509,88 +501,45 @@ class ChatService:
         force_deep_context: bool = False,
     ) -> str:
         working_memory = self.session_context_store.load_working_memory(session.session_id)
-        if self._use_compact_chat_prompt(session=session) and not force_deep_context:
-            return self._build_compact_chat_prompt(
-                session=session,
-                participant=participant,
-                transcript=transcript,
-                working_memory=working_memory,
-            )
-
+        recent_transcript = self._format_completed_transcript_window(transcript, max_turns=50, max_tokens=60000)
+        peer_input = self._format_same_turn_peer_input(transcript, participant=participant, max_tokens=15000)
+        project_label = session.project or "(none)"
         participants = ", ".join(item.name for item in session.participants)
         current_user_message = self._latest_user_message_text(transcript)
-        assembled_context = self._assemble_context(
-            session=session,
-            transcript=transcript,
-            snapshot=snapshot,
-            deep_memory=force_deep_context,
-        )
-
         platform_context = self._platform_context(session.project)
         remote_compute_context = self._remote_compute_context(session.project)
+        retrieval_reference = self._format_retrieval_reference(
+            snapshot=snapshot,
+            include_memory_blocks=force_deep_context,
+        )
 
         return self.prompt_builder.build(
             participant_name=participant.name,
-            project=session.project or "(none)",
+            project=project_label,
             mode=session.mode.value,
             participants=participants,
             platform_context=platform_context,
             remote_compute_context=remote_compute_context,
             current_task=current_user_message,
             prior_state=self._render_compact_working_memory(working_memory),
-            history=self._format_completed_transcript_window(transcript, max_turns=50, max_tokens=60000),
-            peer_input=self._format_same_turn_peer_input(transcript, participant=participant, max_tokens=15000),
-            retrieval_reference=assembled_context,
+            history=recent_transcript,
+            peer_input=peer_input,
+            retrieval_reference=retrieval_reference,
         )
 
-    def _assemble_context(
+    def _format_retrieval_reference(
         self,
         *,
-        session: ChatSession,
-        transcript: list[ChatMessage],
         snapshot: ContextSnapshot,
-        deep_memory: bool = False,
+        include_memory_blocks: bool,
     ) -> str:
-        task_header = "\n".join(
-            [
-                f"Session title: {session.title}",
-                f"Project: {session.project or '(none)'}",
-                f"Mode: {session.mode.value}",
-                f"Participants: {', '.join(item.name for item in session.participants)}",
-            ]
-        )
-        working_memory = self.session_context_store.load_working_memory(session.session_id)
-        evidence_refs = list((working_memory.evidence_refs if working_memory else []))
-        base_query_text = self._memory_query_text(transcript=transcript, working_memory=working_memory)
-        bound_sections = [
-            ContextSection(title=block.title, content=block.content, source=block.source, priority=90)
-            for block in snapshot.blocks
-        ]
-        recent_sections = []
-        recent_transcript = self._format_completed_transcript_window(transcript, max_turns=50, max_tokens=60000)
-        if recent_transcript:
-            recent_sections.append(
-                ContextSection(
-                    title="Recent Transcript",
-                    content=recent_transcript,
-                    source="transcript",
-                    priority=80,
-                )
-            )
-        map_sections = self.context_map_builder.build_sections(
-            project=session.project,
-            query=base_query_text,
-            evidence_refs=evidence_refs,
-            allow_fallback=deep_memory,
-        )
-        assembled = self.assembler.assemble(
-            task_header=task_header,
-            bound_sections=bound_sections,
-            recent_sections=recent_sections,
-            working_memory=working_memory,
-            map_sections=map_sections,
-        )
-        return assembled.render()
+        parts: list[str] = []
+        for block in snapshot.blocks[:6]:
+            parts.append(f"## {block.title} ({block.source})\n{block.content.strip()}")
+        if include_memory_blocks:
+            for block in snapshot.memory[:4]:
+                parts.append(f"## {block.title} ({block.source})\n{block.content.strip()}")
+        return "\n\n".join(part for part in parts if part.strip())
 
     def _format_transcript_window(self, transcript: list[ChatMessage], *, max_turns: int, max_tokens: int) -> str:
         if not transcript:
@@ -605,7 +554,7 @@ class ChatService:
                 line = f"{line}\n{attachment_text}"
             lines.append(line)
         rendered = "\n\n".join(lines)
-        return self.assembler.clip_to_tokens(rendered, max_tokens=max_tokens)
+        return self._clip_to_tokens(rendered, max_tokens=max_tokens)
 
     def _recent_turn_window(self, transcript: list[ChatMessage], *, max_turns: int) -> list[ChatMessage]:
         if not transcript:
@@ -621,24 +570,6 @@ class ChatService:
                 break
         allowed = set(ordered_turns)
         return [message for message in transcript if message.turn_index in allowed]
-
-    def _memory_query_text(
-        self,
-        *,
-        transcript: list[ChatMessage],
-        working_memory: WorkingMemorySnapshot | None,
-    ) -> str:
-        parts: list[str] = []
-        user_messages = [message.content.strip() for message in transcript if message.message_type == MessageType.USER]
-        if user_messages:
-            parts.extend(user_messages[-3:])
-        if working_memory is not None:
-            parts.extend(working_memory.decisions_made[-3:])
-            parts.extend(working_memory.open_questions[-3:])
-            parts.extend(working_memory.followups[-3:])
-            parts.extend(working_memory.active_artifacts[-4:])
-            parts.extend(working_memory.evidence_refs[-6:])
-        return "\n".join(part for part in parts if part).strip()
 
     def _recent_image_paths(self, transcript: list[ChatMessage], *, max_images: int = 4) -> list[str]:
         image_paths: list[str] = []
@@ -663,48 +594,6 @@ class ChatService:
             lines.append(f"  [attached {attachment.kind.value}] {label} @ {attachment.path}")
         return "\n".join(lines)
 
-    def _use_lightweight_prompt(
-        self,
-        *,
-        session: ChatSession,
-        snapshot: ContextSnapshot,
-        working_memory: WorkingMemorySnapshot | None,
-    ) -> bool:
-        return self._use_compact_chat_prompt(session=session)
-
-    def _use_compact_chat_prompt(self, *, session: ChatSession) -> bool:
-        return not any(binding.provider != "none" for binding in session.context_bindings)
-
-    def _build_compact_chat_prompt(
-        self,
-        *,
-        session: ChatSession,
-        participant: ChatParticipant,
-        transcript: list[ChatMessage],
-        working_memory: WorkingMemorySnapshot | None,
-    ) -> str:
-        recent_transcript = self._format_completed_transcript_window(transcript, max_turns=50, max_tokens=60000)
-        peer_input = self._format_same_turn_peer_input(transcript, participant=participant, max_tokens=15000)
-        project_label = session.project or "(none)"
-        participants = ", ".join(item.name for item in session.participants)
-        working_memory_text = self._render_compact_working_memory(working_memory)
-        platform_context = self._platform_context(session.project)
-        remote_compute_context = self._remote_compute_context(session.project)
-        current_user_message = self._latest_user_message_text(transcript)
-
-        return self.prompt_builder.build(
-            participant_name=participant.name,
-            project=project_label,
-            mode=session.mode.value,
-            participants=participants,
-            platform_context=platform_context,
-            remote_compute_context=remote_compute_context,
-            current_task=current_user_message,
-            prior_state=working_memory_text,
-            history=recent_transcript,
-            peer_input=peer_input,
-        )
-
     def _latest_user_message_text(self, transcript: list[ChatMessage]) -> str:
         for message in reversed(transcript):
             if message.message_type == MessageType.USER:
@@ -716,8 +605,6 @@ class ChatService:
         if snapshot is None:
             return "(empty)"
         parts: list[str] = []
-        if snapshot.current_goal:
-            parts.append(f"Previous focus: {snapshot.current_goal}")
         if snapshot.active_artifacts:
             parts.append(f"Active artifacts: {', '.join(snapshot.active_artifacts)}")
         if snapshot.decisions_made:
@@ -784,7 +671,22 @@ class ChatService:
             f"[same turn {message.turn_index}] {message.speaker}: {message.content}"
             for message in peer_messages
         )
-        return self.assembler.clip_to_tokens(rendered, max_tokens=max_tokens)
+        return self._clip_to_tokens(rendered, max_tokens=max_tokens)
+
+    def _clip_to_tokens(self, text: str, *, max_tokens: int) -> str:
+        text = text.strip()
+        if self._estimate_tokens(text) <= max_tokens:
+            return text
+        approx_chars = max(1, max_tokens * 4)
+        clipped = text[:approx_chars].rstrip()
+        if len(clipped) < len(text):
+            clipped = f"{clipped}…"
+        return clipped
+
+    def _estimate_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return max(1, math.ceil(len(text) / 4))
 
     def _platform_context(self, project: str | None) -> str:
         """Build a static platform-awareness block that agents must always know."""

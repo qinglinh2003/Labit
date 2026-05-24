@@ -90,8 +90,6 @@ class SessionWorkingMemoryProvider(ConversationMemoryProvider):
             return []
 
         lines: list[str] = []
-        if snapshot.current_goal:
-            lines.append(f"Current goal: {snapshot.current_goal}")
         if snapshot.active_artifacts:
             lines.append(f"Active artifacts: {', '.join(snapshot.active_artifacts)}")
         if snapshot.decisions_made:

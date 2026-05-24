@@ -93,7 +93,7 @@ def test_stop_instruction_prompt_snapshot(tmp_path: Path) -> None:
     assert prompt == _golden("golden_stop_do_nothing.md")
     assert prompt.count("Stop. Reply only OK.") == 2
     assert "Current goal:" not in prompt
-    assert "Previous focus: Keep editing chapter 15" in prompt
+    assert "Keep editing chapter 15" not in prompt
     assert "Do not inspect files, edit files, run shell commands" in prompt
 
 
