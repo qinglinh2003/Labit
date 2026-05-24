@@ -30,7 +30,20 @@ Continue the conversation naturally. Distinguish evidence from inference when it
 <context_block id="stage_role" kind="instruction" authority="high" source="turn_scheduler">
 # Stage Role
 
-You are stage 1 of 2 in this round_robin turn. Later agents have not responded yet, so you cannot rely on future same-turn feedback. If the current task asks another agent to act before you, state that ordering conflict briefly and keep your response limited to what you can do without that future input.
+Stage 1 of 2
+Role: answer
+Task: Stop. Reply only OK.
+
+Allowed actions:
+- answer the current task
+
+Forbidden actions:
+- inspect files
+- edit files
+- run shell commands
+- continue previous work
+
+If the current task assigns this stage to review, verify, critique, or check prior work, perform that review now; do not merely say you will review later.
 </context_block>
 
 <context_block id="capabilities" kind="capability" authority="binding">
