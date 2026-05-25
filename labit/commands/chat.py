@@ -466,9 +466,6 @@ def run_chat_shell(
                     console.print(f"[dim]Participants: {names}[/dim]")
                 continue
             if command == "/swap":
-                if len(current_session.participants) < 2:
-                    console.print("[dim]Need at least 2 participants to swap.[/dim]")
-                    continue
                 old_order = ", ".join(p.name for p in current_session.participants)
                 current_session = service.swap_participants(current_session.session_id)
                 new_order = ", ".join(p.name for p in current_session.participants)

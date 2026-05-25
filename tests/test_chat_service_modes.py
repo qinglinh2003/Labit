@@ -94,3 +94,32 @@ def test_single_mode_dispatches_only_first_participant_even_with_legacy_session(
     assert [reply.participant.name for reply in result.replies] == ["codex"]
     assert len(codex.requests) == 1
     assert claude.requests == []
+
+
+def test_swap_in_single_mode_switches_to_other_agent(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("labit.chat.service.provider_available", lambda provider: True)
+    codex = RecordingAdapter(ProviderKind.CODEX)
+    claude = RecordingAdapter(ProviderKind.CLAUDE)
+    service = ChatService(
+        _paths(tmp_path),
+        registry=ProviderRegistry(
+            adapters={
+                ProviderKind.CODEX: codex,
+                ProviderKind.CLAUDE: claude,
+            }
+        ),
+    )
+    session = service.open_session(
+        title="Single swap test",
+        mode=ChatMode.SINGLE,
+        provider=ProviderKind.CODEX,
+    )
+
+    swapped = service.swap_participants(session.session_id)
+    result = service.ask(session_id=session.session_id, content="New single agent should answer.")
+
+    assert swapped.mode == ChatMode.SINGLE
+    assert [participant.name for participant in swapped.participants] == ["claude"]
+    assert [reply.participant.name for reply in result.replies] == ["claude"]
+    assert codex.requests == []
+    assert len(claude.requests) == 1

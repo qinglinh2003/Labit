@@ -219,7 +219,7 @@ def render_shell_help(console: Console) -> None:
     table.add_row("/switch <session_id>", "Switch to another session.")
     table.add_row("/show", "Show the full transcript for the current session.")
     table.add_row("/mode [mode]", "Show or switch mode (single, round_robin, parallel).")
-    table.add_row("/swap", "Swap the response order of participants (e.g. claude,codex → codex,claude).")
+    table.add_row("/swap", "Swap response order, or switch agent in single mode.")
     table.add_row("/mute <name>", "Mute an agent for the next turn only. Toggle: run again to unmute.")
     table.add_row("/idea [text]", "Save a lightweight project idea. With no text, show saved ideas.")
     table.add_row("/todo [text]", "Save an actionable project todo. With no text, show saved todos.")

@@ -330,12 +330,18 @@ class ChatService:
         return updated
 
     def swap_participants(self, session_id: str) -> ChatSession:
-        """Reverse the order of participants."""
+        """Reverse participant order, or switch the sole participant in single mode."""
         session = self.load_session(session_id)
         if len(session.participants) < 2:
-            raise ValueError("Need at least 2 participants to swap.")
+            if not session.participants:
+                raise ValueError("Need at least 1 participant to swap.")
+            current = session.participants[0]
+            next_kind = self._other_provider(current.provider)
+            participants = [ChatParticipant(name=next_kind.value, provider=next_kind)]
+        else:
+            participants = list(reversed(session.participants))
         updated = session.model_copy(update={
-            "participants": list(reversed(session.participants)),
+            "participants": participants,
             "updated_at": utc_now_iso(),
         })
         self.store.write_session(updated)
