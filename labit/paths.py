@@ -46,8 +46,8 @@ def discover_repo_root(start: Path | None = None) -> Path:
     for candidate in candidates:
         has_markers = (
             (candidate / ".git").exists()
+            and (candidate / ".labit").exists()
             and (candidate / "pyproject.toml").exists()
-            and (candidate / "labit").exists()
             and (candidate / "configs").exists()
             and (candidate / "vault").exists()
         )
