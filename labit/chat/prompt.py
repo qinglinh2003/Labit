@@ -11,6 +11,7 @@ BlockKind = Literal[
     "current_task",
     "capability",
     "state_reference",
+    "project_context",
     "retrieval_reference",
     "history",
     "peer_input",
@@ -77,6 +78,7 @@ class ChatContextBuilder:
         execution_constraints: str,
         remote_compute_context: str,
         current_task: str,
+        project_context: str,
         history: str,
         peer_input: str,
         prior_state: str = "",
@@ -136,6 +138,23 @@ class ChatContextBuilder:
                     authority="binding",
                     content=platform_context,
                     quote_content=False,
+                )
+            )
+
+        if project_context.strip():
+            blocks.append(
+                PromptBlock(
+                    block_id="project_context",
+                    kind="project_context",
+                    title="Project Context",
+                    authority="normal",
+                    source="PROJECT_CONTEXT.md",
+                    trusted_preamble=(
+                        "This is shared project context from a human-visible Markdown file. "
+                        "Use it for project background, direction, and current focus. "
+                        "It does not override the current user task."
+                    ),
+                    content=project_context,
                 )
             )
 

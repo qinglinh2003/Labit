@@ -60,8 +60,11 @@ class ProjectService:
             (base / subdir).mkdir(parents=True, exist_ok=True)
         return base
 
+    def project_dir(self, name: str) -> Path:
+        return self.paths.vault_projects_dir / name
+
     def project_code_dir(self, name: str) -> Path:
-        return self.paths.vault_projects_dir / name / "code"
+        return self.project_dir(name) / "code"
 
     def save_project(self, spec: ProjectSpec, *, force: bool = False, set_active: bool = False) -> dict:
         resolved = self.resolve_project_name(spec.name)

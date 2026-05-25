@@ -529,6 +529,7 @@ class ChatService:
         participants = ", ".join(item.name for item in session.participants)
         current_user_message = self._latest_user_message_text(transcript)
         platform_context = self._platform_context(session.project)
+        project_context = self._project_context(session.project)
         execution_constraints = self._execution_constraints_context(session.project)
         remote_compute_context = self._remote_compute_context(session.project)
         include_prior_state = force_deep_context or self._current_task_requests_prior_state(current_user_message)
@@ -546,6 +547,7 @@ class ChatService:
             execution_constraints=execution_constraints,
             remote_compute_context=remote_compute_context,
             current_task=current_user_message,
+            project_context=project_context,
             prior_state=self._render_compact_working_memory(working_memory),
             history=recent_transcript,
             peer_input=peer_input,
@@ -879,6 +881,68 @@ class ChatService:
         if not text:
             return 0
         return max(1, math.ceil(len(text) / 4))
+
+    def _project_context(self, project: str | None) -> str:
+        if not project:
+            return ""
+        context_path = self.project_service.project_dir(project) / "PROJECT_CONTEXT.md"
+        try:
+            context = context_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return ""
+        except OSError:
+            return ""
+        return self._clip_project_context(context, max_tokens=1500)
+
+    def _clip_project_context(self, text: str, *, max_tokens: int) -> str:
+        text = text.strip()
+        if not text or self._estimate_tokens(text) <= max_tokens:
+            return text
+
+        sections = self._split_markdown_h2_sections(text)
+        prioritized: list[str] = []
+        for key in ("__preamble__", "brief", "goal", "active focus", "current state"):
+            value = sections.pop(key, "").strip()
+            if value:
+                prioritized.append(value)
+        prioritized.extend(value.strip() for value in sections.values() if value.strip())
+
+        selected: list[str] = []
+        marker = "\n\n[project context clipped to fit prompt budget]"
+        for section in prioritized:
+            candidate = "\n\n".join([*selected, section]).strip()
+            if self._estimate_tokens(candidate + marker) <= max_tokens:
+                selected.append(section)
+                continue
+            break
+
+        if selected:
+            candidate = "\n\n".join(selected).strip() + marker
+            if self._estimate_tokens(candidate) <= max_tokens:
+                return candidate
+
+        return self._clip_to_tokens(text, max_tokens=max_tokens).rstrip("…") + marker
+
+    def _split_markdown_h2_sections(self, text: str) -> dict[str, str]:
+        sections: dict[str, str] = {}
+        current_key = "__preamble__"
+        current_lines: list[str] = []
+
+        for line in text.splitlines():
+            if line.startswith("## "):
+                content = "\n".join(current_lines).strip()
+                if content:
+                    sections[current_key] = content
+                title = line[3:].strip()
+                current_key = title.casefold()
+                current_lines = [line]
+            else:
+                current_lines.append(line)
+
+        content = "\n".join(current_lines).strip()
+        if content:
+            sections[current_key] = content
+        return sections
 
     def _platform_context(self, project: str | None) -> str:
         """Build a static platform-awareness block that agents must always know."""
