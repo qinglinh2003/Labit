@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Labit arXiv Importer",
+  "version": "0.1.0",
+  "description": "Import arXiv PDFs into a Labit project.",
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "permissions": ["activeTab", "storage"],
+  "host_permissions": [
+    "https://arxiv.org/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://arxiv.org/abs/*"],
+      "js": ["contentScript.js"]
+    }
+  ]
+}

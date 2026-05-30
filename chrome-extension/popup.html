@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Labit arXiv Importer</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Labit</h1>
+        <span id="status" class="status">Loading</span>
+      </header>
+
+      <label>
+        API
+        <input id="apiBase" type="url" spellcheck="false" />
+      </label>
+
+      <label>
+        Project
+        <select id="projectSelect"></select>
+      </label>
+
+      <section id="paper" class="paper hidden">
+        <div class="paper-id" id="paperId"></div>
+        <h2 id="paperTitle"></h2>
+        <p id="paperAuthors"></p>
+      </section>
+
+      <button id="importButton" disabled>Add to Labit</button>
+      <p id="message" class="message"></p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

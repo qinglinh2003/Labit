@@ -67,7 +67,8 @@ def _render_paper_added(console, record: PaperRecord) -> None:
             f"[bold]Title[/bold]: {record.title}",
             f"[bold]Authors[/bold]: {authors or '(unknown)'}",
             f"[bold]Metadata[/bold]: {record.local_metadata_path}",
-            f"[bold]HTML[/bold]: {record.local_html_path or '(not cached)'}",
+            f"[bold]PDF[/bold]: {record.local_pdf_path or '(not saved)'}",
+            f"[bold]Artifacts[/bold]: {record.artifact_dir_path or '(not initialized)'}",
         ]
     )
     if record.html_fetch_error:
@@ -83,13 +84,13 @@ def _render_paper_list(console, records: list[PaperRecord]) -> None:
     table.add_column("ID", style="bold #0080ff", no_wrap=True)
     table.add_column("Title")
     table.add_column("Abstract")
-    table.add_column("HTML")
+    table.add_column("PDF")
     for record in records:
         table.add_row(
             record.arxiv_id,
             record.title,
             _clip(record.abstract, 220),
-            record.local_html_path or "(not cached)",
+            record.local_pdf_path or "(not saved)",
         )
     console.print(Panel(table, title="Project Papers", border_style="#0080ff"))
 

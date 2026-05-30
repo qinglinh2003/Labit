@@ -5,7 +5,7 @@ LABIT is a lightweight local workspace for project-scoped AI research conversati
 The current lite surface is intentionally small:
 
 ```bash
-labit          # open the dashboard shell
+labit          # show workspace status
 labit chat     # start a project-scoped multi-agent conversation
 labit project  # manage local projects
 labit setup    # show workspace status
@@ -85,6 +85,36 @@ Use `/doc` when a discussion should become a Markdown document. In doc mode, nor
 
 Use `/todo` and `/idea` for lightweight capture from the current session.
 
-## Dashboard
+## Web UI
 
-Running `labit` opens a Streamlit dashboard shell. The shell is intentionally empty until the GUI surface is redesigned.
+The Streamlit dashboard shell has been removed. The web surface is moving to a React + TypeScript frontend backed by a FastAPI API server.
+
+Run the backend:
+
+```bash
+labit api --port 8787
+```
+
+Run the frontend in development:
+
+```bash
+cd labit-ui
+npm install
+npm run dev
+```
+
+Build the frontend for FastAPI static serving:
+
+```bash
+cd labit-ui
+npm run build
+labit api --port 8787
+```
+
+Import arXiv PDFs from Chrome:
+
+```text
+chrome://extensions -> Developer mode -> Load unpacked -> chrome-extension/
+```
+
+Open an arXiv abstract page, then use the Labit extension popup to upload the PDF into a project.

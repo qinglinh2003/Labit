@@ -12,7 +12,6 @@ from labit.commands.chat import chat_app
 from labit.commands.project import project_app
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
-from labit.web.command import launch_dashboard
 
 app = typer.Typer(help="LABIT: local-first control plane for research workflows.", invoke_without_command=True)
 app.add_typer(project_app, name="project")
@@ -70,7 +69,7 @@ def _render_home() -> None:
         next_steps = [
             f"Continue the active project with `labit chat`.",
             f"Inspect project state with `labit project show {active_project}`.",
-            "Open the dashboard with `labit`.",
+            "Use `labit setup` to inspect workspace status.",
         ]
 
     console.print("[bold]Next Steps[/bold]")
@@ -83,6 +82,17 @@ def setup() -> None:
     _render_home()
 
 
+@app.command("api", help="Run the LABIT FastAPI backend.")
+def api(
+    host: str = typer.Option("127.0.0.1", "--host", help="Host interface to bind."),
+    port: int = typer.Option(8787, "--port", help="Port to bind."),
+    reload: bool = typer.Option(False, "--reload", help="Enable uvicorn reload for development."),
+) -> None:
+    import uvicorn
+
+    uvicorn.run("labit.api.app:create_app", factory=True, host=host, port=port, reload=reload)
+
+
 @app.callback()
 def main(
     ctx: typer.Context,
@@ -92,12 +102,10 @@ def main(
         help="Show the LABIT version and exit.",
         is_eager=True,
     ),
-    port: int = typer.Option(8765, "--port", help="Local port for the default dashboard."),
-    address: str = typer.Option("127.0.0.1", "--address", help="Bind address for the default dashboard."),
 ) -> None:
     """LABIT CLI."""
     if version:
         typer.echo(__version__)
         raise typer.Exit()
     if ctx.invoked_subcommand is None:
-        raise typer.Exit(launch_dashboard(port=port, address=address))
+        _render_home()

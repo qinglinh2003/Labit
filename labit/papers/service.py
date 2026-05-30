@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -14,7 +15,7 @@ from time import sleep
 
 import yaml
 
-from labit.papers.models import PaperRecord
+from labit.papers.models import ArxivPaperMetadata, PaperRecord
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
 
@@ -39,8 +40,7 @@ class PaperService:
         arxiv_id = self.parse_arxiv_id(reference)
 
         # Cache-first: if we already have metadata locally, return it
-        target_dir = self._paper_dir(resolved)
-        metadata_path = target_dir / f"{arxiv_id}.yaml"
+        metadata_path = self._metadata_path(resolved, arxiv_id)
         if metadata_path.exists():
             raw = yaml.safe_load(metadata_path.read_text(encoding="utf-8")) or {}
             return PaperRecord.model_validate(raw)
@@ -57,28 +57,91 @@ class PaperService:
         except Exception as exc:
             html_fetch_error = str(exc)
 
-        target_dir = self._paper_dir(resolved)
-        target_dir.mkdir(parents=True, exist_ok=True)
-        metadata_path = target_dir / f"{arxiv_id}.yaml"
-        html_path = target_dir / f"{arxiv_id}.html"
+        paper_dir = self._paper_record_dir(resolved, arxiv_id)
+        paper_dir.mkdir(parents=True, exist_ok=True)
+        artifacts_dir = paper_dir / "artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        metadata_path = paper_dir / "paper.yaml"
+        html_path = paper_dir / "paper.html"
+        notes_path = artifacts_dir / "notes.md"
+        if not notes_path.exists():
+            self._atomic_write(notes_path, f"# {metadata['title']}\n")
 
         now = datetime.now(UTC).replace(microsecond=0).isoformat()
         record = PaperRecord(
+            id=f"arxiv:{arxiv_id}",
+            source="arxiv",
             arxiv_id=arxiv_id,
             title=metadata["title"],
             authors=metadata["authors"],
             abstract=metadata["abstract"],
+            url=ARXIV_ABS_URL.format(arxiv_id=arxiv_id),
             source_url=ARXIV_ABS_URL.format(arxiv_id=arxiv_id),
             html_url=html_url,
             html_fetch_error=html_fetch_error,
             pdf_url=ARXIV_PDF_URL.format(arxiv_id=arxiv_id),
             local_html_path=str(html_path.relative_to(self.paths.root)) if html else "",
             local_metadata_path=str(metadata_path.relative_to(self.paths.root)),
+            artifact_dir_path=str(artifacts_dir.relative_to(self.paths.root)),
             added_at=now,
         )
 
         if html:
             self._atomic_write(html_path, html)
+        yaml_text = yaml.safe_dump(record.model_dump(mode="json"), sort_keys=False, allow_unicode=True)
+        self._atomic_write(metadata_path, yaml_text)
+        return record
+
+    def import_arxiv_pdf(
+        self,
+        *,
+        project: str,
+        metadata: ArxivPaperMetadata,
+        pdf_content: bytes,
+    ) -> PaperRecord:
+        resolved = self._require_project(project)
+        arxiv_id = self.parse_arxiv_id(metadata.arxiv_id)
+        if not pdf_content:
+            raise ValueError("PDF upload is empty.")
+
+        paper_dir = self._paper_record_dir(resolved, arxiv_id)
+        artifacts_dir = paper_dir / "artifacts"
+        metadata_path = paper_dir / "paper.yaml"
+        pdf_path = paper_dir / "paper.pdf"
+        notes_path = artifacts_dir / "notes.md"
+
+        previous_added_at = ""
+        if metadata_path.exists():
+            try:
+                raw = yaml.safe_load(metadata_path.read_text(encoding="utf-8")) or {}
+                previous_added_at = str(raw.get("added_at") or "")
+            except Exception:
+                previous_added_at = ""
+
+        paper_dir.mkdir(parents=True, exist_ok=True)
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        pdf_path.write_bytes(pdf_content)
+        if not notes_path.exists():
+            self._atomic_write(notes_path, f"# {metadata.title or arxiv_id}\n")
+
+        now = datetime.now(UTC).replace(microsecond=0).isoformat()
+        source_url = metadata.url or ARXIV_ABS_URL.format(arxiv_id=arxiv_id)
+        pdf_url = metadata.pdf_url or ARXIV_PDF_URL.format(arxiv_id=arxiv_id)
+        record = PaperRecord(
+            id=f"arxiv:{arxiv_id}",
+            source="arxiv",
+            arxiv_id=arxiv_id,
+            title=metadata.title or arxiv_id,
+            authors=metadata.authors,
+            abstract=metadata.abstract,
+            url=source_url,
+            source_url=source_url,
+            pdf_url=pdf_url,
+            local_pdf_path=str(pdf_path.relative_to(self.paths.root)),
+            local_metadata_path=str(metadata_path.relative_to(self.paths.root)),
+            artifact_dir_path=str(artifacts_dir.relative_to(self.paths.root)),
+            added_at=previous_added_at or now,
+        )
         yaml_text = yaml.safe_dump(record.model_dump(mode="json"), sort_keys=False, allow_unicode=True)
         self._atomic_write(metadata_path, yaml_text)
         return record
@@ -90,7 +153,7 @@ class PaperService:
             return []
 
         records: list[PaperRecord] = []
-        for path in sorted(target_dir.glob("*.yaml")):
+        for path in sorted(target_dir.glob("arxiv-*/paper.yaml")):
             try:
                 raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
                 records.append(PaperRecord.model_validate(raw))
@@ -101,29 +164,65 @@ class PaperService:
     def remove_paper(self, *, project: str, arxiv_id_or_url: str) -> PaperRecord:
         resolved = self._require_project(project)
         arxiv_id = self.parse_arxiv_id(arxiv_id_or_url)
-        target_dir = self._paper_dir(resolved)
-        metadata_path = target_dir / f"{arxiv_id}.yaml"
-        html_path = target_dir / f"{arxiv_id}.html"
-        if not metadata_path.exists() and not html_path.exists():
+        paper_dir = self._paper_record_dir(resolved, arxiv_id)
+        metadata_path = paper_dir / "paper.yaml"
+        if not paper_dir.exists():
             raise FileNotFoundError(f"Paper '{arxiv_id}' is not saved in project '{resolved}'.")
 
         record: PaperRecord | None = None
         if metadata_path.exists():
             raw = yaml.safe_load(metadata_path.read_text(encoding="utf-8")) or {}
             record = PaperRecord.model_validate(raw)
-            metadata_path.unlink()
-        if html_path.exists():
-            html_path.unlink()
+        shutil.rmtree(paper_dir)
         if record is not None:
             return record
         return PaperRecord(
+            id=f"arxiv:{arxiv_id}",
+            source="arxiv",
             arxiv_id=arxiv_id,
             title=arxiv_id,
+            url=ARXIV_ABS_URL.format(arxiv_id=arxiv_id),
             source_url=ARXIV_ABS_URL.format(arxiv_id=arxiv_id),
             html_url=ARXIV_HTML_URL.format(arxiv_id=arxiv_id),
             pdf_url=ARXIV_PDF_URL.format(arxiv_id=arxiv_id),
             added_at="",
         )
+
+    def get_paper(self, *, project: str, paper_id: str) -> PaperRecord:
+        resolved = self._require_project(project)
+        arxiv_id = self._paper_id_to_arxiv_id(paper_id)
+        metadata_path = self._metadata_path(resolved, arxiv_id)
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Paper '{paper_id}' is not saved in project '{resolved}'.")
+        raw = yaml.safe_load(metadata_path.read_text(encoding="utf-8")) or {}
+        return PaperRecord.model_validate(raw)
+
+    def pdf_path(self, *, project: str, paper_id: str) -> Path:
+        resolved = self._require_project(project)
+        arxiv_id = self._paper_id_to_arxiv_id(paper_id)
+        path = self._paper_record_dir(resolved, arxiv_id) / "paper.pdf"
+        if not path.exists():
+            raise FileNotFoundError(f"PDF for paper '{paper_id}' is not saved in project '{resolved}'.")
+        return path
+
+    def list_artifacts(self, *, project: str, paper_id: str) -> list[dict[str, object]]:
+        resolved = self._require_project(project)
+        arxiv_id = self._paper_id_to_arxiv_id(paper_id)
+        artifacts_dir = self._paper_record_dir(resolved, arxiv_id) / "artifacts"
+        if not artifacts_dir.exists():
+            return []
+
+        artifacts: list[dict[str, object]] = []
+        for path in sorted(item for item in artifacts_dir.rglob("*") if item.is_file()):
+            artifacts.append(
+                {
+                    "name": path.name,
+                    "path": str(path.relative_to(self.paths.root)),
+                    "relative_path": str(path.relative_to(artifacts_dir)),
+                    "size_bytes": path.stat().st_size,
+                }
+            )
+        return artifacts
 
     def parse_arxiv_id(self, reference: str) -> str:
         value = reference.strip()
@@ -293,6 +392,20 @@ class PaperService:
 
     def _paper_dir(self, project: str) -> Path:
         return self.paths.vault_projects_dir / project / "papers"
+
+    def _paper_record_dir(self, project: str, arxiv_id: str) -> Path:
+        return self._paper_dir(project) / f"arxiv-{arxiv_id}"
+
+    def _metadata_path(self, project: str, arxiv_id: str) -> Path:
+        return self._paper_record_dir(project, arxiv_id) / "paper.yaml"
+
+    def _paper_id_to_arxiv_id(self, paper_id: str) -> str:
+        value = paper_id.strip()
+        if value.startswith("arxiv:"):
+            return self.parse_arxiv_id(value.removeprefix("arxiv:"))
+        if value.startswith("arxiv-"):
+            return self.parse_arxiv_id(value.removeprefix("arxiv-"))
+        return self.parse_arxiv_id(value)
 
     def _atomic_write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
