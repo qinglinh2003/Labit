@@ -6,10 +6,12 @@ import {
   listArtifacts,
   listPapers,
   listProjects,
-  PaperRecord
+  PaperRecord,
+  prefetchPaperPdf
 } from "./api/client";
+import { loadPaperPdfViewer } from "./components/loadPaperPdfViewer";
 
-const PaperPdfViewer = lazy(() => import("./components/PaperPdfViewer"));
+const PaperPdfViewer = lazy(loadPaperPdfViewer);
 
 interface UiState {
   project: string;
@@ -50,6 +52,18 @@ export function App() {
     }
   }, [selectedPaper, selectedPaperId, setSelectedPaperId]);
 
+  useEffect(() => {
+    if (papers.some((paper) => paper.local_pdf_path)) {
+      void loadPaperPdfViewer();
+    }
+  }, [papers]);
+
+  useEffect(() => {
+    if (project && selectedPaper?.local_pdf_path) {
+      prefetchPaperPdf(project, selectedPaper.id);
+    }
+  }, [project, selectedPaper?.id, selectedPaper?.local_pdf_path]);
+
   return (
     <main className="min-h-screen bg-slate-50 text-slate-950">
       <header className="border-b border-slate-200 bg-white">
@@ -88,6 +102,7 @@ export function App() {
       <section className="grid h-[calc(100vh-3.5rem)] grid-cols-[360px_minmax(0,1fr)]">
         <PaperList
           papers={papers}
+          project={project}
           selectedPaperId={selectedPaper?.id ?? ""}
           isLoading={papersQuery.isLoading}
           onSelect={setSelectedPaperId}
@@ -100,15 +115,25 @@ export function App() {
 
 function PaperList({
   papers,
+  project,
   selectedPaperId,
   isLoading,
   onSelect
 }: {
   papers: PaperRecord[];
+  project: string;
   selectedPaperId: string;
   isLoading: boolean;
   onSelect: (paperId: string) => void;
 }) {
+  const warmPaper = (paper: PaperRecord) => {
+    if (!project || !paper.local_pdf_path) {
+      return;
+    }
+    void loadPaperPdfViewer();
+    prefetchPaperPdf(project, paper.id);
+  };
+
   return (
     <aside className="border-r border-slate-200 bg-white">
       <div className="flex h-12 items-center justify-between border-b border-slate-200 px-4">
@@ -125,6 +150,8 @@ function PaperList({
               selectedPaperId === paper.id ? "bg-slate-100" : "bg-white hover:bg-slate-50"
             }`}
             onClick={() => onSelect(paper.id)}
+            onFocus={() => warmPaper(paper)}
+            onMouseEnter={() => warmPaper(paper)}
             type="button"
           >
             <div className="line-clamp-2 text-sm font-medium leading-5">{paper.title}</div>

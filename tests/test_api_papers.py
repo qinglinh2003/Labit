@@ -70,10 +70,72 @@ def test_api_imports_lists_and_serves_project_paper(tmp_path: Path) -> None:
     pdf_response = client.get("/api/projects/Labit/papers/arxiv-2401.12345/pdf")
     assert pdf_response.status_code == 200
     assert pdf_response.content == b"%PDF-1.7\n"
+    assert pdf_response.headers["accept-ranges"] == "bytes"
+    assert pdf_response.headers["cache-control"] == "public, max-age=86400, immutable"
 
     artifacts_response = client.get("/api/projects/Labit/papers/arxiv-2401.12345/artifacts")
     assert artifacts_response.status_code == 200
     assert artifacts_response.json()[0]["relative_path"] == "notes.md"
+
+
+def test_api_serves_pdf_byte_ranges(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    client = TestClient(create_app(paths))
+    metadata = {
+        "arxiv_id": "2401.12345",
+        "title": "A Useful Paper",
+        "authors": ["Ada Lovelace"],
+        "abstract": "A compact abstract.",
+        "url": "https://arxiv.org/abs/2401.12345",
+        "pdf_url": "https://arxiv.org/pdf/2401.12345",
+    }
+    client.post(
+        "/api/projects/Labit/papers/import/arxiv",
+        data={"metadata": json.dumps(metadata)},
+        files={"pdf": ("paper.pdf", b"0123456789", "application/pdf")},
+    )
+
+    response = client.get(
+        "/api/projects/Labit/papers/arxiv-2401.12345/pdf",
+        headers={"Origin": "http://127.0.0.1:5173", "Range": "bytes=2-5"},
+    )
+
+    assert response.status_code == 206
+    assert response.content == b"2345"
+    assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:5173"
+    assert "Content-Range" in response.headers["access-control-expose-headers"]
+    assert response.headers["accept-ranges"] == "bytes"
+    assert response.headers["cache-control"] == "public, max-age=86400, immutable"
+    assert response.headers["content-length"] == "4"
+    assert response.headers["content-range"] == "bytes 2-5/10"
+
+
+def test_api_serves_pdf_suffix_byte_ranges(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    client = TestClient(create_app(paths))
+    metadata = {
+        "arxiv_id": "2401.12345",
+        "title": "A Useful Paper",
+        "authors": ["Ada Lovelace"],
+        "abstract": "A compact abstract.",
+        "url": "https://arxiv.org/abs/2401.12345",
+        "pdf_url": "https://arxiv.org/pdf/2401.12345",
+    }
+    client.post(
+        "/api/projects/Labit/papers/import/arxiv",
+        data={"metadata": json.dumps(metadata)},
+        files={"pdf": ("paper.pdf", b"0123456789", "application/pdf")},
+    )
+
+    response = client.get(
+        "/api/projects/Labit/papers/arxiv-2401.12345/pdf",
+        headers={"Range": "bytes=-4"},
+    )
+
+    assert response.status_code == 206
+    assert response.content == b"6789"
+    assert response.headers["content-length"] == "4"
+    assert response.headers["content-range"] == "bytes 6-9/10"
 
 
 def test_api_returns_project_list(tmp_path: Path) -> None:

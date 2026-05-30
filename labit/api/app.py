@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Iterator
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ValidationError
 
@@ -24,6 +25,8 @@ DEFAULT_CORS_ORIGINS = [
     "http://localhost:8787",
 ]
 CHROME_EXTENSION_ORIGIN_RE = r"^chrome-extension://[a-z]{32}$"
+PDF_CACHE_CONTROL = "public, max-age=86400, immutable"
+PDF_RANGE_CHUNK_SIZE = 1024 * 1024
 
 
 class ProjectListResponse(BaseModel):
@@ -51,6 +54,7 @@ def create_app(paths: RepoPaths | None = None) -> FastAPI:
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["Accept-Ranges", "Cache-Control", "Content-Length", "Content-Range"],
     )
 
     @app.get("/api/health")
@@ -105,10 +109,22 @@ def create_app(paths: RepoPaths | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/projects/{project}/papers/{paper_id}/pdf")
-    def get_paper_pdf(project: str, paper_id: str) -> FileResponse:
+    def get_paper_pdf(project: str, paper_id: str, request: Request):
         try:
             pdf_path = paper_service.pdf_path(project=project, paper_id=paper_id)
-            return FileResponse(pdf_path, media_type="application/pdf", filename=pdf_path.name)
+            range_header = request.headers.get("range")
+            if range_header:
+                return _range_pdf_response(pdf_path, range_header)
+            return FileResponse(
+                pdf_path,
+                media_type="application/pdf",
+                filename=pdf_path.name,
+                content_disposition_type="inline",
+                headers={
+                    "Accept-Ranges": "bytes",
+                    "Cache-Control": PDF_CACHE_CONTROL,
+                },
+            )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -145,3 +161,62 @@ def _cors_origins() -> list[str]:
     raw = os.environ.get("LABIT_API_CORS_ORIGINS", "")
     origins = [item.strip() for item in raw.split(",") if item.strip()]
     return origins or DEFAULT_CORS_ORIGINS
+
+
+def _range_pdf_response(pdf_path: Path, range_header: str) -> StreamingResponse:
+    file_size = pdf_path.stat().st_size
+    start, end = _parse_range_header(range_header, file_size)
+    content_length = end - start + 1
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": PDF_CACHE_CONTROL,
+        "Content-Disposition": f'inline; filename="{pdf_path.name}"',
+        "Content-Length": str(content_length),
+        "Content-Range": f"bytes {start}-{end}/{file_size}",
+    }
+    return StreamingResponse(
+        _iter_file_range(pdf_path, start, end),
+        status_code=206,
+        media_type="application/pdf",
+        headers=headers,
+    )
+
+
+def _parse_range_header(range_header: str, file_size: int) -> tuple[int, int]:
+    unit, _, raw_range = range_header.partition("=")
+    if unit.strip().lower() != "bytes" or not raw_range:
+        raise HTTPException(status_code=416, detail="Invalid range header")
+
+    first_range = raw_range.split(",", 1)[0].strip()
+    raw_start, separator, raw_end = first_range.partition("-")
+    if separator != "-":
+        raise HTTPException(status_code=416, detail="Invalid range header")
+
+    try:
+        if raw_start == "":
+            suffix_length = int(raw_end)
+            if suffix_length <= 0:
+                raise ValueError
+            start = max(file_size - suffix_length, 0)
+            end = file_size - 1
+        else:
+            start = int(raw_start)
+            end = int(raw_end) if raw_end else file_size - 1
+    except ValueError as exc:
+        raise HTTPException(status_code=416, detail="Invalid range header") from exc
+
+    if start < 0 or end < start or start >= file_size:
+        raise HTTPException(status_code=416, detail="Requested range not satisfiable")
+    return start, min(end, file_size - 1)
+
+
+def _iter_file_range(pdf_path: Path, start: int, end: int) -> Iterator[bytes]:
+    remaining = end - start + 1
+    with pdf_path.open("rb") as file:
+        file.seek(start)
+        while remaining > 0:
+            chunk = file.read(min(PDF_RANGE_CHUNK_SIZE, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
