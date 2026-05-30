@@ -11,6 +11,35 @@ function parseArxivId() {
   return match ? decodeURIComponent(match[1]).replace(/\.pdf$/i, "") : "";
 }
 
+function parseSubmittedDate() {
+  const dateline = cleanText(document.querySelector(".dateline")?.textContent);
+  const match = dateline.match(/(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})/);
+  if (!match) {
+    return "";
+  }
+
+  const monthByName = {
+    Jan: "01",
+    Feb: "02",
+    Mar: "03",
+    Apr: "04",
+    May: "05",
+    Jun: "06",
+    Jul: "07",
+    Aug: "08",
+    Sep: "09",
+    Oct: "10",
+    Nov: "11",
+    Dec: "12"
+  };
+  const month = monthByName[match[2]];
+  if (!month) {
+    return "";
+  }
+
+  return `${match[3]}-${month}-${match[1].padStart(2, "0")}`;
+}
+
 function collectMetadata() {
   const arxivId = parseArxivId();
   if (!arxivId) {
@@ -29,7 +58,8 @@ function collectMetadata() {
     authors,
     abstract,
     url: `https://arxiv.org/abs/${arxivId}`,
-    pdf_url: `https://arxiv.org/pdf/${arxivId}`
+    pdf_url: `https://arxiv.org/pdf/${arxivId}`,
+    submitted_date: parseSubmittedDate()
   };
 }
 

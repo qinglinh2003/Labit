@@ -49,12 +49,14 @@ def test_import_arxiv_pdf_writes_project_scoped_paper_directory(tmp_path: Path) 
             abstract="A compact abstract.",
             url="https://arxiv.org/abs/2401.12345",
             pdf_url="https://arxiv.org/pdf/2401.12345",
+            submitted_date="2024-01-02",
         ),
         pdf_content=b"%PDF-1.7\n",
     )
 
     paper_dir = tmp_path / "vault" / "projects" / "Labit" / "papers" / "arxiv-2401.12345"
     assert record.id == "arxiv:2401.12345"
+    assert record.submitted_date == "2024-01-02"
     assert record.local_pdf_path == "vault/projects/Labit/papers/arxiv-2401.12345/paper.pdf"
     assert record.artifact_dir_path == "vault/projects/Labit/papers/arxiv-2401.12345/artifacts"
     assert (paper_dir / "paper.yaml").exists()

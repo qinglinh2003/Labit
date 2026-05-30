@@ -7,11 +7,12 @@ from typing import Iterator
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ValidationError
 
 from labit.papers.models import ArxivPaperMetadata, PaperRecord
+from labit.papers.render import load_manifest, render_page
 from labit.papers.service import PaperService
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
@@ -23,6 +24,7 @@ DEFAULT_CORS_ORIGINS = [
     "http://localhost:4173",
     "http://localhost:5173",
     "http://localhost:8787",
+    "http://10.66.0.1:8787",
 ]
 CHROME_EXTENSION_ORIGIN_RE = r"^chrome-extension://[a-z]{32}$"
 PDF_CACHE_CONTROL = "public, max-age=86400, immutable"
@@ -129,6 +131,64 @@ def create_app(paths: RepoPaths | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    RENDER_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
+    @app.get("/api/projects/{project}/papers/{paper_id}/reader-manifest")
+    def get_reader_manifest(project: str, paper_id: str):
+        try:
+            paper_service.ensure_renders(project=project, paper_id=paper_id)
+            renders = paper_service.renders_dir(project=project, paper_id=paper_id)
+            manifest = load_manifest(renders)
+            if manifest is None:
+                raise HTTPException(status_code=404, detail="No render cache available")
+            return JSONResponse(
+                content=manifest,
+                headers={"Cache-Control": "public, max-age=3600"},
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/projects/{project}/papers/{paper_id}/renders/{name}")
+    def get_render(project: str, paper_id: str, name: str):
+        try:
+            renders = paper_service.renders_dir(project=project, paper_id=paper_id)
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        # Sanitize name — only allow simple filenames
+        if "/" in name or "\\" in name or name.startswith("."):
+            raise HTTPException(status_code=400, detail="Invalid render name")
+        path = renders / name
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="Render not found")
+        return FileResponse(
+            path,
+            media_type="image/webp",
+            headers={"Cache-Control": RENDER_CACHE_CONTROL},
+        )
+
+    @app.get("/api/projects/{project}/papers/{paper_id}/pages/{page}/image")
+    def get_page_image(project: str, paper_id: str, page: int, w: int = 1600):
+        """On-demand page rendering. Returns a cached or freshly rendered page image."""
+        if page < 1:
+            raise HTTPException(status_code=400, detail="Page must be >= 1")
+        try:
+            pdf = paper_service.pdf_path(project=project, paper_id=paper_id)
+            renders = paper_service.renders_dir(project=project, paper_id=paper_id)
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        name = f"p{page}-fit-w{w}.webp"
+        path = renders / name
+        if not path.exists():
+            try:
+                render_page(pdf, renders, page - 1, w)
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return FileResponse(
+            path,
+            media_type="image/webp",
+            headers={"Cache-Control": RENDER_CACHE_CONTROL},
+        )
 
     @app.get("/api/projects/{project}/papers/{paper_id}/artifacts", response_model=list[ArtifactRecord])
     def list_artifacts(project: str, paper_id: str) -> list[ArtifactRecord]:

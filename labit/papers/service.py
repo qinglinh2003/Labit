@@ -16,6 +16,7 @@ from time import sleep
 import yaml
 
 from labit.papers.models import ArxivPaperMetadata, PaperRecord
+from labit.papers.render import generate_page1_cache, is_manifest_current, load_manifest
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
 
@@ -26,7 +27,7 @@ ARXIV_HTML_URL = "https://arxiv.org/html/{arxiv_id}"
 AR5IV_HTML_URL = "https://ar5iv.labs.arxiv.org/html/{arxiv_id}"
 ARXIV_PDF_URL = "https://arxiv.org/pdf/{arxiv_id}"
 S2_API_URL = "https://api.semanticscholar.org/graph/v1/paper/ARXIV:{arxiv_id}"
-S2_FIELDS = "title,authors,abstract,externalIds,url"
+S2_FIELDS = "title,authors,abstract,externalIds,url,publicationDate"
 ARXIV_ID_RE = re.compile(r"(?P<id>\d{4}\.\d{4,5}(?:v\d+)?)")
 
 
@@ -83,6 +84,7 @@ class PaperService:
             local_html_path=str(html_path.relative_to(self.paths.root)) if html else "",
             local_metadata_path=str(metadata_path.relative_to(self.paths.root)),
             artifact_dir_path=str(artifacts_dir.relative_to(self.paths.root)),
+            submitted_date=metadata.get("submitted_date", ""),
             added_at=now,
         )
 
@@ -124,6 +126,13 @@ class PaperService:
         if not notes_path.exists():
             self._atomic_write(notes_path, f"# {metadata.title or arxiv_id}\n")
 
+        # Generate server-side page-1 render cache (WebP images + manifest)
+        renders_dir = paper_dir / "renders"
+        try:
+            generate_page1_cache(pdf_path, renders_dir)
+        except Exception:
+            pass  # render failure should not block import
+
         now = datetime.now(UTC).replace(microsecond=0).isoformat()
         source_url = metadata.url or ARXIV_ABS_URL.format(arxiv_id=arxiv_id)
         pdf_url = metadata.pdf_url or ARXIV_PDF_URL.format(arxiv_id=arxiv_id)
@@ -140,6 +149,7 @@ class PaperService:
             local_pdf_path=str(pdf_path.relative_to(self.paths.root)),
             local_metadata_path=str(metadata_path.relative_to(self.paths.root)),
             artifact_dir_path=str(artifacts_dir.relative_to(self.paths.root)),
+            submitted_date=metadata.submitted_date,
             added_at=previous_added_at or now,
         )
         yaml_text = yaml.safe_dump(record.model_dump(mode="json"), sort_keys=False, allow_unicode=True)
@@ -205,6 +215,19 @@ class PaperService:
             raise FileNotFoundError(f"PDF for paper '{paper_id}' is not saved in project '{resolved}'.")
         return path
 
+    def renders_dir(self, *, project: str, paper_id: str) -> Path:
+        resolved = self._require_project(project)
+        arxiv_id = self._paper_id_to_arxiv_id(paper_id)
+        return self._paper_record_dir(resolved, arxiv_id) / "renders"
+
+    def ensure_renders(self, *, project: str, paper_id: str) -> None:
+        """Generate render cache if it doesn't exist yet."""
+        renders = self.renders_dir(project=project, paper_id=paper_id)
+        if is_manifest_current(load_manifest(renders)):
+            return
+        pdf = self.pdf_path(project=project, paper_id=paper_id)
+        generate_page1_cache(pdf, renders)
+
     def list_artifacts(self, *, project: str, paper_id: str) -> list[dict[str, object]]:
         resolved = self._require_project(project)
         arxiv_id = self._paper_id_to_arxiv_id(paper_id)
@@ -263,7 +286,8 @@ class PaperService:
         abstract = data.get("abstract") or ""
         authors = [a.get("name", "") for a in (data.get("authors") or [])]
         authors = [a for a in authors if a]
-        return {"title": title, "authors": authors, "abstract": abstract}
+        pub_date = (data.get("publicationDate") or "")[:10]  # "YYYY-MM-DD"
+        return {"title": title, "authors": authors, "abstract": abstract, "submitted_date": pub_date}
 
     def _fetch_arxiv_metadata(self, arxiv_id: str) -> dict:
         query = urllib.parse.urlencode({"id_list": arxiv_id})
@@ -284,10 +308,13 @@ class PaperService:
         authors = [author for author in authors if author]
         if not title:
             title = arxiv_id
+        # <published> is the v1 submission date
+        published = self._xml_text(entry.find("atom:published", ns))[:10]  # "YYYY-MM-DD"
         return {
             "title": title,
             "authors": authors,
             "abstract": abstract,
+            "submitted_date": published,
         }
 
     def _fetch_abs_metadata(self, arxiv_id: str) -> dict:
@@ -304,10 +331,21 @@ class PaperService:
         abstract = re.sub(r"^Abstract:\s*", "", abstract).strip()
         authors_text = re.sub(r"^Authors?:\s*", "", authors_text).strip()
         authors = [item.strip() for item in re.split(r"\s*,\s*", authors_text) if item.strip()]
+        # Try to extract submission date from the abs page dateline
+        dateline = self._extract_html_text(body, r'<div class="dateline">(.*?)</div>')
+        submitted_match = re.search(r"\b(\d{1,2}\s+\w+\s+\d{4})\b", dateline)
+        submitted_date = ""
+        if submitted_match:
+            try:
+                from datetime import datetime as _dt
+                submitted_date = _dt.strptime(submitted_match.group(1), "%d %b %Y").strftime("%Y-%m-%d")
+            except ValueError:
+                pass
         return {
             "title": title,
             "authors": authors,
             "abstract": abstract,
+            "submitted_date": submitted_date,
         }
 
     def _fetch_html(self, arxiv_id: str) -> tuple[str, str]:

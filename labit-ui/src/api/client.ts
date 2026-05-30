@@ -18,6 +18,7 @@ export interface PaperRecord {
   local_pdf_path: string;
   local_metadata_path: string;
   artifact_dir_path: string;
+  submitted_date: string;
   added_at: string;
 }
 
@@ -27,6 +28,32 @@ export interface ArtifactRecord {
   relative_path: string;
   size_bytes: number;
 }
+
+// ---------------------------------------------------------------------------
+// Reader manifest types (server-side rendered PDF pages)
+// ---------------------------------------------------------------------------
+
+export interface ReaderPageInfo {
+  page: number;
+  width_pt: number;
+  height_pt: number;
+  css_width: number;
+  css_height: number;
+  first_tile_css_height: number;
+  thumb: string;
+  preview: string;
+  retina: string;
+  first_viewport_tile: string;
+}
+
+export interface ReaderManifest {
+  page_count: number;
+  pages: ReaderPageInfo[];
+}
+
+// ---------------------------------------------------------------------------
+// API helpers
+// ---------------------------------------------------------------------------
 
 async function getJson<T>(path: string): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`);
@@ -57,75 +84,66 @@ export function paperPdfUrl(project: string, paperId: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// PDF blob cache – fetch full PDF once, serve from memory thereafter.
-// Hover triggers prefetch; by click-time the blob is usually ready.
-// We cache as Blob (not ArrayBuffer) because PDF.js transfers the
-// ArrayBuffer to its worker, detaching the original.  Each render gets
-// a fresh ArrayBuffer via blob.arrayBuffer().
+// Reader manifest + render URLs
 // ---------------------------------------------------------------------------
 
-const pdfBlobCache = new Map<string, Blob>();
-const pdfBlobInflight = new Map<string, Promise<Blob>>();
+export function fetchReaderManifest(project: string, paperId: string): Promise<ReaderManifest> {
+  const key = manifestCacheKey(project, paperId);
+  const cached = _manifestCache.get(key);
+  if (cached) return Promise.resolve(cached);
+  const inflight = _manifestInflight.get(key);
+  if (inflight) {
+    return inflight.then((manifest) => {
+      if (!manifest) throw new Error("Failed to load reader manifest");
+      return manifest;
+    });
+  }
 
-function pdfCacheKey(project: string, paperId: string): string {
+  return getJson<ReaderManifest>(
+    `/api/projects/${encodeURIComponent(project)}/papers/${encodeURIComponent(paperId)}/reader-manifest`
+  ).then((manifest) => {
+    _manifestCache.set(key, manifest);
+    return manifest;
+  });
+}
+
+export function renderUrl(project: string, paperId: string, name: string): string {
+  return `${API_BASE}/api/projects/${encodeURIComponent(project)}/papers/${encodeURIComponent(
+    paperId
+  )}/renders/${encodeURIComponent(name)}`;
+}
+
+export function pageImageUrl(project: string, paperId: string, page: number, w: number = 1600): string {
+  return `${API_BASE}/api/projects/${encodeURIComponent(project)}/papers/${encodeURIComponent(
+    paperId
+  )}/pages/${page}/image?w=${w}`;
+}
+
+/** Prefetch manifest + first viewport tile on hover (best-effort). */
+export function prefetchReaderManifest(project: string, paperId: string): void {
+  const key = manifestCacheKey(project, paperId);
+  if (_manifestCache.has(key) || _manifestInflight.has(key)) return;
+  const promise = fetchReaderManifest(project, paperId)
+    .then((manifest) => {
+      _manifestCache.set(key, manifest);
+      // Also prefetch the first viewport tile image
+      if (manifest.pages.length > 0) {
+        const tile = manifest.pages[0].first_viewport_tile;
+        const img = new window.Image();
+        img.src = renderUrl(project, paperId, tile);
+      }
+      return manifest;
+    })
+    .catch(() => null)
+    .finally(() => {
+      _manifestInflight.delete(key);
+    });
+  _manifestInflight.set(key, promise);
+}
+
+function manifestCacheKey(project: string, paperId: string): string {
   return `${project}\0${paperId}`;
 }
 
-/** Start fetching the full PDF in the background (idempotent). */
-export function prefetchPaperPdf(project: string, paperId: string): void {
-  const key = pdfCacheKey(project, paperId);
-  if (pdfBlobCache.has(key) || pdfBlobInflight.has(key)) return;
-  const promise = fetch(paperPdfUrl(project, paperId))
-    .then((r) => {
-      if (!r.ok) throw new Error(`PDF fetch failed: ${r.status}`);
-      return r.blob();
-    })
-    .then((blob) => {
-      pdfBlobCache.set(key, blob);
-      pdfBlobInflight.delete(key);
-      return blob;
-    })
-    .catch((err) => {
-      pdfBlobInflight.delete(key);
-      // Swallow – prefetch is best-effort; fetchPaperPdf will retry.
-      console.warn("PDF prefetch failed:", err);
-      return new Blob(); // satisfy type; won't be cached (size 0)
-    });
-  pdfBlobInflight.set(key, promise);
-}
-
-/** Check whether the PDF blob is already cached. */
-export function hasCachedPdf(project: string, paperId: string): boolean {
-  const blob = pdfBlobCache.get(pdfCacheKey(project, paperId));
-  return blob != null && blob.size > 0;
-}
-
-/** Return a fresh ArrayBuffer copy from the cached blob (safe to transfer). */
-export async function getCachedPdfData(project: string, paperId: string): Promise<ArrayBuffer | null> {
-  const blob = pdfBlobCache.get(pdfCacheKey(project, paperId));
-  if (!blob || blob.size === 0) return null;
-  return blob.arrayBuffer(); // always a new copy
-}
-
-/** Return PDF as ArrayBuffer – from cache if available, otherwise fetch. */
-export async function fetchPaperPdf(project: string, paperId: string): Promise<ArrayBuffer> {
-  const key = pdfCacheKey(project, paperId);
-  const cached = pdfBlobCache.get(key);
-  if (cached && cached.size > 0) return cached.arrayBuffer();
-
-  let inflight = pdfBlobInflight.get(key);
-  if (!inflight) {
-    prefetchPaperPdf(project, paperId);
-    inflight = pdfBlobInflight.get(key);
-  }
-  if (inflight) {
-    const blob = await inflight;
-    if (blob.size > 0) return blob.arrayBuffer();
-  }
-  // Retry once if prefetch silently failed
-  const r = await fetch(paperPdfUrl(project, paperId));
-  if (!r.ok) throw new Error(`PDF fetch failed: ${r.status}`);
-  const blob = await r.blob();
-  pdfBlobCache.set(key, blob);
-  return blob.arrayBuffer();
-}
+const _manifestCache = new Map<string, ReaderManifest>();
+const _manifestInflight = new Map<string, Promise<ReaderManifest | null>>();

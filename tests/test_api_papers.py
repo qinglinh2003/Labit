@@ -49,6 +49,7 @@ def test_api_imports_lists_and_serves_project_paper(tmp_path: Path) -> None:
         "abstract": "A compact abstract.",
         "url": "https://arxiv.org/abs/2401.12345",
         "pdf_url": "https://arxiv.org/pdf/2401.12345",
+        "submitted_date": "2024-01-02",
     }
 
     import_response = client.post(
@@ -58,6 +59,7 @@ def test_api_imports_lists_and_serves_project_paper(tmp_path: Path) -> None:
     )
     assert import_response.status_code == 200
     assert import_response.json()["id"] == "arxiv:2401.12345"
+    assert import_response.json()["submitted_date"] == "2024-01-02"
 
     list_response = client.get("/api/projects/Labit/papers")
     assert list_response.status_code == 200
@@ -136,6 +138,61 @@ def test_api_serves_pdf_suffix_byte_ranges(tmp_path: Path) -> None:
     assert response.content == b"6789"
     assert response.headers["content-length"] == "4"
     assert response.headers["content-range"] == "bytes 6-9/10"
+
+
+def _make_test_pdf() -> bytes:
+    """Create a minimal 2-page PDF via PyMuPDF for render tests."""
+    import fitz
+    doc = fitz.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text((72, 72), "Test PDF page 1", fontsize=24)
+    page2 = doc.new_page(width=612, height=792)
+    page2.insert_text((72, 72), "Test PDF page 2", fontsize=24)
+    data = doc.tobytes()
+    doc.close()
+    return data
+
+
+def test_api_reader_manifest_and_renders(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    client = TestClient(create_app(paths))
+    metadata = {
+        "arxiv_id": "2401.12345",
+        "title": "A Useful Paper",
+        "authors": ["Ada Lovelace"],
+        "abstract": "A compact abstract.",
+        "url": "https://arxiv.org/abs/2401.12345",
+        "pdf_url": "https://arxiv.org/pdf/2401.12345",
+    }
+    client.post(
+        "/api/projects/Labit/papers/import/arxiv",
+        data={"metadata": json.dumps(metadata)},
+        files={"pdf": ("paper.pdf", _make_test_pdf(), "application/pdf")},
+    )
+
+    # Reader manifest should be available
+    manifest_response = client.get("/api/projects/Labit/papers/arxiv-2401.12345/reader-manifest")
+    assert manifest_response.status_code == 200
+    manifest = manifest_response.json()
+    assert manifest["page_count"] == 2
+    assert len(manifest["pages"]) == 1  # only page 1 pre-rendered
+    p1 = manifest["pages"][0]
+    assert p1["page"] == 1
+    assert "first_viewport_tile" in p1
+    assert "retina" in p1
+
+    # Render files should be servable
+    render_response = client.get(
+        f"/api/projects/Labit/papers/arxiv-2401.12345/renders/{p1['retina']}"
+    )
+    assert render_response.status_code == 200
+    assert render_response.headers["cache-control"] == "public, max-age=31536000, immutable"
+
+    # On-demand page render
+    page2_response = client.get(
+        "/api/projects/Labit/papers/arxiv-2401.12345/pages/2/image?w=1600"
+    )
+    assert page2_response.status_code == 200
 
 
 def test_api_returns_project_list(tmp_path: Path) -> None:

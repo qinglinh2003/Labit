@@ -21,6 +21,7 @@ class PaperRecord(BaseModel):
     local_html_path: str = ""
     local_metadata_path: str = ""
     artifact_dir_path: str = ""
+    submitted_date: str = ""
     added_at: str
 
 
@@ -33,3 +34,4 @@ class ArxivPaperMetadata(BaseModel):
     abstract: str = ""
     url: str = ""
     pdf_url: str = ""
+    submitted_date: str = ""
