@@ -18,6 +18,10 @@ export interface PaperRecord {
   local_pdf_path: string;
   local_metadata_path: string;
   artifact_dir_path: string;
+  tags: string[];
+  starred: boolean;
+  status: "unread" | "reading" | "read";
+  status_updated_at: string;
   submitted_date: string;
   added_at: string;
 }
@@ -69,6 +73,64 @@ export function listProjects(): Promise<ProjectListResponse> {
 
 export function listPapers(project: string): Promise<PaperRecord[]> {
   return getJson<PaperRecord[]>(`/api/projects/${encodeURIComponent(project)}/papers`);
+}
+
+export async function togglePaperStar(project: string, paperId: string): Promise<PaperRecord> {
+  const response = await fetch(
+    `${API_BASE}/api/projects/${encodeURIComponent(project)}/papers/${encodeURIComponent(paperId)}/star`,
+    { method: "PUT" }
+  );
+  if (!response.ok) throw new Error(await response.text());
+  return response.json() as Promise<PaperRecord>;
+}
+
+export async function updatePaperStatus(project: string, paperId: string, status: string): Promise<PaperRecord> {
+  const response = await fetch(
+    `${API_BASE}/api/projects/${encodeURIComponent(project)}/papers/${encodeURIComponent(paperId)}/status`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status }),
+    }
+  );
+  if (!response.ok) throw new Error(await response.text());
+  return response.json() as Promise<PaperRecord>;
+}
+
+export async function updatePaperTags(project: string, paperId: string, tags: string[]): Promise<PaperRecord> {
+  const response = await fetch(
+    `${API_BASE}/api/projects/${encodeURIComponent(project)}/papers/${encodeURIComponent(paperId)}/tags`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tags }),
+    }
+  );
+  if (!response.ok) throw new Error(await response.text());
+  return response.json() as Promise<PaperRecord>;
+}
+
+export interface NoteResponse {
+  content: string;
+}
+
+export async function getNote(project: string, paperId: string): Promise<NoteResponse> {
+  return getJson<NoteResponse>(
+    `/api/projects/${encodeURIComponent(project)}/papers/${encodeURIComponent(paperId)}/note`
+  );
+}
+
+export async function saveNote(project: string, paperId: string, content: string): Promise<NoteResponse> {
+  const response = await fetch(
+    `${API_BASE}/api/projects/${encodeURIComponent(project)}/papers/${encodeURIComponent(paperId)}/note`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
+    }
+  );
+  if (!response.ok) throw new Error(await response.text());
+  return response.json() as Promise<NoteResponse>;
 }
 
 export function listArtifacts(project: string, paperId: string): Promise<ArtifactRecord[]> {
