@@ -21,6 +21,10 @@ class PaperRecord(BaseModel):
     local_html_path: str = ""
     local_metadata_path: str = ""
     artifact_dir_path: str = ""
+    tags: list[str] = Field(default_factory=list)
+    starred: bool = False
+    status: str = "unread"
+    status_updated_at: str = ""
     submitted_date: str = ""
     added_at: str
 

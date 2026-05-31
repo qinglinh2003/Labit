@@ -113,12 +113,25 @@ class PaperService:
         notes_path = artifacts_dir / "notes.md"
 
         previous_added_at = ""
+        previous_tags: list[str] = []
+        previous_starred = False
+        previous_status = "unread"
+        previous_status_updated_at = ""
         if metadata_path.exists():
             try:
                 raw = yaml.safe_load(metadata_path.read_text(encoding="utf-8")) or {}
                 previous_added_at = str(raw.get("added_at") or "")
+                previous_tags = self._normalize_tags(raw.get("tags") or [])
+                previous_starred = bool(raw.get("starred", False))
+                raw_status = str(raw.get("status") or "unread")
+                previous_status = raw_status if raw_status in self._VALID_STATUSES else "unread"
+                previous_status_updated_at = str(raw.get("status_updated_at") or "")
             except Exception:
                 previous_added_at = ""
+                previous_tags = []
+                previous_starred = False
+                previous_status = "unread"
+                previous_status_updated_at = ""
 
         paper_dir.mkdir(parents=True, exist_ok=True)
         artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -149,6 +162,10 @@ class PaperService:
             local_pdf_path=str(pdf_path.relative_to(self.paths.root)),
             local_metadata_path=str(metadata_path.relative_to(self.paths.root)),
             artifact_dir_path=str(artifacts_dir.relative_to(self.paths.root)),
+            tags=previous_tags,
+            starred=previous_starred,
+            status=previous_status,
+            status_updated_at=previous_status_updated_at,
             submitted_date=metadata.submitted_date,
             added_at=previous_added_at or now,
         )
@@ -228,6 +245,61 @@ class PaperService:
         pdf = self.pdf_path(project=project, paper_id=paper_id)
         generate_page1_cache(pdf, renders)
 
+    def toggle_star(self, *, project: str, paper_id: str) -> PaperRecord:
+        resolved = self._require_project(project)
+        arxiv_id = self._paper_id_to_arxiv_id(paper_id)
+        metadata_path = self._metadata_path(resolved, arxiv_id)
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Paper '{paper_id}' is not saved in project '{resolved}'.")
+        raw = yaml.safe_load(metadata_path.read_text(encoding="utf-8")) or {}
+        raw["starred"] = not raw.get("starred", False)
+        yaml_text = yaml.safe_dump(raw, sort_keys=False, allow_unicode=True)
+        self._atomic_write(metadata_path, yaml_text)
+        return PaperRecord.model_validate(raw)
+
+    _VALID_STATUSES = {"unread", "reading", "read"}
+
+    def update_paper_status(self, *, project: str, paper_id: str, status: str) -> PaperRecord:
+        if status not in self._VALID_STATUSES:
+            raise ValueError(f"Invalid status '{status}'. Must be one of: {', '.join(sorted(self._VALID_STATUSES))}")
+        resolved = self._require_project(project)
+        arxiv_id = self._paper_id_to_arxiv_id(paper_id)
+        metadata_path = self._metadata_path(resolved, arxiv_id)
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Paper '{paper_id}' is not saved in project '{resolved}'.")
+        raw = yaml.safe_load(metadata_path.read_text(encoding="utf-8")) or {}
+        raw["status"] = status
+        raw["status_updated_at"] = datetime.now(UTC).replace(microsecond=0).isoformat()
+        yaml_text = yaml.safe_dump(raw, sort_keys=False, allow_unicode=True)
+        self._atomic_write(metadata_path, yaml_text)
+        return PaperRecord.model_validate(raw)
+
+    def update_paper_tags(self, *, project: str, paper_id: str, tags: list[str]) -> PaperRecord:
+        resolved = self._require_project(project)
+        arxiv_id = self._paper_id_to_arxiv_id(paper_id)
+        metadata_path = self._metadata_path(resolved, arxiv_id)
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Paper '{paper_id}' is not saved in project '{resolved}'.")
+        raw = yaml.safe_load(metadata_path.read_text(encoding="utf-8")) or {}
+        raw["tags"] = self._normalize_tags(tags)
+        yaml_text = yaml.safe_dump(raw, sort_keys=False, allow_unicode=True)
+        self._atomic_write(metadata_path, yaml_text)
+        return PaperRecord.model_validate(raw)
+
+    @staticmethod
+    def _normalize_tags(tags: object) -> list[str]:
+        if not isinstance(tags, list):
+            return []
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for tag in tags:
+            value = str(tag).strip().lower()
+            if not value or value in seen:
+                continue
+            normalized.append(value)
+            seen.add(value)
+        return normalized
+
     def list_artifacts(self, *, project: str, paper_id: str) -> list[dict[str, object]]:
         resolved = self._require_project(project)
         arxiv_id = self._paper_id_to_arxiv_id(paper_id)
@@ -246,6 +318,23 @@ class PaperService:
                 }
             )
         return artifacts
+
+    def get_note(self, *, project: str, paper_id: str) -> str:
+        resolved = self._require_project(project)
+        arxiv_id = self._paper_id_to_arxiv_id(paper_id)
+        notes_path = self._paper_record_dir(resolved, arxiv_id) / "artifacts" / "notes.md"
+        if not notes_path.exists():
+            return ""
+        return notes_path.read_text(encoding="utf-8")
+
+    def save_note(self, *, project: str, paper_id: str, content: str) -> str:
+        resolved = self._require_project(project)
+        arxiv_id = self._paper_id_to_arxiv_id(paper_id)
+        notes_path = self._paper_record_dir(resolved, arxiv_id) / "artifacts" / "notes.md"
+        if not notes_path.parent.exists():
+            notes_path.parent.mkdir(parents=True, exist_ok=True)
+        self._atomic_write(notes_path, content)
+        return content
 
     def parse_arxiv_id(self, reference: str) -> str:
         value = reference.strip()

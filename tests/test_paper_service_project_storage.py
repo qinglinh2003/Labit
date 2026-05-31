@@ -84,6 +84,76 @@ def test_project_paper_import_is_idempotent_and_lists_latest(tmp_path: Path) -> 
     assert service.list_artifacts(project="Labit", paper_id="2401.12345")[0]["relative_path"] == "notes.md"
 
 
+def test_project_paper_reimport_preserves_tags(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    service = PaperService(paths)
+    metadata = ArxivPaperMetadata(arxiv_id="2401.12345", title="Original")
+    service.import_arxiv_pdf(project="Labit", metadata=metadata, pdf_content=b"first")
+    tagged = service.update_paper_tags(
+        project="Labit",
+        paper_id="arxiv-2401.12345",
+        tags=[" llm ", "systems", "LLM", ""],
+    )
+
+    updated = service.import_arxiv_pdf(
+        project="Labit",
+        metadata=metadata.model_copy(update={"title": "Updated"}),
+        pdf_content=b"second",
+    )
+
+    assert tagged.tags == ["llm", "systems"]
+    assert updated.title == "Updated"
+    assert updated.tags == ["llm", "systems"]
+
+
+def test_project_paper_reimport_preserves_starred_flag(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    service = PaperService(paths)
+    metadata = ArxivPaperMetadata(arxiv_id="2401.12345", title="Original")
+    service.import_arxiv_pdf(project="Labit", metadata=metadata, pdf_content=b"first")
+    starred = service.toggle_star(project="Labit", paper_id="arxiv-2401.12345")
+
+    updated = service.import_arxiv_pdf(
+        project="Labit",
+        metadata=metadata.model_copy(update={"title": "Updated"}),
+        pdf_content=b"second",
+    )
+
+    assert starred.starred is True
+    assert updated.title == "Updated"
+    assert updated.starred is True
+
+
+def test_project_paper_toggle_star_round_trips(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    service = PaperService(paths)
+    metadata = ArxivPaperMetadata(arxiv_id="2401.12345", title="Original")
+    service.import_arxiv_pdf(project="Labit", metadata=metadata, pdf_content=b"first")
+
+    starred = service.toggle_star(project="Labit", paper_id="arxiv-2401.12345")
+    unstarred = service.toggle_star(project="Labit", paper_id="2401.12345")
+
+    metadata_path = (
+        tmp_path / "vault" / "projects" / "Labit" / "papers" / "arxiv-2401.12345" / "paper.yaml"
+    )
+    assert starred.starred is True
+    assert unstarred.starred is False
+    assert yaml.safe_load(metadata_path.read_text(encoding="utf-8"))["starred"] is False
+
+
+def test_project_paper_note_round_trips(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    service = PaperService(paths)
+    metadata = ArxivPaperMetadata(arxiv_id="2401.12345", title="Original")
+    service.import_arxiv_pdf(project="Labit", metadata=metadata, pdf_content=b"first")
+
+    content = "# Reading note\n\n- important result"
+    saved = service.save_note(project="Labit", paper_id="arxiv-2401.12345", content=content)
+
+    assert saved == content
+    assert service.get_note(project="Labit", paper_id="2401.12345") == content
+
+
 def test_project_paper_records_ignore_future_metadata_fields(tmp_path: Path) -> None:
     paths = _create_project(tmp_path)
     service = PaperService(paths)

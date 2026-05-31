@@ -80,6 +80,94 @@ def test_api_imports_lists_and_serves_project_paper(tmp_path: Path) -> None:
     assert artifacts_response.json()[0]["relative_path"] == "notes.md"
 
 
+def test_api_updates_project_paper_tags(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    client = TestClient(create_app(paths))
+    metadata = {
+        "arxiv_id": "2401.12345",
+        "title": "A Useful Paper",
+        "authors": ["Ada Lovelace"],
+        "abstract": "A compact abstract.",
+        "url": "https://arxiv.org/abs/2401.12345",
+        "pdf_url": "https://arxiv.org/pdf/2401.12345",
+    }
+    client.post(
+        "/api/projects/Labit/papers/import/arxiv",
+        data={"metadata": json.dumps(metadata)},
+        files={"pdf": ("paper.pdf", b"%PDF-1.7\n", "application/pdf")},
+    )
+
+    response = client.patch(
+        "/api/projects/Labit/papers/arxiv-2401.12345/tags",
+        json={"tags": [" LLM ", "biology", "llm", "", "  "]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["tags"] == ["llm", "biology"]
+    metadata_path = tmp_path / "vault" / "projects" / "Labit" / "papers" / "arxiv-2401.12345" / "paper.yaml"
+    assert yaml.safe_load(metadata_path.read_text(encoding="utf-8"))["tags"] == ["llm", "biology"]
+
+
+def test_api_toggles_project_paper_star(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    client = TestClient(create_app(paths))
+    metadata = {
+        "arxiv_id": "2401.12345",
+        "title": "A Useful Paper",
+        "authors": ["Ada Lovelace"],
+        "abstract": "A compact abstract.",
+        "url": "https://arxiv.org/abs/2401.12345",
+        "pdf_url": "https://arxiv.org/pdf/2401.12345",
+    }
+    client.post(
+        "/api/projects/Labit/papers/import/arxiv",
+        data={"metadata": json.dumps(metadata)},
+        files={"pdf": ("paper.pdf", b"%PDF-1.7\n", "application/pdf")},
+    )
+
+    starred_response = client.put("/api/projects/Labit/papers/arxiv-2401.12345/star")
+    unstarred_response = client.put("/api/projects/Labit/papers/2401.12345/star")
+
+    assert starred_response.status_code == 200
+    assert starred_response.json()["starred"] is True
+    assert unstarred_response.status_code == 200
+    assert unstarred_response.json()["starred"] is False
+    metadata_path = tmp_path / "vault" / "projects" / "Labit" / "papers" / "arxiv-2401.12345" / "paper.yaml"
+    assert yaml.safe_load(metadata_path.read_text(encoding="utf-8"))["starred"] is False
+
+
+def test_api_updates_project_paper_note(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    client = TestClient(create_app(paths))
+    metadata = {
+        "arxiv_id": "2401.12345",
+        "title": "A Useful Paper",
+        "authors": ["Ada Lovelace"],
+        "abstract": "A compact abstract.",
+        "url": "https://arxiv.org/abs/2401.12345",
+        "pdf_url": "https://arxiv.org/pdf/2401.12345",
+    }
+    client.post(
+        "/api/projects/Labit/papers/import/arxiv",
+        data={"metadata": json.dumps(metadata)},
+        files={"pdf": ("paper.pdf", b"%PDF-1.7\n", "application/pdf")},
+    )
+
+    content = "# Reading note\n\nInline $x^2$ and a list."
+    save_response = client.put(
+        "/api/projects/Labit/papers/arxiv-2401.12345/note",
+        json={"content": content},
+    )
+    get_response = client.get("/api/projects/Labit/papers/2401.12345/note")
+
+    assert save_response.status_code == 200
+    assert save_response.json() == {"content": content}
+    assert get_response.status_code == 200
+    assert get_response.json() == {"content": content}
+    notes_path = tmp_path / "vault" / "projects" / "Labit" / "papers" / "arxiv-2401.12345" / "artifacts" / "notes.md"
+    assert notes_path.read_text(encoding="utf-8") == content
+
+
 def test_api_serves_pdf_byte_ranges(tmp_path: Path) -> None:
     paths = _create_project(tmp_path)
     client = TestClient(create_app(paths))
