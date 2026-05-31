@@ -136,6 +136,37 @@ def test_api_toggles_project_paper_star(tmp_path: Path) -> None:
     assert yaml.safe_load(metadata_path.read_text(encoding="utf-8"))["starred"] is False
 
 
+def test_api_backfills_project_paper_submitted_dates(tmp_path: Path, monkeypatch) -> None:
+    paths = _create_project(tmp_path)
+
+    def fake_fetch(self, arxiv_id: str) -> dict[str, object]:
+        assert arxiv_id == "2401.12345"
+        return {"submitted_date": "2024-01-02"}
+
+    monkeypatch.setattr("labit.papers.service.PaperService._fetch_arxiv_metadata", fake_fetch)
+    client = TestClient(create_app(paths))
+    metadata = {
+        "arxiv_id": "2401.12345",
+        "title": "A Useful Paper",
+        "authors": ["Ada Lovelace"],
+        "abstract": "A compact abstract.",
+        "url": "https://arxiv.org/abs/2401.12345",
+        "pdf_url": "https://arxiv.org/pdf/2401.12345",
+    }
+    client.post(
+        "/api/projects/Labit/papers/import/arxiv",
+        data={"metadata": json.dumps(metadata)},
+        files={"pdf": ("paper.pdf", b"%PDF-1.7\n", "application/pdf")},
+    )
+
+    response = client.post("/api/projects/Labit/papers/backfill-dates")
+
+    assert response.status_code == 200
+    assert response.json() == {"updated": 1}
+    metadata_path = tmp_path / "vault" / "projects" / "Labit" / "papers" / "arxiv-2401.12345" / "paper.yaml"
+    assert yaml.safe_load(metadata_path.read_text(encoding="utf-8"))["submitted_date"] == "2024-01-02"
+
+
 def test_api_updates_project_paper_note(tmp_path: Path) -> None:
     paths = _create_project(tmp_path)
     client = TestClient(create_app(paths))

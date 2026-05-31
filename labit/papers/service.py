@@ -286,6 +286,29 @@ class PaperService:
         self._atomic_write(metadata_path, yaml_text)
         return PaperRecord.model_validate(raw)
 
+    def backfill_submitted_dates(self, project: str) -> int:
+        """Fetch submitted_date from arXiv API for papers that are missing it. Returns count of updated papers."""
+        papers = self.list_papers(project)
+        updated = 0
+        for paper in papers:
+            if paper.submitted_date:
+                continue
+            try:
+                metadata = self._fetch_arxiv_metadata(paper.arxiv_id)
+                submitted = metadata.get("submitted_date", "")
+                if not submitted:
+                    continue
+                resolved = self._require_project(project)
+                metadata_path = self._metadata_path(resolved, paper.arxiv_id)
+                raw = yaml.safe_load(metadata_path.read_text(encoding="utf-8")) or {}
+                raw["submitted_date"] = submitted
+                yaml_text = yaml.safe_dump(raw, sort_keys=False, allow_unicode=True)
+                self._atomic_write(metadata_path, yaml_text)
+                updated += 1
+            except Exception:
+                continue
+        return updated
+
     @staticmethod
     def _normalize_tags(tags: object) -> list[str]:
         if not isinstance(tags, list):

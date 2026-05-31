@@ -131,6 +131,14 @@ def create_app(paths: RepoPaths | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post("/api/projects/{project}/papers/backfill-dates")
+    def backfill_submitted_dates(project: str) -> dict:
+        try:
+            count = paper_service.backfill_submitted_dates(project)
+            return {"updated": count}
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @app.get("/api/projects/{project}/papers/{paper_id}/note", response_model=NoteResponse)
     def get_note(project: str, paper_id: str) -> NoteResponse:
         try:

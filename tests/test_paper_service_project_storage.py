@@ -141,6 +141,43 @@ def test_project_paper_toggle_star_round_trips(tmp_path: Path) -> None:
     assert yaml.safe_load(metadata_path.read_text(encoding="utf-8"))["starred"] is False
 
 
+def test_project_paper_backfills_missing_submitted_dates(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    service = PaperService(paths)
+    service.import_arxiv_pdf(
+        project="Labit",
+        metadata=ArxivPaperMetadata(arxiv_id="2401.12345", title="Missing Date"),
+        pdf_content=b"first",
+    )
+    service.import_arxiv_pdf(
+        project="Labit",
+        metadata=ArxivPaperMetadata(
+            arxiv_id="2401.54321",
+            title="Existing Date",
+            submitted_date="2024-01-09",
+        ),
+        pdf_content=b"second",
+    )
+
+    def fake_fetch(arxiv_id: str) -> dict[str, object]:
+        assert arxiv_id == "2401.12345"
+        return {"submitted_date": "2024-01-02"}
+
+    service._fetch_arxiv_metadata = fake_fetch  # type: ignore[method-assign]
+
+    updated = service.backfill_submitted_dates("Labit")
+
+    missing_path = (
+        tmp_path / "vault" / "projects" / "Labit" / "papers" / "arxiv-2401.12345" / "paper.yaml"
+    )
+    existing_path = (
+        tmp_path / "vault" / "projects" / "Labit" / "papers" / "arxiv-2401.54321" / "paper.yaml"
+    )
+    assert updated == 1
+    assert yaml.safe_load(missing_path.read_text(encoding="utf-8"))["submitted_date"] == "2024-01-02"
+    assert yaml.safe_load(existing_path.read_text(encoding="utf-8"))["submitted_date"] == "2024-01-09"
+
+
 def test_project_paper_note_round_trips(tmp_path: Path) -> None:
     paths = _create_project(tmp_path)
     service = PaperService(paths)
