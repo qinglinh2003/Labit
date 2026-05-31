@@ -11,6 +11,8 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ValidationError
 
+from labit.api.chat_routes import mount_chat_routes
+from labit.api.chat_service import ChatService
 from labit.papers.models import ArxivPaperMetadata, PaperRecord
 from labit.papers.render import load_manifest, render_page
 from labit.papers.service import PaperService
@@ -34,6 +36,22 @@ PDF_RANGE_CHUNK_SIZE = 1024 * 1024
 class ProjectListResponse(BaseModel):
     projects: list[str]
     active_project: str | None = None
+
+
+class UpdateStatusRequest(BaseModel):
+    status: str
+
+
+class UpdateTagsRequest(BaseModel):
+    tags: list[str]
+
+
+class UpdateNoteRequest(BaseModel):
+    content: str
+
+
+class NoteResponse(BaseModel):
+    content: str
 
 
 class ArtifactRecord(BaseModel):
@@ -85,6 +103,49 @@ def create_app(paths: RepoPaths | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.put("/api/projects/{project}/papers/{paper_id}/star", response_model=PaperRecord)
+    def toggle_paper_star(project: str, paper_id: str) -> PaperRecord:
+        try:
+            return paper_service.toggle_star(project=project, paper_id=paper_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.put("/api/projects/{project}/papers/{paper_id}/status", response_model=PaperRecord)
+    def update_paper_status(project: str, paper_id: str, body: UpdateStatusRequest) -> PaperRecord:
+        try:
+            return paper_service.update_paper_status(project=project, paper_id=paper_id, status=body.status)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.patch("/api/projects/{project}/papers/{paper_id}/tags", response_model=PaperRecord)
+    def update_paper_tags(project: str, paper_id: str, body: UpdateTagsRequest) -> PaperRecord:
+        try:
+            return paper_service.update_paper_tags(project=project, paper_id=paper_id, tags=body.tags)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/projects/{project}/papers/{paper_id}/note", response_model=NoteResponse)
+    def get_note(project: str, paper_id: str) -> NoteResponse:
+        try:
+            content = paper_service.get_note(project=project, paper_id=paper_id)
+            return NoteResponse(content=content)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.put("/api/projects/{project}/papers/{paper_id}/note", response_model=NoteResponse)
+    def save_note(project: str, paper_id: str, body: UpdateNoteRequest) -> NoteResponse:
+        try:
+            content = paper_service.save_note(project=project, paper_id=paper_id, content=body.content)
+            return NoteResponse(content=content)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/projects/{project}/papers/import/arxiv", response_model=PaperRecord)
     async def import_arxiv_paper(
@@ -199,6 +260,9 @@ def create_app(paths: RepoPaths | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    chat_service = ChatService(paper_service)
+    app.include_router(mount_chat_routes(chat_service))
 
     _mount_frontend(app, _frontend_dist_dir())
     return app
