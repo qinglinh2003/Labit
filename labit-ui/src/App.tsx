@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { create } from "zustand";
+import { persist } from "zustand/middleware";
 import { BookOpen, ChevronDown, ChevronLeft, ChevronRight, Edit3, Eye, FileText, FolderOpen, MessageSquare, NotebookPen, Plus, RefreshCw, Search, Settings, Star, Tag, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -30,12 +31,17 @@ interface UiState {
   setSelectedPaperId: (paperId: string) => void;
 }
 
-const useUiStore = create<UiState>((set) => ({
-  project: "",
-  selectedPaperId: "",
-  setProject: (project) => set({ project, selectedPaperId: "" }),
-  setSelectedPaperId: (paperId) => set({ selectedPaperId: paperId })
-}));
+const useUiStore = create<UiState>()(
+  persist(
+    (set) => ({
+      project: "",
+      selectedPaperId: "",
+      setProject: (project) => set({ project, selectedPaperId: "" }),
+      setSelectedPaperId: (paperId) => set({ selectedPaperId: paperId }),
+    }),
+    { name: "labit-ui-state" }
+  )
+);
 
 export function App() {
   const { project, selectedPaperId, setProject, setSelectedPaperId } = useUiStore();
@@ -43,7 +49,7 @@ export function App() {
   const projects = projectsQuery.data?.projects ?? [];
 
   useEffect(() => {
-    if (!project && projects.length > 0) {
+    if (projects.length > 0 && (!project || !projects.includes(project))) {
       setProject(projectsQuery.data?.active_project ?? projects[0]);
     }
   }, [project, projects, projectsQuery.data?.active_project, setProject]);
@@ -51,13 +57,14 @@ export function App() {
   const papersQuery = useQuery({
     queryKey: ["papers", project],
     queryFn: () => listPapers(project),
-    enabled: Boolean(project)
+    enabled: Boolean(project),
+    refetchInterval: 5000,
   });
   const papers = papersQuery.data ?? [];
   const selectedPaper = papers.find((paper) => paper.id === selectedPaperId) ?? papers[0];
 
   useEffect(() => {
-    if (!selectedPaperId && selectedPaper) {
+    if (selectedPaper && selectedPaperId !== selectedPaper.id) {
       setSelectedPaperId(selectedPaper.id);
     }
   }, [selectedPaper, selectedPaperId, setSelectedPaperId]);
@@ -534,12 +541,6 @@ function PaperList({
 
   return (
     <aside className="lb relative flex-shrink-0" style={{ width: `${width}px`, borderRight: "1px solid var(--lb-line)" }}>
-      {/* Brand */}
-      <div className="lb-brand">
-        <BookOpen size={18} />
-        <b>LABIT</b>
-      </div>
-
       {/* Header */}
       <div className="lb-head">
         <h2>Papers</h2>
