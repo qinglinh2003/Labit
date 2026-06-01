@@ -1,4 +1,5 @@
-import { useEffect, useState, useRef, useCallback, useMemo } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
+import { ZoomIn, ZoomOut, RotateCcw } from "lucide-react";
 import {
   fetchReaderManifest,
   pageImageUrl,
@@ -28,8 +29,56 @@ export default function PaperImageReader({
   const [error, setError] = useState<string | null>(null);
   const [pages, setPages] = useState<PageEntry[]>([]);
   const [currentPage, setCurrentPage] = useState(1);
+  const [zoom, setZoom] = useState(1.0);
   const containerRef = useRef<HTMLDivElement>(null);
   const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const gestureScaleRef = useRef(1);
+
+  const clampZoom = useCallback((z: number) => Math.min(Math.max(z, 0.5), 3.0), []);
+  const zoomIn = useCallback(() => setZoom((z) => clampZoom(z + 0.25)), [clampZoom]);
+  const zoomOut = useCallback(() => setZoom((z) => clampZoom(z - 0.25)), [clampZoom]);
+  const zoomReset = useCallback(() => setZoom(1.0), []);
+
+  // Trackpad pinch-to-zoom. Chrome/Firefox emit ctrl+wheel; Safari emits gesture events.
+  useEffect(() => {
+    const eventIsInsideReader = (event: Event) => {
+      const container = containerRef.current;
+      return !!container && event.target instanceof Node && container.contains(event.target);
+    };
+
+    const handleWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      if (!eventIsInsideReader(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setZoom((z) => clampZoom(z - e.deltaY * 0.005));
+    };
+
+    const handleGestureStart = (e: Event) => {
+      if (!eventIsInsideReader(e)) return;
+      e.preventDefault();
+      gestureScaleRef.current = 1;
+    };
+
+    const handleGestureChange = (e: Event) => {
+      if (!eventIsInsideReader(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const scale = "scale" in e && typeof e.scale === "number" ? e.scale : 1;
+      const delta = scale - gestureScaleRef.current;
+      gestureScaleRef.current = scale;
+      setZoom((z) => clampZoom(z + delta));
+    };
+
+    window.addEventListener("wheel", handleWheel, { passive: false, capture: true });
+    window.addEventListener("gesturestart", handleGestureStart, { passive: false, capture: true });
+    window.addEventListener("gesturechange", handleGestureChange, { passive: false, capture: true });
+    return () => {
+      window.removeEventListener("wheel", handleWheel, { capture: true });
+      window.removeEventListener("gesturestart", handleGestureStart, { capture: true });
+      window.removeEventListener("gesturechange", handleGestureChange, { capture: true });
+    };
+  }, [clampZoom, manifest]);
 
   // Fetch manifest when paper changes
   useEffect(() => {
@@ -146,14 +195,15 @@ export default function PaperImageReader({
     <div className="relative">
       <div
         ref={containerRef}
-        className="overflow-y-auto rounded-md border border-slate-200 bg-slate-100"
-        style={{ height: "80vh" }}
+        className="overflow-auto rounded-md border border-slate-200 bg-slate-100"
+        style={{ height: "80vh", overscrollBehavior: "contain" }}
       >
         <div className="flex flex-col items-center gap-2 py-4">
           {pages.map((entry) => (
             <PageImage
               key={entry.page}
               entry={entry}
+              zoom={zoom}
               containerRef={containerRef}
               onLoad={() => markLoaded(entry.page)}
               registerRef={registerPageRef}
@@ -161,22 +211,36 @@ export default function PaperImageReader({
           ))}
         </div>
       </div>
-      {manifest && manifest.page_count > 1 && (
-        <div className="absolute bottom-4 right-4 rounded bg-black/60 px-2.5 py-1 text-xs text-white shadow">
-          {currentPage} / {manifest.page_count}
-        </div>
-      )}
+      <div className="absolute bottom-4 right-4 flex items-center gap-1 rounded bg-black/60 px-1.5 py-1 text-xs text-white shadow">
+        <button onClick={zoomOut} className="p-0.5 hover:text-slate-300" title="Zoom out">
+          <ZoomOut size={14} />
+        </button>
+        <span className="min-w-[3ch] text-center">{Math.round(zoom * 100)}%</span>
+        <button onClick={zoomIn} className="p-0.5 hover:text-slate-300" title="Zoom in">
+          <ZoomIn size={14} />
+        </button>
+        <button onClick={zoomReset} className="p-0.5 hover:text-slate-300" title="Reset zoom">
+          <RotateCcw size={12} />
+        </button>
+        {manifest && manifest.page_count > 1 && (
+          <span className="ml-1 border-l border-white/30 pl-1.5">
+            {currentPage} / {manifest.page_count}
+          </span>
+        )}
+      </div>
     </div>
   );
 }
 
 function PageImage({
   entry,
+  zoom,
   containerRef,
   onLoad,
   registerRef,
 }: {
   entry: PageEntry;
+  zoom: number;
   containerRef: React.RefObject<HTMLDivElement | null>;
   onLoad: () => void;
   registerRef: (page: number, el: HTMLDivElement | null) => void;
@@ -220,8 +284,8 @@ function PageImage({
       data-page={entry.page}
       className="bg-white shadow-sm"
       style={{
-        width: entry.cssWidth,
-        minHeight: entry.cssHeight,
+        width: entry.cssWidth * zoom,
+        minHeight: entry.cssHeight * zoom,
       }}
     >
       {imgError ? (
@@ -232,8 +296,8 @@ function PageImage({
         <img
           ref={imgRef}
           src={visible ? activeSrc : undefined}
-          width={entry.cssWidth}
-          height={activeHeight}
+          width={entry.cssWidth * zoom}
+          height={activeHeight * zoom}
           decoding="async"
           fetchPriority={entry.page === 1 ? "high" : "auto"}
           loading={entry.page === 1 ? "eager" : "lazy"}
