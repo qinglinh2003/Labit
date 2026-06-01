@@ -46,15 +46,26 @@ async function saveSettings() {
 
 async function getActiveTabMetadata() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab?.id) {
-    throw new Error("No active tab found.");
+
+  // Try content script on the active tab first (if on an arXiv page).
+  if (tab?.id) {
+    try {
+      const response = await chrome.tabs.sendMessage(tab.id, { type: "LABIT_GET_ARXIV_METADATA" });
+      if (response?.ok) {
+        return response.metadata;
+      }
+    } catch (_) {
+      // Content script not available — tab is not an arXiv page.
+    }
   }
 
-  const response = await chrome.tabs.sendMessage(tab.id, { type: "LABIT_GET_ARXIV_METADATA" });
-  if (!response?.ok) {
-    throw new Error(response?.error || "Open an arXiv abstract page first.");
+  // Fall back to cached metadata from background worker.
+  const cached = await chrome.runtime.sendMessage({ type: "LABIT_GET_CACHED_METADATA", tabId: tab?.id });
+  if (cached?.ok && cached.metadata) {
+    return cached.metadata;
   }
-  return response.metadata;
+
+  throw new Error("No paper found. Visit an arXiv abstract page first.");
 }
 
 async function fetchProjects(preferredProject) {
@@ -98,32 +109,27 @@ async function importPaper() {
   }
 
   setStatus("Importing");
-  setMessage("Fetching PDF from arXiv...");
+  setMessage("Import running in background. You can close this popup.");
   elements.importButton.disabled = true;
 
   try {
     await saveSettings();
-    const pdfResponse = await fetch(state.metadata.pdf_url);
-    if (!pdfResponse.ok) {
-      throw new Error(`PDF fetch returned ${pdfResponse.status}.`);
+
+    // Delegate to background service worker. If this popup stays open, the
+    // response updates the status when the background import completes.
+    const response = await chrome.runtime.sendMessage({
+      type: "LABIT_IMPORT_PAPER",
+      metadata: state.metadata,
+      apiBase: state.apiBase,
+      project
+    });
+
+    if (response?.ok) {
+      setStatus("Done");
+      setMessage(`Imported ${state.metadata.arxiv_id}.`);
+    } else {
+      throw new Error(response?.error || "Failed to import paper.");
     }
-
-    const pdfBlob = await pdfResponse.blob();
-    const form = new FormData();
-    form.append("metadata", JSON.stringify(state.metadata));
-    form.append("pdf", new File([pdfBlob], `${state.metadata.arxiv_id}.pdf`, { type: "application/pdf" }));
-
-    setMessage("Uploading to Labit...");
-    const importResponse = await fetch(
-      `${state.apiBase}/api/projects/${encodeURIComponent(project)}/papers/import/arxiv`,
-      { method: "POST", body: form }
-    );
-    if (!importResponse.ok) {
-      throw new Error(await importResponse.text());
-    }
-
-    setStatus("Done");
-    setMessage(`Imported ${state.metadata.arxiv_id} into ${project}.`);
   } catch (error) {
     setStatus("Error");
     setMessage(error instanceof Error ? error.message : String(error));

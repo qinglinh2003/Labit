@@ -75,3 +75,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
   return true;
 });
+
+// Proactively cache metadata in background worker so it persists after navigating away.
+try {
+  const metadata = collectMetadata();
+  chrome.runtime.sendMessage({ type: "LABIT_CACHE_METADATA", metadata });
+} catch (_) {
+  // Not an arXiv abstract page — ignore.
+}
