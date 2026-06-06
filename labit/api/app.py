@@ -13,11 +13,15 @@ from pydantic import BaseModel, ValidationError
 
 from labit.api.chat_routes import mount_chat_routes
 from labit.api.chat_service import ChatService
+from labit.api.general_chat_routes import mount_general_chat_routes
+from labit.api.general_chat_service import GeneralChatService
+from labit.api.todo_routes import mount_todo_routes
 from labit.papers.models import ArxivPaperMetadata, PaperRecord
 from labit.papers.render import load_manifest, render_page
 from labit.papers.service import PaperService
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
+from labit.todos.service import TodoService
 
 DEFAULT_CORS_ORIGINS = [
     "http://127.0.0.1:4173",
@@ -271,6 +275,12 @@ def create_app(paths: RepoPaths | None = None) -> FastAPI:
 
     chat_service = ChatService(paper_service)
     app.include_router(mount_chat_routes(chat_service))
+
+    todo_service = TodoService(repo_paths, project_service=project_service)
+    app.include_router(mount_todo_routes(todo_service))
+
+    general_chat_service = GeneralChatService(repo_paths, project_service=project_service)
+    app.include_router(mount_general_chat_routes(general_chat_service))
 
     _mount_frontend(app, _frontend_dist_dir())
     return app

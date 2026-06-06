@@ -23,12 +23,24 @@ import { createChat, deleteChat, listChats, type ChatListItem } from "./api/chat
 import PaperImageReader from "./components/PaperImageReader";
 import ChatList from "./components/ChatList";
 import ChatPanel from "./components/ChatPanel";
+import TodoPage from "./todo/TodoPage";
+import ChatPage from "./chat/ChatPage";
+import {
+  IconBook, IconPaper, IconCheckSquare, IconFlask, IconTerminal, IconCapture,
+  IconRefresh, IconCloud, IconChevronDown, IconChat,
+} from "./todo/icons";
+
+type ModuleTab = "papers" | "todos" | "chat";
 
 interface UiState {
   project: string;
   selectedPaperId: string;
+  activeTab: ModuleTab;
+  chatActiveChatId: string;
   setProject: (project: string) => void;
   setSelectedPaperId: (paperId: string) => void;
+  setActiveTab: (tab: ModuleTab) => void;
+  setChatActiveChatId: (chatId: string) => void;
 }
 
 const useUiStore = create<UiState>()(
@@ -36,15 +48,26 @@ const useUiStore = create<UiState>()(
     (set) => ({
       project: "",
       selectedPaperId: "",
+      activeTab: "papers" as ModuleTab,
+      chatActiveChatId: "",
       setProject: (project) => set({ project, selectedPaperId: "" }),
       setSelectedPaperId: (paperId) => set({ selectedPaperId: paperId }),
+      setActiveTab: (activeTab) => set({ activeTab }),
+      setChatActiveChatId: (chatActiveChatId) => set({ chatActiveChatId }),
     }),
     { name: "labit-ui-state" }
   )
 );
 
+const NAV_TABS: { id: ModuleTab; label: string; Icon: React.ComponentType<any> }[] = [
+  { id: "papers", label: "Papers", Icon: IconPaper },
+  { id: "chat", label: "Chat", Icon: IconChat },
+  { id: "todos", label: "Todos", Icon: IconCheckSquare },
+];
+
 export function App() {
-  const { project, selectedPaperId, setProject, setSelectedPaperId } = useUiStore();
+  const { project, selectedPaperId, activeTab, chatActiveChatId, setProject, setSelectedPaperId, setActiveTab, setChatActiveChatId } = useUiStore();
+  const [spinning, setSpinning] = useState(false);
   const projectsQuery = useQuery({ queryKey: ["projects"], queryFn: listProjects });
   const projects = projectsQuery.data?.projects ?? [];
 
@@ -69,55 +92,76 @@ export function App() {
     }
   }, [selectedPaper, selectedPaperId, setSelectedPaperId]);
 
-
   useEffect(() => {
     if (project && selectedPaper?.local_pdf_path) {
       prefetchReaderManifest(project, selectedPaper.id);
     }
   }, [project, selectedPaper?.id, selectedPaper?.local_pdf_path]);
 
+  const refresh = () => {
+    setSpinning(true);
+    void projectsQuery.refetch();
+    void papersQuery.refetch();
+    window.setTimeout(() => setSpinning(false), 650);
+  };
+
   return (
-    <main className="min-h-screen bg-slate-50 text-slate-950">
-      <header className="border-b border-slate-200 bg-white">
-        <div className="flex h-16 items-center justify-between px-5">
-          <div className="flex items-center gap-2 font-semibold">
-            <BookOpen size={18} />
-            <span>LABIT</span>
+    <main className="h-screen flex flex-col bg-[var(--bg,#eef3fb)] text-[var(--text,#0d1b2e)] font-[var(--font-sans,'IBM_Plex_Sans',system-ui,sans-serif)]">
+      {/* NavBar */}
+      <header className="flex-none flex items-center justify-between gap-3 px-3 lg:px-[22px] h-[52px] bg-[var(--surface,#fff)] border-b border-[var(--border,#e1e9f4)]">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="flex items-center gap-[9px]">
+            <span className="grid place-items-center w-[30px] h-[30px] rounded-lg bg-[var(--ink,#0e72ed)] text-[var(--ink-text,#fff)]"><IconBook size={19} stroke={2} /></span>
+            <span className="font-bold text-[18px] tracking-[0.08em]">LABIT</span>
           </div>
-          <div className="flex items-center gap-2">
-            <select
-              className="h-9 rounded-md border border-slate-300 bg-white px-3 text-sm"
-              value={project}
-              onChange={(event) => setProject(event.target.value)}
-            >
-              {projects.map((name) => (
-                <option key={name} value={name}>
-                  {name}
-                </option>
-              ))}
-            </select>
-            <button
-              className="inline-flex h-9 items-center gap-2 rounded-md border border-slate-300 bg-white px-3 text-sm"
-              onClick={() => {
-                void projectsQuery.refetch();
-                void papersQuery.refetch();
-              }}
-              type="button"
-            >
-              <RefreshCw size={15} />
-              Refresh
-            </button>
+          <nav aria-label="Modules" className="flex items-center gap-0.5 p-[3px] rounded-[11px] bg-[var(--surface-3,#e9f1fb)]">
+            {NAV_TABS.map((t) => {
+              const active = t.id === activeTab;
+              return (
+                <button key={t.id} onClick={() => setActiveTab(t.id)} aria-current={active ? "page" : undefined}
+                  className={`flex items-center gap-[5px] py-[6px] px-[10px] rounded-lg text-[13px] font-medium transition-colors ${active ? "bg-[var(--ink,#0e72ed)] text-[var(--ink-text,#fff)] shadow-[0_1px_2px_rgba(0,0,0,.18)]" : "text-[var(--muted,#5a6b82)] hover:text-[var(--text,#0d1b2e)] hover:bg-[var(--surface,#fff)]"}`}>
+                  <t.Icon size={14} stroke={1.9} />
+                  <span className="whitespace-nowrap hidden sm:inline">{t.label}</span>
+                </button>
+              );
+            })}
+          </nav>
+        </div>
+        <div className="flex items-center gap-2 flex-shrink-0">
+          <div title="Local-first · saved to vault/" className="hidden lg:flex items-center gap-1.5 text-[var(--faint,#97a5ba)] text-[12.5px]">
+            <IconCloud size={15} stroke={1.9} className="text-[var(--accent,#0e72ed)] opacity-80" />
+            <span className="font-mono whitespace-nowrap">saved to vault</span>
           </div>
+          <select
+            className="h-8 rounded-[9px] border border-[var(--border,#e1e9f4)] bg-[var(--surface-2,#f4f8fd)] px-2 text-[13px] font-medium max-w-[140px]"
+            value={project}
+            onChange={(event) => setProject(event.target.value)}
+          >
+            {projects.map((name) => (
+              <option key={name} value={name}>{name}</option>
+            ))}
+          </select>
+          <button onClick={refresh} title="Refresh"
+            className="flex items-center justify-center w-8 h-8 rounded-[9px] bg-[var(--ink,#0e72ed)] text-[var(--ink-text,#fff)] hover:opacity-90">
+            <IconRefresh size={15} stroke={1.9} className={spinning ? "animate-[spin_0.65s_ease]" : ""} />
+          </button>
         </div>
       </header>
 
-      <ContentArea
-        papers={papers}
-        project={project}
-        selectedPaper={selectedPaper}
-        isLoading={papersQuery.isLoading}
-        onSelect={setSelectedPaperId}
-      />
+      {/* Module content */}
+      {activeTab === "chat" ? (
+        <ChatPage project={project} activeChatId={chatActiveChatId} onActiveChatIdChange={setChatActiveChatId} />
+      ) : activeTab === "todos" ? (
+        <TodoPage project={project} />
+      ) : (
+        <ContentArea
+          papers={papers}
+          project={project}
+          selectedPaper={selectedPaper}
+          isLoading={papersQuery.isLoading}
+          onSelect={setSelectedPaperId}
+        />
+      )}
     </main>
   );
 }
@@ -219,7 +263,7 @@ function ContentArea({
   }, [leftOpen, rightOpen, leftResize.width, rightResize.width, leftResize.setWidth, rightResize.setWidth]);
 
   return (
-    <section ref={containerRef} className="relative flex h-[calc(100vh-4rem)] overflow-hidden">
+    <section ref={containerRef} className="relative flex flex-1 min-h-0 overflow-hidden">
       {/* Left expand button (visible when collapsed) */}
       {!leftOpen && (
         <button

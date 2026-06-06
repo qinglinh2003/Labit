@@ -2,6 +2,14 @@ const API_BASE = import.meta.env.VITE_LABIT_API_BASE ?? "";
 
 export type ChatMode = "single" | "parallel" | "round_robin";
 
+export interface ChatAttachment {
+  id: string;
+  kind: string;
+  filename: string;
+  mime_type: string;
+  path: string;
+}
+
 export interface ChatArtifact {
   id: string;
   title: string;
@@ -16,14 +24,15 @@ export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   agent: string | null;
-  artifacts: ChatArtifact[];
+  attachments?: ChatAttachment[];
+  artifacts?: ChatArtifact[];
   created_at: string;
 }
 
 export interface ChatRecord {
   chat_id: string;
   title: string;
-  paper_id: string;
+  project: string;
   mode: ChatMode;
   first_agent: string;
   participants: string[];
@@ -41,20 +50,28 @@ export interface ChatListItem {
   message_count: number;
 }
 
+export interface SSEEvent {
+  type: "start" | "text" | "status" | "done" | "error" | "end";
+  agent?: string;
+  text?: string;
+  status?: string;
+  error?: string;
+  full_text?: string;
+}
+
 // ---------------------------------------------------------------------------
 // CRUD
 // ---------------------------------------------------------------------------
 
-function chatBase(project: string, paperId: string): string {
-  return `${API_BASE}/api/projects/${encodeURIComponent(project)}/papers/${encodeURIComponent(paperId)}/chats`;
+function base(project: string): string {
+  return `${API_BASE}/api/projects/${encodeURIComponent(project)}/chats`;
 }
 
 export async function createChat(
   project: string,
-  paperId: string,
   opts: { title?: string; mode?: ChatMode; first_agent?: string } = {},
 ): Promise<ChatRecord> {
-  const res = await fetch(chatBase(project, paperId), {
+  const res = await fetch(base(project), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -67,25 +84,24 @@ export async function createChat(
   return res.json();
 }
 
-export async function listChats(project: string, paperId: string): Promise<ChatListItem[]> {
-  const res = await fetch(chatBase(project, paperId));
+export async function listChats(project: string): Promise<ChatListItem[]> {
+  const res = await fetch(base(project));
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
-export async function getChat(project: string, paperId: string, chatId: string): Promise<ChatRecord> {
-  const res = await fetch(`${chatBase(project, paperId)}/${encodeURIComponent(chatId)}`);
+export async function getChat(project: string, chatId: string): Promise<ChatRecord> {
+  const res = await fetch(`${base(project)}/${encodeURIComponent(chatId)}`);
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
 export async function updateChat(
   project: string,
-  paperId: string,
   chatId: string,
   updates: { mode?: ChatMode; first_agent?: string; title?: string },
 ): Promise<ChatRecord> {
-  const res = await fetch(`${chatBase(project, paperId)}/${encodeURIComponent(chatId)}`, {
+  const res = await fetch(`${base(project)}/${encodeURIComponent(chatId)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(updates),
@@ -94,27 +110,52 @@ export async function updateChat(
   return res.json();
 }
 
-export async function deleteChat(project: string, paperId: string, chatId: string): Promise<void> {
-  const res = await fetch(`${chatBase(project, paperId)}/${encodeURIComponent(chatId)}`, {
+export async function deleteChat(project: string, chatId: string): Promise<void> {
+  const res = await fetch(`${base(project)}/${encodeURIComponent(chatId)}`, {
     method: "DELETE",
   });
   if (!res.ok) throw new Error(await res.text());
 }
 
 // ---------------------------------------------------------------------------
-// SSE streaming ask
+// Attachments
 // ---------------------------------------------------------------------------
 
-export interface SSEEvent {
-  type: "start" | "text" | "status" | "done" | "error" | "end";
-  agent?: string;
-  text?: string;
-  status?: string;
-  error?: string;
-  full_text?: string;
+export async function uploadAttachment(
+  project: string,
+  chatId: string,
+  file: File,
+): Promise<ChatAttachment> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch(
+    `${base(project)}/${encodeURIComponent(chatId)}/attachments`,
+    { method: "POST", body: form },
+  );
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
 }
 
-/** Parse SSE from a ReadableStream, calling onEvent for each parsed event. */
+export function attachmentUrl(
+  project: string,
+  chatId: string,
+  attId: string,
+): string {
+  return `${API_BASE}/api/projects/${encodeURIComponent(project)}/chats/${encodeURIComponent(chatId)}/attachments/${encodeURIComponent(attId)}`;
+}
+
+export function artifactDownloadUrl(
+  project: string,
+  chatId: string,
+  artifactId: string,
+): string {
+  return `${API_BASE}/api/projects/${encodeURIComponent(project)}/chats/${encodeURIComponent(chatId)}/artifacts/${encodeURIComponent(artifactId)}/download`;
+}
+
+// ---------------------------------------------------------------------------
+// SSE streaming
+// ---------------------------------------------------------------------------
+
 function consumeSSE(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   onEvent: (event: SSEEvent) => void,
@@ -127,10 +168,7 @@ function consumeSSE(
     reader
       .read()
       .then(({ done, value }) => {
-        if (done) {
-          onDone();
-          return;
-        }
+        if (done) { onDone(); return; }
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
         buffer = lines.pop() ?? "";
@@ -140,24 +178,18 @@ function consumeSSE(
           if (line.startsWith("event: ")) {
             currentEventType = line.slice(7).trim();
           } else if (line.startsWith("data: ")) {
-            const data = line.slice(6);
             try {
-              const parsed = JSON.parse(data) as SSEEvent;
+              const parsed = JSON.parse(line.slice(6)) as SSEEvent;
               parsed.type = (currentEventType || parsed.type) as SSEEvent["type"];
               onEvent(parsed);
-            } catch {
-              // ignore parse errors
-            }
+            } catch { /* ignore */ }
             currentEventType = "";
           }
-          // Ignore comment lines (keepalive)
         }
         pump();
       })
       .catch((err) => {
-        if (err.name !== "AbortError") {
-          onEvent({ type: "error", error: String(err) });
-        }
+        if (err.name !== "AbortError") onEvent({ type: "error", error: String(err) });
         onDone();
       });
   }
@@ -166,117 +198,70 @@ function consumeSSE(
 
 export function askStream(
   project: string,
-  paperId: string,
   chatId: string,
   content: string,
   onEvent: (event: SSEEvent) => void,
   onDone: () => void,
+  attachmentIds?: string[],
 ): AbortController {
   const controller = new AbortController();
-  const url = `${chatBase(project, paperId)}/${encodeURIComponent(chatId)}/ask`;
+  const url = `${base(project)}/${encodeURIComponent(chatId)}/ask`;
+
+  const payload: Record<string, unknown> = { content };
+  if (attachmentIds && attachmentIds.length > 0) {
+    payload.attachment_ids = attachmentIds;
+  }
 
   fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content }),
+    body: JSON.stringify(payload),
     signal: controller.signal,
   })
     .then(async (res) => {
-      if (!res.ok) {
-        onEvent({ type: "error", error: await res.text() });
-        onDone();
-        return;
-      }
+      if (!res.ok) { onEvent({ type: "error", error: await res.text() }); onDone(); return; }
       const reader = res.body?.getReader();
-      if (!reader) {
-        onDone();
-        return;
-      }
+      if (!reader) { onDone(); return; }
       consumeSSE(reader, onEvent, onDone);
     })
     .catch((err) => {
-      if (err.name !== "AbortError") {
-        onEvent({ type: "error", error: String(err) });
-      }
+      if (err.name !== "AbortError") onEvent({ type: "error", error: String(err) });
       onDone();
     });
 
   return controller;
 }
 
-// ---------------------------------------------------------------------------
-// Background task reconnect
-// ---------------------------------------------------------------------------
-
-export interface ActiveTaskResponse {
-  active: boolean;
-  event_count?: number;
-}
-
-export async function getActiveTask(
-  project: string,
-  paperId: string,
-  chatId: string,
-): Promise<ActiveTaskResponse> {
-  const res = await fetch(
-    `${chatBase(project, paperId)}/${encodeURIComponent(chatId)}/active-task`,
-  );
+export async function getActiveTask(project: string, chatId: string): Promise<{ active: boolean; event_count?: number }> {
+  const res = await fetch(`${base(project)}/${encodeURIComponent(chatId)}/active-task`);
   if (!res.ok) return { active: false };
   return res.json();
 }
 
-/** Reconnect to an in-progress background task's SSE stream. */
 export function reconnectStream(
   project: string,
-  paperId: string,
   chatId: string,
   onEvent: (event: SSEEvent) => void,
   onDone: () => void,
 ): AbortController {
   const controller = new AbortController();
-  const url = `${chatBase(project, paperId)}/${encodeURIComponent(chatId)}/active-task/stream`;
+  const url = `${base(project)}/${encodeURIComponent(chatId)}/active-task/stream`;
 
   fetch(url, { signal: controller.signal })
     .then(async (res) => {
-      if (!res.ok) {
-        onDone();
-        return;
-      }
+      if (!res.ok) { onDone(); return; }
       const reader = res.body?.getReader();
-      if (!reader) {
-        onDone();
-        return;
-      }
+      if (!reader) { onDone(); return; }
       consumeSSE(reader, onEvent, onDone);
     })
     .catch((err) => {
-      if (err.name !== "AbortError") {
-        onEvent({ type: "error", error: String(err) });
-      }
+      if (err.name !== "AbortError") onEvent({ type: "error", error: String(err) });
       onDone();
     });
 
   return controller;
 }
 
-/** Explicitly stop a running background task. */
-export async function stopTask(
-  project: string,
-  paperId: string,
-  chatId: string,
-): Promise<void> {
-  await fetch(
-    `${chatBase(project, paperId)}/${encodeURIComponent(chatId)}/stop`,
-    { method: "POST" },
-  );
-}
-
-/** Get the download URL for a chat artifact. */
-export function artifactDownloadUrl(
-  project: string,
-  paperId: string,
-  chatId: string,
-  artifactId: string,
-): string {
-  return `${chatBase(project, paperId)}/${encodeURIComponent(chatId)}/artifacts/${encodeURIComponent(artifactId)}/download`;
+export async function stopTask(project: string, chatId: string): Promise<void> {
+  await fetch(`${base(project)}/${encodeURIComponent(chatId)}/stop`, { method: "POST" });
 }

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import asyncio
 import threading
 
 import pytest
 import yaml
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from labit.api.app import create_app
 from labit.api.chat_models import CreateChatRequest
 from labit.api.chat_routes import BackgroundTask, _stream_from_task
 from labit.api.chat_service import ChatService
@@ -91,6 +94,87 @@ def test_build_prompt_uses_persisted_history_without_duplicating_current_questio
 
     assert prompt.count("What is the main idea?") == 1
     assert "This is the extracted paper text." in prompt
+
+
+def test_build_prompt_adds_artifact_reminder_for_document_requests(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    _write_paper(paths)
+    paper_service = PaperService(paths, project_service=ProjectService(paths))
+    chat_service = ChatService(paper_service)
+    chat = chat_service.create_chat("Labit", "arxiv:2401.12345")
+
+    chat_service.append_message(
+        "Labit",
+        "arxiv:2401.12345",
+        chat.chat_id,
+        "user",
+        "围绕这个方法写一个 research proposal 文档",
+    )
+
+    prompt = chat_service.build_prompt("Labit", "arxiv:2401.12345", chat.chat_id)
+
+    assert "System reminder" in prompt
+    assert "`````artifact:filename.ext" in prompt
+
+
+def test_paper_chat_downloads_artifact_from_chat(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    _write_paper(paths)
+    client = TestClient(create_app(paths))
+
+    create_response = client.post(
+        "/api/projects/Labit/papers/arxiv:2401.12345/chats",
+        json={"mode": "single"},
+    )
+    assert create_response.status_code == 200
+    chat = create_response.json()
+    chat_id = chat["chat_id"]
+
+    chat["messages"].append(
+        {
+            "id": "msg_artifact",
+            "role": "assistant",
+            "content": "Generated.",
+            "agent": "claude",
+            "artifacts": [
+                {
+                    "id": "art_test",
+                    "title": "Research Proposal",
+                    "filename": "研究方案.md",
+                    "language": "markdown",
+                    "mime_type": "text/markdown",
+                    "content": "# Research Proposal\n\nDraft body.",
+                }
+            ],
+            "created_at": "2026-06-06T00:00:00+00:00",
+        }
+    )
+    chat_path = (
+        paths.vault_projects_dir
+        / "Labit"
+        / "papers"
+        / "arxiv-2401.12345"
+        / "artifacts"
+        / "chats"
+        / f"{chat_id}.json"
+    )
+    chat_path.write_text(json.dumps(chat), encoding="utf-8")
+
+    response = client.get(
+        f"/api/projects/Labit/papers/arxiv:2401.12345/chats/{chat_id}/artifacts/art_test/download"
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/markdown")
+    content_disposition = response.headers["content-disposition"]
+    assert 'filename="????.md"' in content_disposition
+    assert "filename*=UTF-8''%E7%A0%94%E7%A9%B6%E6%96%B9%E6%A1%88.md" in content_disposition
+    assert response.text == "# Research Proposal\n\nDraft body."
+
+    missing_response = client.get(
+        f"/api/projects/Labit/papers/arxiv:2401.12345/chats/{chat_id}/artifacts/missing/download"
+    )
+    assert missing_response.status_code == 404
 
 
 def test_chat_request_rejects_unknown_first_agent() -> None:

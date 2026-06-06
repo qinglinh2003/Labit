@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Send, Square, User } from "lucide-react";
+import { ChevronDown, ChevronRight, Copy, Download, Send, Square, User } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import "katex/dist/katex.min.css";
-import type { ChatMessage, ChatMode, ChatRecord, SSEEvent } from "../api/chat";
-import { askStream, getActiveTask, getChat, reconnectStream, stopTask, updateChat } from "../api/chat";
+import type { ChatArtifact, ChatMessage, ChatMode, ChatRecord, SSEEvent } from "../api/chat";
+import { artifactDownloadUrl, askStream, getActiveTask, getChat, reconnectStream, stopTask, updateChat } from "../api/chat";
 import { ClaudeIcon, CodexIcon } from "./AgentIcons";
 import ModeSwapBar from "./ModeSwapBar";
 
@@ -37,9 +37,9 @@ function hasAssistantMessage(messages: ChatMessage[], agent: string, content: st
 function mergeMissingLocalMessages(serverChat: ChatRecord, localChat: ChatRecord | null): ChatRecord {
   if (!localChat) return serverChat;
   const missing = localChat.messages.filter((msg) =>
-    msg.role === "assistant" &&
-    (msg.id.startsWith("done_") || msg.id.startsWith("partial_")) &&
-    !hasAssistantMessage(serverChat.messages, msg.agent ?? "", msg.content)
+    msg.role === "user" &&
+    msg.id.startsWith("local_") &&
+    !serverChat.messages.some((serverMsg) => serverMsg.role === "user" && serverMsg.content === msg.content)
   );
   if (missing.length === 0) return serverChat;
   return { ...serverChat, messages: [...serverChat.messages, ...missing] };
@@ -130,6 +130,7 @@ export default function ChatPanel({
             role: "assistant",
             content: finalText,
             agent: event.agent,
+            artifacts: [],
             created_at: new Date().toISOString(),
           };
           setChat((prev) => {
@@ -156,6 +157,7 @@ export default function ChatPanel({
               role: "assistant" as const,
               content: entry.content,
               agent: entry.agent,
+              artifacts: [] as ChatArtifact[],
               created_at: new Date().toISOString(),
             }));
           return additions.length ? { ...prev, messages: [...prev.messages, ...additions] } : prev;
@@ -219,6 +221,7 @@ export default function ChatPanel({
       role: "user",
       content,
       agent: null,
+      artifacts: [],
       created_at: new Date().toISOString(),
     };
     setChat((prev) => prev ? { ...prev, messages: [...prev.messages, userMsg] } : prev);
@@ -266,7 +269,7 @@ export default function ChatPanel({
           </div>
         )}
         {chat.messages.map((msg) => (
-          <MessageBubble key={msg.id} message={msg} />
+          <MessageBubble key={msg.id} message={msg} project={project} paperId={paperId} chatId={chatId} />
         ))}
         {streamingAgents.map((sa) => (
           <StreamingBubble key={`stream-${sa.agent}`} agent={sa} />
@@ -335,7 +338,75 @@ export default function ChatPanel({
   );
 }
 
-function MessageBubble({ message }: { message: ChatMessage }) {
+function ArtifactCard({
+  artifact,
+  downloadUrl,
+}: {
+  artifact: ChatArtifact;
+  downloadUrl: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const lines = artifact.content.split("\n").length;
+
+  const handleCopy = () => {
+    navigator.clipboard.writeText(artifact.content);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50 overflow-hidden">
+      <div className="flex items-center gap-2 px-3 py-2">
+        <button
+          className="flex items-center gap-1.5 flex-1 min-w-0 text-left"
+          onClick={() => setExpanded(!expanded)}
+        >
+          {expanded ? <ChevronDown size={14} className="text-slate-400 flex-shrink-0" /> : <ChevronRight size={14} className="text-slate-400 flex-shrink-0" />}
+          <span className="text-sm font-medium text-slate-700 truncate">{artifact.title}</span>
+          <span className="text-[10px] text-slate-400 truncate min-w-0 max-w-[120px]" title={artifact.filename}>{artifact.filename}</span>
+          {artifact.language && (
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-200 text-slate-500 flex-shrink-0">{artifact.language}</span>
+          )}
+        </button>
+        <div className="flex items-center gap-1 flex-shrink-0">
+          <button
+            onClick={handleCopy}
+            className="p-1 rounded hover:bg-slate-200 text-slate-400 hover:text-slate-600 transition-colors"
+            title="Copy content"
+          >
+            <Copy size={13} />
+          </button>
+          {copied && <span className="text-[10px] text-green-600">Copied</span>}
+          <a
+            href={downloadUrl}
+            download={artifact.filename}
+            className="p-1 rounded hover:bg-slate-200 text-slate-400 hover:text-slate-600 transition-colors"
+            title="Download"
+          >
+            <Download size={13} />
+          </a>
+        </div>
+      </div>
+      {!expanded && (
+        <div className="px-3 pb-2 text-[10px] text-slate-400">{lines} lines</div>
+      )}
+      {expanded && (
+        <div className="border-t border-slate-200 max-h-96 overflow-y-auto">
+          {artifact.language === "markdown" ? (
+            <div className="px-3 py-2">
+              <Markdown>{artifact.content}</Markdown>
+            </div>
+          ) : (
+            <pre className="px-3 py-2 text-xs text-slate-700 whitespace-pre-wrap">{artifact.content}</pre>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MessageBubble({ message, project, paperId, chatId }: { message: ChatMessage; project: string; paperId: string; chatId: string }) {
   const isUser = message.role === "user";
 
   if (isUser) {
@@ -360,6 +431,17 @@ function MessageBubble({ message }: { message: ChatMessage }) {
       <div className={`max-w-[85%] rounded-2xl rounded-tl-md border ${style.accent} bg-white px-3.5 py-2.5`}>
         <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">{agent}</div>
         <Markdown>{message.content}</Markdown>
+        {message.artifacts && message.artifacts.length > 0 && (
+          <div className="mt-2 space-y-2">
+            {message.artifacts.map((art) => (
+              <ArtifactCard
+                key={art.id}
+                artifact={art}
+                downloadUrl={artifactDownloadUrl(project, paperId, chatId, art.id)}
+              />
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );

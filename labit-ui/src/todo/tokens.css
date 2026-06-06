@@ -1,0 +1,39 @@
+/* tokens.css — theme variables for the Labit Todo module.
+   Apply by setting data-theme + data-density on a wrapper element. */
+
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap");
+
+/* ---- Zoom (default) ---- */
+[data-theme="zoom"], :root {
+  --bg: #eef3fb;
+  --surface: #ffffff;
+  --surface-2: #f4f8fd;
+  --surface-3: #e9f1fb;
+  --border: #e1e9f4;
+  --border-strong: #c8d6e8;
+  --text: #0d1b2e;
+  --muted: #5a6b82;
+  --faint: #97a5ba;
+  --ink: #0e72ed;
+  --ink-text: #ffffff;
+  --accent: #0e72ed;
+  --accent-weak: #e6f0fd;
+  --accent-strong: #0857c2;
+  --accent-text: #ffffff;
+  --shadow: 0 1px 2px rgba(13,27,46,.04), 0 8px 24px -12px rgba(13,40,90,.16);
+  --radius: 11px;
+  --radius-sm: 8px;
+  --font-sans: "IBM Plex Sans", system-ui, sans-serif;
+  --font-head: "IBM Plex Sans", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --head-weight: 600;
+  --head-tracking: -0.01em;
+  --head-transform: none;
+  --pri-high: oklch(0.58 0.2 22);
+  --pri-normal: oklch(0.7 0.15 70);
+  --pri-low: var(--faint);
+}
+
+/* ---- Density ---- */
+[data-density="comfortable"] { --row-py: 11px; --row-px: 13px; --list-gap: 5px; --fs-item: 14.5px; }
+[data-density="compact"]     { --row-py: 6px;  --row-px: 11px; --list-gap: 2px; --fs-item: 13.5px; }

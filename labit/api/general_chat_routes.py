@@ -1,93 +1,86 @@
-"""Chat API routes: CRUD + SSE streaming via agent subprocess.
-
-Agent tasks run in background threads, decoupled from SSE connections.
-Navigating away no longer kills the agent — the task keeps running and
-messages are saved when the agent finishes.  The frontend can reconnect
-to an in-progress task via GET .../active-task/stream.
-"""
+"""General (project-scoped) chat API routes: CRUD + SSE streaming."""
 from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes
 import threading
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
-
-from labit.api.downloads import attachment_content_disposition
-from labit.api.general_chat_service import extract_artifacts
+from fastapi import APIRouter, HTTPException, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
 
 from labit.agents.adapters.base import AgentAdapterError, StreamCancelled
 from labit.agents.adapters.claude import ClaudeAdapter
 from labit.agents.adapters.codex import CodexAdapter
 from labit.agents.models import AgentRequest, AgentRole
-from labit.api.chat_models import (
-    AskRequest,
-    ChatListItem,
-    ChatMode,
-    ChatRecord,
-    CreateChatRequest,
-    UpdateChatRequest,
+from labit.api.chat_models import ChatMode
+from labit.api.general_chat_models import (
+    Attachment,
+    CreateGeneralChatRequest,
+    GeneralAskRequest,
+    GeneralChatListItem,
+    GeneralChatRecord,
+    UpdateGeneralChatRequest,
 )
-from labit.api.chat_service import SYSTEM_PROMPT, ChatService
+from labit.api.general_chat_service import (
+    ALLOWED_MIME_TYPES,
+    MAX_UPLOAD_BYTES,
+    SYSTEM_PROMPT,
+    GeneralChatService,
+    extract_artifacts,
+)
+from labit.api.downloads import attachment_content_disposition
 
 router = APIRouter()
 
-# Module-level service — set by mount_chat_routes()
-_chat_service: ChatService | None = None
+_service: GeneralChatService | None = None
 
 
-def mount_chat_routes(chat_service: ChatService) -> APIRouter:
-    global _chat_service
-    _chat_service = chat_service
+def mount_general_chat_routes(service: GeneralChatService) -> APIRouter:
+    global _service
+    _service = service
     return router
 
 
-def _svc() -> ChatService:
-    assert _chat_service is not None
-    return _chat_service
+def _svc() -> GeneralChatService:
+    assert _service is not None
+    return _service
 
 
 # ---------------------------------------------------------------------------
 # CRUD
 # ---------------------------------------------------------------------------
 
-@router.post("/api/projects/{project}/papers/{paper_id}/chats", response_model=ChatRecord)
-def create_chat(project: str, paper_id: str, body: CreateChatRequest) -> ChatRecord:
+@router.post("/api/projects/{project}/chats", response_model=GeneralChatRecord)
+def create_chat(project: str, body: CreateGeneralChatRequest) -> GeneralChatRecord:
+    return _svc().create_chat(
+        project,
+        title=body.title,
+        mode=body.mode,
+        first_agent=body.first_agent,
+    )
+
+
+@router.get("/api/projects/{project}/chats", response_model=list[GeneralChatListItem])
+def list_chats(project: str) -> list[GeneralChatListItem]:
+    return _svc().list_chats(project)
+
+
+@router.get("/api/projects/{project}/chats/{chat_id}", response_model=GeneralChatRecord)
+def get_chat(project: str, chat_id: str) -> GeneralChatRecord:
     try:
-        return _svc().create_chat(
-            project, paper_id,
-            title=body.title,
-            mode=body.mode,
-            first_agent=body.first_agent,
-        )
+        return _svc().get_chat(project, chat_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/api/projects/{project}/papers/{paper_id}/chats", response_model=list[ChatListItem])
-def list_chats(project: str, paper_id: str) -> list[ChatListItem]:
-    try:
-        return _svc().list_chats(project, paper_id)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@router.get("/api/projects/{project}/papers/{paper_id}/chats/{chat_id}", response_model=ChatRecord)
-def get_chat(project: str, paper_id: str, chat_id: str) -> ChatRecord:
-    try:
-        return _svc().get_chat(project, paper_id, chat_id)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@router.patch("/api/projects/{project}/papers/{paper_id}/chats/{chat_id}", response_model=ChatRecord)
-def update_chat(project: str, paper_id: str, chat_id: str, body: UpdateChatRequest) -> ChatRecord:
+@router.patch("/api/projects/{project}/chats/{chat_id}", response_model=GeneralChatRecord)
+def update_chat(project: str, chat_id: str, body: UpdateGeneralChatRequest) -> GeneralChatRecord:
     try:
         return _svc().update_chat(
-            project, paper_id, chat_id,
+            project, chat_id,
             mode=body.mode,
             first_agent=body.first_agent,
             title=body.title,
@@ -96,25 +89,72 @@ def update_chat(project: str, paper_id: str, chat_id: str, body: UpdateChatReque
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.delete("/api/projects/{project}/papers/{paper_id}/chats/{chat_id}")
-def delete_chat(project: str, paper_id: str, chat_id: str) -> dict:
-    _svc().delete_chat(project, paper_id, chat_id)
+@router.delete("/api/projects/{project}/chats/{chat_id}")
+def delete_chat(project: str, chat_id: str) -> dict:
+    _svc().delete_chat(project, chat_id)
     return {"deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Attachments
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/api/projects/{project}/chats/{chat_id}/attachments",
+    response_model=Attachment,
+)
+async def upload_attachment(project: str, chat_id: str, file: UploadFile) -> Attachment:
+    svc = _svc()
+    # Validate chat exists
+    try:
+        svc.get_chat(project, chat_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    # Validate MIME type
+    mime = file.content_type or mimetypes.guess_type(file.filename or "")[0] or ""
+    if mime not in ALLOWED_MIME_TYPES:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {mime}. Allowed: {', '.join(sorted(ALLOWED_MIME_TYPES))}")
+
+    data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail=f"File too large ({len(data)} bytes). Max: {MAX_UPLOAD_BYTES} bytes.")
+
+    att = svc.upload_attachment(
+        project, chat_id,
+        filename=file.filename or "image.png",
+        mime_type=mime,
+        data=data,
+    )
+    return att
+
+
+@router.get("/api/projects/{project}/chats/{chat_id}/attachments/{att_id}")
+def get_attachment(project: str, chat_id: str, att_id: str):
+    svc = _svc()
+    # Strip extension if present (e.g. "abc123.png" -> "abc123")
+    att_id_clean = att_id.rsplit(".", 1)[0] if "." in att_id else att_id
+    path = svc.get_attachment_path(project, chat_id, att_id_clean)
+    if not path or not path.exists():
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+    return FileResponse(path, media_type=mime)
 
 
 # ---------------------------------------------------------------------------
 # Artifacts
 # ---------------------------------------------------------------------------
 
-@router.get("/api/projects/{project}/papers/{paper_id}/chats/{chat_id}/artifacts/{artifact_id}/download")
-def download_artifact(project: str, paper_id: str, chat_id: str, artifact_id: str):
+@router.get("/api/projects/{project}/chats/{chat_id}/artifacts/{artifact_id}/download")
+def download_artifact(project: str, chat_id: str, artifact_id: str):
     svc = _svc()
     try:
-        art = svc.get_artifact(project, paper_id, chat_id, artifact_id)
+        art = svc.get_artifact(project, chat_id, artifact_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Chat not found") from exc
     if not art:
         raise HTTPException(status_code=404, detail="Artifact not found")
+    # Force safe content types — never serve text/html directly
     safe_mime = art.mime_type if art.mime_type != "text/html" else "text/plain"
     return StreamingResponse(
         iter([art.content.encode("utf-8")]),
@@ -126,13 +166,11 @@ def download_artifact(project: str, paper_id: str, chat_id: str, artifact_id: st
 
 
 # ---------------------------------------------------------------------------
-# Background task registry
+# Background task registry (same pattern as paper chat)
 # ---------------------------------------------------------------------------
 
 @dataclass
 class BackgroundTask:
-    """An agent task that runs independently of any SSE connection."""
-
     events: list[dict] = field(default_factory=list)
     cancel_events: list[threading.Event] = field(default_factory=list)
     done: bool = False
@@ -155,22 +193,21 @@ class BackgroundTask:
             ce.set()
 
 
-# chat_key -> BackgroundTask
 _active_tasks: dict[str, BackgroundTask] = {}
 _tasks_lock = threading.Lock()
 
 
-def _chat_key(project: str, paper_id: str, chat_id: str) -> str:
-    return f"{project}/{paper_id}/{chat_id}"
+def _chat_key(project: str, chat_id: str) -> str:
+    return f"{project}/__general__/{chat_id}"
 
 
-def _get_task(project: str, paper_id: str, chat_id: str) -> BackgroundTask | None:
+def _get_task(project: str, chat_id: str) -> BackgroundTask | None:
     with _tasks_lock:
-        return _active_tasks.get(_chat_key(project, paper_id, chat_id))
+        return _active_tasks.get(_chat_key(project, chat_id))
 
 
-def _set_task(project: str, paper_id: str, chat_id: str, task: BackgroundTask) -> None:
-    key = _chat_key(project, paper_id, chat_id)
+def _set_task(project: str, chat_id: str, task: BackgroundTask) -> None:
+    key = _chat_key(project, chat_id)
     with _tasks_lock:
         old = _active_tasks.get(key)
         if old and not old.done:
@@ -178,14 +215,14 @@ def _set_task(project: str, paper_id: str, chat_id: str, task: BackgroundTask) -
         _active_tasks[key] = task
 
 
-def _remove_task(project: str, paper_id: str, chat_id: str) -> None:
-    key = _chat_key(project, paper_id, chat_id)
+def _remove_task(project: str, chat_id: str) -> None:
+    key = _chat_key(project, chat_id)
     with _tasks_lock:
         _active_tasks.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
-# Agent execution (runs in background threads)
+# Agent execution
 # ---------------------------------------------------------------------------
 
 def _get_adapter(agent: str):
@@ -202,11 +239,10 @@ def _run_agent_to_task(
     system_prompt: str,
     task: BackgroundTask,
     cancel_event: threading.Event,
+    image_paths: list[str] | None = None,
 ) -> None:
-    """Run agent subprocess, pushing events to a BackgroundTask."""
     adapter = _get_adapter(agent)
     allowed_tools: list[str] = []
-    extra_args: list[str] = []
     if agent == "claude":
         allowed_tools = ["WebSearch", "WebFetch"]
 
@@ -216,7 +252,7 @@ def _run_agent_to_task(
         system_prompt=system_prompt,
         timeout_seconds=120,
         allowed_tools=allowed_tools,
-        extra_args=extra_args,
+        image_paths=image_paths or [],
     )
 
     collected: list[str] = []
@@ -240,7 +276,6 @@ def _run_agent_to_task(
 
 
 def _get_agent_text(task: BackgroundTask, agent: str) -> str:
-    """Extract the full_text for an agent from task events."""
     events, _done = task.snapshot()
     for ev in events:
         if ev.get("agent") == agent and ev.get("type") in ("done", "error"):
@@ -249,46 +284,46 @@ def _get_agent_text(task: BackgroundTask, agent: str) -> str:
 
 
 def _save_agent_result(
-    svc: ChatService, project: str, paper_id: str, chat_id: str,
+    svc: GeneralChatService, project: str, chat_id: str,
     agent: str, task: BackgroundTask,
 ) -> None:
     text = _get_agent_text(task, agent)
     if text:
         cleaned, artifacts = extract_artifacts(text, agent=agent)
         svc.append_message(
-            project, paper_id, chat_id, "assistant", cleaned,
+            project, chat_id, "assistant", cleaned,
             agent=agent, artifacts=artifacts if artifacts else None,
         )
 
 
 # ---------------------------------------------------------------------------
-# Orchestration threads (one per mode)
+# Orchestration
 # ---------------------------------------------------------------------------
 
 def _orchestrate_single(
-    svc: ChatService, project: str, paper_id: str, chat_id: str,
-    agent: str, task: BackgroundTask,
+    svc: GeneralChatService, project: str, chat_id: str,
+    agent: str, task: BackgroundTask, image_paths: list[str] | None = None,
 ) -> None:
     try:
-        prompt = svc.build_prompt(project, paper_id, chat_id)
+        prompt = svc.build_prompt(project, chat_id)
         cancel_event = threading.Event()
         task.cancel_events.append(cancel_event)
-        _run_agent_to_task(agent, prompt, SYSTEM_PROMPT, task, cancel_event)
-        _save_agent_result(svc, project, paper_id, chat_id, agent, task)
+        _run_agent_to_task(agent, prompt, SYSTEM_PROMPT, task, cancel_event, image_paths=image_paths)
+        _save_agent_result(svc, project, chat_id, agent, task)
     except Exception as exc:
         task.push_event({"type": "error", "error": str(exc)})
     finally:
         task.push_event({"type": "end"})
         task.mark_done()
-        _remove_task(project, paper_id, chat_id)
+        _remove_task(project, chat_id)
 
 
 def _orchestrate_parallel(
-    svc: ChatService, project: str, paper_id: str, chat_id: str,
-    agents: list[str], task: BackgroundTask,
+    svc: GeneralChatService, project: str, chat_id: str,
+    agents: list[str], task: BackgroundTask, image_paths: list[str] | None = None,
 ) -> None:
     try:
-        prompt = svc.build_prompt(project, paper_id, chat_id)
+        prompt = svc.build_prompt(project, chat_id)
         threads = []
         for agent in agents:
             cancel_event = threading.Event()
@@ -296,6 +331,7 @@ def _orchestrate_parallel(
             t = threading.Thread(
                 target=_run_agent_to_task,
                 args=(agent, prompt, SYSTEM_PROMPT, task, cancel_event),
+                kwargs={"image_paths": image_paths},
                 daemon=True,
             )
             t.start()
@@ -303,50 +339,49 @@ def _orchestrate_parallel(
         for t in threads:
             t.join()
         for agent in agents:
-            _save_agent_result(svc, project, paper_id, chat_id, agent, task)
+            _save_agent_result(svc, project, chat_id, agent, task)
     except Exception as exc:
         task.push_event({"type": "error", "error": str(exc)})
     finally:
         task.push_event({"type": "end"})
         task.mark_done()
-        _remove_task(project, paper_id, chat_id)
+        _remove_task(project, chat_id)
 
 
 def _orchestrate_round_robin(
-    svc: ChatService, project: str, paper_id: str, chat_id: str,
-    agents: list[str], task: BackgroundTask,
+    svc: GeneralChatService, project: str, chat_id: str,
+    agents: list[str], task: BackgroundTask, image_paths: list[str] | None = None,
 ) -> None:
     try:
-        # First agent
         first = agents[0]
-        prompt = svc.build_prompt(project, paper_id, chat_id)
+        prompt = svc.build_prompt(project, chat_id)
         cancel_event = threading.Event()
         task.cancel_events.append(cancel_event)
-        _run_agent_to_task(first, prompt, SYSTEM_PROMPT, task, cancel_event)
-        _save_agent_result(svc, project, paper_id, chat_id, first, task)
+        _run_agent_to_task(first, prompt, SYSTEM_PROMPT, task, cancel_event, image_paths=image_paths)
+        _save_agent_result(svc, project, chat_id, first, task)
 
         first_text = _get_agent_text(task, first)
         if len(agents) > 1 and first_text:
             second = agents[1]
-            prompt2 = svc.build_prompt(project, paper_id, chat_id)
+            prompt2 = svc.build_prompt(project, chat_id)
             cancel_event2 = threading.Event()
             task.cancel_events.append(cancel_event2)
+            # Don't re-send images for the second agent in round robin
             _run_agent_to_task(second, prompt2, SYSTEM_PROMPT, task, cancel_event2)
-            _save_agent_result(svc, project, paper_id, chat_id, second, task)
+            _save_agent_result(svc, project, chat_id, second, task)
     except Exception as exc:
         task.push_event({"type": "error", "error": str(exc)})
     finally:
         task.push_event({"type": "end"})
         task.mark_done()
-        _remove_task(project, paper_id, chat_id)
+        _remove_task(project, chat_id)
 
 
 # ---------------------------------------------------------------------------
-# SSE stream from task
+# SSE
 # ---------------------------------------------------------------------------
 
 async def _stream_from_task(task: BackgroundTask) -> AsyncGenerator[str, None]:
-    """Read events from a BackgroundTask and yield as SSE."""
     cursor = 0
     while True:
         events, done = task.snapshot()
@@ -363,69 +398,76 @@ async def _stream_from_task(task: BackgroundTask) -> AsyncGenerator[str, None]:
         await asyncio.sleep(0.5)
 
 
-# ---------------------------------------------------------------------------
-# SSE endpoints
-# ---------------------------------------------------------------------------
-
-@router.post("/api/projects/{project}/papers/{paper_id}/chats/{chat_id}/ask")
-async def ask(project: str, paper_id: str, chat_id: str, body: AskRequest):
+@router.post("/api/projects/{project}/chats/{chat_id}/ask")
+async def ask(project: str, chat_id: str, body: GeneralAskRequest):
     svc = _svc()
     try:
-        chat = svc.get_chat(project, paper_id, chat_id)
+        chat = svc.get_chat(project, chat_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    # Save user message first
-    svc.append_message(project, paper_id, chat_id, "user", body.content)
+    # Resolve attachments
+    attachments: list[Attachment] = []
+    if body.attachment_ids:
+        attachments = svc.resolve_attachment_ids(project, chat_id, body.attachment_ids)
+        found_ids = {att.id for att in attachments}
+        missing_ids = [att_id for att_id in body.attachment_ids if att_id not in found_ids]
+        if missing_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Attachment not found for chat: {', '.join(missing_ids)}",
+            )
+
+    svc.append_message(project, chat_id, "user", body.content, attachments=attachments)
+
+    # Collect image paths from the current message's attachments
+    image_paths = [a.path for a in attachments if a.kind == "image"]
 
     mode = chat.mode
     first = chat.first_agent
     second = "codex" if first == "claude" else "claude"
 
-    # Create background task
     task = BackgroundTask()
-    _set_task(project, paper_id, chat_id, task)
+    _set_task(project, chat_id, task)
 
-    # Pick orchestration function
     if mode == ChatMode.SINGLE:
         target = _orchestrate_single
-        args = (svc, project, paper_id, chat_id, first, task)
+        args = (svc, project, chat_id, first, task)
+        kwargs = {"image_paths": image_paths}
     elif mode == ChatMode.PARALLEL:
         target = _orchestrate_parallel
-        args = (svc, project, paper_id, chat_id, [first, second], task)
-    else:  # round_robin
+        args = (svc, project, chat_id, [first, second], task)
+        kwargs = {"image_paths": image_paths}
+    else:
         target = _orchestrate_round_robin
-        args = (svc, project, paper_id, chat_id, [first, second], task)
+        args = (svc, project, chat_id, [first, second], task)
+        kwargs = {"image_paths": image_paths}
 
-    # Start orchestration in background thread
-    threading.Thread(target=target, args=args, daemon=True).start()
+    threading.Thread(target=target, args=args, kwargs=kwargs, daemon=True).start()
 
     return StreamingResponse(_stream_from_task(task), media_type="text/event-stream")
 
 
-@router.get("/api/projects/{project}/papers/{paper_id}/chats/{chat_id}/active-task")
-def get_active_task(project: str, paper_id: str, chat_id: str):
-    """Check if there is an active (running) task for this chat."""
-    task = _get_task(project, paper_id, chat_id)
+@router.get("/api/projects/{project}/chats/{chat_id}/active-task")
+def get_active_task(project: str, chat_id: str):
+    task = _get_task(project, chat_id)
     if not task or task.done:
         return {"active": False}
     events, _done = task.snapshot()
     return {"active": True, "event_count": len(events)}
 
 
-@router.get("/api/projects/{project}/papers/{paper_id}/chats/{chat_id}/active-task/stream")
-async def stream_active_task(project: str, paper_id: str, chat_id: str):
-    """Reconnect to an in-progress task's SSE stream."""
-    task = _get_task(project, paper_id, chat_id)
+@router.get("/api/projects/{project}/chats/{chat_id}/active-task/stream")
+async def stream_active_task(project: str, chat_id: str):
+    task = _get_task(project, chat_id)
     if not task or task.done:
         raise HTTPException(status_code=404, detail="No active task")
     return StreamingResponse(_stream_from_task(task), media_type="text/event-stream")
 
 
-@router.post("/api/projects/{project}/papers/{paper_id}/chats/{chat_id}/stop")
-def stop_task(project: str, paper_id: str, chat_id: str):
-    """Explicitly cancel the running task."""
-    task = _get_task(project, paper_id, chat_id)
+@router.post("/api/projects/{project}/chats/{chat_id}/stop")
+def stop_task(project: str, chat_id: str):
+    task = _get_task(project, chat_id)
     if task and not task.done:
         task.cancel()
         return {"stopped": True}
