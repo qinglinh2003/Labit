@@ -27,12 +27,13 @@ import TodoPage from "./todo/TodoPage";
 import ChatPage from "./chat/ChatPage";
 import DocsPage from "./docs/DocsPage";
 import CodePage from "./code/CodePage";
+import ComputePage from "./compute/ComputePage";
 import {
   IconBook, IconPaper, IconCheckSquare, IconFlask, IconTerminal, IconCapture,
-  IconRefresh, IconCloud, IconChevronDown, IconChat, IconFileText, IconCode,
+  IconRefresh, IconCloud, IconChevronDown, IconChat, IconFileText, IconCode, IconCompute,
 } from "./todo/icons";
 
-type ModuleTab = "papers" | "docs" | "code" | "todos" | "chat";
+type ModuleTab = "papers" | "docs" | "code" | "todos" | "chat" | "compute";
 
 interface UiState {
   project: string;
@@ -67,6 +68,7 @@ const NAV_TABS: { id: ModuleTab; label: string; Icon: React.ComponentType<any> }
   { id: "code", label: "Code", Icon: IconCode },
   { id: "chat", label: "Chat", Icon: IconChat },
   { id: "todos", label: "Todos", Icon: IconCheckSquare },
+  { id: "compute", label: "Compute", Icon: IconCompute },
 ];
 
 export function App() {
@@ -159,6 +161,8 @@ export function App() {
         <CodePage project={project} />
       ) : activeTab === "docs" ? (
         <DocsPage project={project} />
+      ) : activeTab === "compute" ? (
+        <ComputePage project={project} />
       ) : activeTab === "todos" ? (
         <TodoPage project={project} />
       ) : (

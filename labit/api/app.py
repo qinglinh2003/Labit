@@ -15,6 +15,8 @@ from labit.api.chat_routes import mount_chat_routes
 from labit.api.chat_service import ChatService
 from labit.api.code_routes import mount_code_routes
 from labit.api.code_service import CodeService
+from labit.api.compute_routes import mount_compute_routes
+from labit.services.compute_service import ComputeService
 from labit.api.doc_routes import mount_doc_routes
 from labit.api.doc_service import DocService
 from labit.api.general_chat_routes import mount_general_chat_routes
@@ -291,6 +293,9 @@ def create_app(paths: RepoPaths | None = None) -> FastAPI:
 
     code_service = CodeService(project_service=project_service)
     app.include_router(mount_code_routes(code_service))
+
+    compute_service = ComputeService(repo_paths, project_service=project_service)
+    app.include_router(mount_compute_routes(compute_service))
 
     _mount_frontend(app, _frontend_dist_dir())
     return app
