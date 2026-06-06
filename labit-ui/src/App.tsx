@@ -25,12 +25,13 @@ import ChatList from "./components/ChatList";
 import ChatPanel from "./components/ChatPanel";
 import TodoPage from "./todo/TodoPage";
 import ChatPage from "./chat/ChatPage";
+import DocsPage from "./docs/DocsPage";
 import {
   IconBook, IconPaper, IconCheckSquare, IconFlask, IconTerminal, IconCapture,
-  IconRefresh, IconCloud, IconChevronDown, IconChat,
+  IconRefresh, IconCloud, IconChevronDown, IconChat, IconFileText,
 } from "./todo/icons";
 
-type ModuleTab = "papers" | "todos" | "chat";
+type ModuleTab = "papers" | "docs" | "todos" | "chat";
 
 interface UiState {
   project: string;
@@ -61,6 +62,7 @@ const useUiStore = create<UiState>()(
 
 const NAV_TABS: { id: ModuleTab; label: string; Icon: React.ComponentType<any> }[] = [
   { id: "papers", label: "Papers", Icon: IconPaper },
+  { id: "docs", label: "Docs", Icon: IconFileText },
   { id: "chat", label: "Chat", Icon: IconChat },
   { id: "todos", label: "Todos", Icon: IconCheckSquare },
 ];
@@ -151,6 +153,8 @@ export function App() {
       {/* Module content */}
       {activeTab === "chat" ? (
         <ChatPage project={project} activeChatId={chatActiveChatId} onActiveChatIdChange={setChatActiveChatId} />
+      ) : activeTab === "docs" ? (
+        <DocsPage project={project} />
       ) : activeTab === "todos" ? (
         <TodoPage project={project} />
       ) : (
