@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, ClipboardCopy, Download, FileText, ImagePlus, MessageSquarePlus, Plus, Send, Square, Trash2, User, X } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, ClipboardCopy, Download, FilePlus2, FileText, ImagePlus, MessageSquarePlus, Plus, Send, Square, Trash2, User, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -26,6 +26,7 @@ import {
   type ChatRecord,
   type SSEEvent,
 } from "./api";
+import { createDoc } from "../docs/api";
 import { ClaudeIcon, CodexIcon } from "../components/AgentIcons";
 
 // ---------------------------------------------------------------------------
@@ -180,12 +181,30 @@ function MessageImages({ message, project, chatId }: { message: ChatMessage; pro
 function ArtifactCard({ artifact, project, chatId }: { artifact: ChatArtifact; project: string; chatId: string }) {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
 
   const handleCopy = () => {
     void navigator.clipboard.writeText(artifact.content).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     });
+  };
+
+  const handleSaveAsDoc = async () => {
+    const filename = prompt("Save as document:", artifact.filename);
+    if (!filename) return;
+    setSaving(true);
+    try {
+      await createDoc(project, filename, artifact.content);
+      setSaved(true);
+      setTimeout(() => setSaved(false), 3000);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      alert(`Failed to save: ${msg}`);
+    } finally {
+      setSaving(false);
+    }
   };
 
   const downloadUrl = artifactDownloadUrl(project, chatId, artifact.id);
@@ -207,6 +226,15 @@ function ArtifactCard({ artifact, project, chatId }: { artifact: ChatArtifact; p
             title={copied ? "Copied!" : "Copy content"}
           >
             <ClipboardCopy size={13} />
+          </button>
+          <button
+            type="button"
+            className="flex h-7 w-7 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 hover:text-emerald-600 transition-colors"
+            onClick={handleSaveAsDoc}
+            disabled={saving}
+            title={saved ? "Saved to docs!" : "Save as Doc"}
+          >
+            {saved ? <Check size={13} className="text-emerald-500" /> : <FilePlus2 size={13} />}
           </button>
           <a
             href={downloadUrl}

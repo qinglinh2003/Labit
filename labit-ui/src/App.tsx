@@ -26,12 +26,13 @@ import ChatPanel from "./components/ChatPanel";
 import TodoPage from "./todo/TodoPage";
 import ChatPage from "./chat/ChatPage";
 import DocsPage from "./docs/DocsPage";
+import CodePage from "./code/CodePage";
 import {
   IconBook, IconPaper, IconCheckSquare, IconFlask, IconTerminal, IconCapture,
-  IconRefresh, IconCloud, IconChevronDown, IconChat, IconFileText,
+  IconRefresh, IconCloud, IconChevronDown, IconChat, IconFileText, IconCode,
 } from "./todo/icons";
 
-type ModuleTab = "papers" | "docs" | "todos" | "chat";
+type ModuleTab = "papers" | "docs" | "code" | "todos" | "chat";
 
 interface UiState {
   project: string;
@@ -63,6 +64,7 @@ const useUiStore = create<UiState>()(
 const NAV_TABS: { id: ModuleTab; label: string; Icon: React.ComponentType<any> }[] = [
   { id: "papers", label: "Papers", Icon: IconPaper },
   { id: "docs", label: "Docs", Icon: IconFileText },
+  { id: "code", label: "Code", Icon: IconCode },
   { id: "chat", label: "Chat", Icon: IconChat },
   { id: "todos", label: "Todos", Icon: IconCheckSquare },
 ];
@@ -153,6 +155,8 @@ export function App() {
       {/* Module content */}
       {activeTab === "chat" ? (
         <ChatPage project={project} activeChatId={chatActiveChatId} onActiveChatIdChange={setChatActiveChatId} />
+      ) : activeTab === "code" ? (
+        <CodePage project={project} />
       ) : activeTab === "docs" ? (
         <DocsPage project={project} />
       ) : activeTab === "todos" ? (

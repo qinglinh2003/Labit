@@ -241,11 +241,13 @@ def _run_agent_to_task(
     task: BackgroundTask,
     cancel_event: threading.Event,
     image_paths: list[str] | None = None,
+    *,
+    cwd: str | None = None,
 ) -> None:
     adapter = _get_adapter(agent)
     allowed_tools: list[str] = []
     if agent == "claude":
-        allowed_tools = ["WebSearch", "WebFetch"]
+        allowed_tools = ["Read", "Grep", "Glob", "WebSearch", "WebFetch"]
 
     request = AgentRequest(
         role=AgentRole.DISCUSSANT,
@@ -254,6 +256,7 @@ def _run_agent_to_task(
         timeout_seconds=120,
         allowed_tools=allowed_tools,
         image_paths=image_paths or [],
+        cwd=cwd,
     )
 
     collected: list[str] = []
@@ -315,9 +318,10 @@ def _orchestrate_single(
 ) -> None:
     try:
         prompt = svc.build_prompt(project, chat_id)
+        project_cwd = svc.get_project_dir(project)
         cancel_event = threading.Event()
         task.cancel_events.append(cancel_event)
-        _run_agent_to_task(agent, prompt, SYSTEM_PROMPT, task, cancel_event, image_paths=image_paths)
+        _run_agent_to_task(agent, prompt, SYSTEM_PROMPT, task, cancel_event, image_paths=image_paths, cwd=project_cwd)
         _save_agent_result(svc, project, chat_id, agent, task)
     except Exception as exc:
         task.push_event({"type": "error", "error": str(exc)})
@@ -333,6 +337,7 @@ def _orchestrate_parallel(
 ) -> None:
     try:
         prompt = svc.build_prompt(project, chat_id)
+        project_cwd = svc.get_project_dir(project)
         threads = []
         for agent in agents:
             cancel_event = threading.Event()
@@ -340,7 +345,7 @@ def _orchestrate_parallel(
             t = threading.Thread(
                 target=_run_agent_to_task,
                 args=(agent, prompt, SYSTEM_PROMPT, task, cancel_event),
-                kwargs={"image_paths": image_paths},
+                kwargs={"image_paths": image_paths, "cwd": project_cwd},
                 daemon=True,
             )
             t.start()
@@ -364,9 +369,10 @@ def _orchestrate_round_robin(
     try:
         first = agents[0]
         prompt = svc.build_prompt(project, chat_id)
+        project_cwd = svc.get_project_dir(project)
         cancel_event = threading.Event()
         task.cancel_events.append(cancel_event)
-        _run_agent_to_task(first, prompt, SYSTEM_PROMPT, task, cancel_event, image_paths=image_paths)
+        _run_agent_to_task(first, prompt, SYSTEM_PROMPT, task, cancel_event, image_paths=image_paths, cwd=project_cwd)
         _save_agent_result(svc, project, chat_id, first, task)
 
         first_text = _get_agent_text(task, first)
@@ -376,7 +382,7 @@ def _orchestrate_round_robin(
             cancel_event2 = threading.Event()
             task.cancel_events.append(cancel_event2)
             # Don't re-send images for the second agent in round robin
-            _run_agent_to_task(second, prompt2, SYSTEM_PROMPT, task, cancel_event2)
+            _run_agent_to_task(second, prompt2, SYSTEM_PROMPT, task, cancel_event2, cwd=project_cwd)
             _save_agent_result(svc, project, chat_id, second, task)
     except Exception as exc:
         task.push_event({"type": "error", "error": str(exc)})

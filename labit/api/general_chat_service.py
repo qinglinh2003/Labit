@@ -41,11 +41,14 @@ def _ext_to_mime(ext: str) -> str:
     }.get(ext.lower(), "application/octet-stream")
 
 
+from labit.api.shared_prompts import PROJECT_FILES_CONTEXT
+
 SYSTEM_PROMPT = (
     "You are a helpful research assistant in the Labit workspace. "
     "Assist the user with their research questions, analysis, writing, "
-    "and development tasks. Be concise and specific.\n\n"
-    "# ARTIFACT OUTPUT FORMAT (MANDATORY)\n\n"
+    "and development tasks. Be concise and specific.\n"
+    + PROJECT_FILES_CONTEXT +
+    "\n# ARTIFACT OUTPUT FORMAT (MANDATORY)\n\n"
     "When the user asks you to write, draft, create, or generate a standalone "
     "document, report, proposal, code file, script, configuration, or any "
     "content that is meant to be saved, downloaded, or used as a file, you "
@@ -484,6 +487,10 @@ class GeneralChatService:
                 if art.id == artifact_id:
                     return art
         return None
+
+    def get_project_dir(self, project: str) -> str:
+        """Return the resolved project directory path (for subprocess cwd)."""
+        return str(self.project_service.project_dir(project).resolve())
 
     def chat_dir(self, project: str, chat_id: str) -> Path:
         """Return the per-chat directory: chats/{chat_id}/."""

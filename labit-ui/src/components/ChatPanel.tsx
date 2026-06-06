@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, Copy, Download, Send, Square, User } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, Copy, Download, FilePlus2, Send, Square, User } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -7,6 +7,7 @@ import rehypeKatex from "rehype-katex";
 import "katex/dist/katex.min.css";
 import type { ChatArtifact, ChatMessage, ChatMode, ChatRecord, SSEEvent } from "../api/chat";
 import { artifactDownloadUrl, askStream, getActiveTask, getChat, reconnectStream, stopTask, updateChat } from "../api/chat";
+import { createDoc } from "../docs/api";
 import { ClaudeIcon, CodexIcon } from "./AgentIcons";
 import ModeSwapBar from "./ModeSwapBar";
 
@@ -341,18 +342,38 @@ export default function ChatPanel({
 function ArtifactCard({
   artifact,
   downloadUrl,
+  project,
 }: {
   artifact: ChatArtifact;
   downloadUrl: string;
+  project: string;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
   const lines = artifact.content.split("\n").length;
 
   const handleCopy = () => {
     navigator.clipboard.writeText(artifact.content);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleSaveAsDoc = async () => {
+    const filename = prompt("Save as document:", artifact.filename);
+    if (!filename) return;
+    setSaving(true);
+    try {
+      await createDoc(project, filename, artifact.content);
+      setSaved(true);
+      setTimeout(() => setSaved(false), 3000);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      alert(`Failed to save: ${msg}`);
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -378,6 +399,14 @@ function ArtifactCard({
             <Copy size={13} />
           </button>
           {copied && <span className="text-[10px] text-green-600">Copied</span>}
+          <button
+            onClick={handleSaveAsDoc}
+            disabled={saving}
+            className="p-1 rounded hover:bg-slate-200 text-slate-400 hover:text-emerald-600 transition-colors disabled:opacity-50"
+            title={saved ? "Saved to docs!" : "Save as Doc"}
+          >
+            {saved ? <Check size={13} className="text-emerald-500" /> : <FilePlus2 size={13} />}
+          </button>
           <a
             href={downloadUrl}
             download={artifact.filename}
@@ -438,6 +467,7 @@ function MessageBubble({ message, project, paperId, chatId }: { message: ChatMes
                 key={art.id}
                 artifact={art}
                 downloadUrl={artifactDownloadUrl(project, paperId, chatId, art.id)}
+                project={project}
               />
             ))}
           </div>

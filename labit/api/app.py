@@ -13,6 +13,8 @@ from pydantic import BaseModel, ValidationError
 
 from labit.api.chat_routes import mount_chat_routes
 from labit.api.chat_service import ChatService
+from labit.api.code_routes import mount_code_routes
+from labit.api.code_service import CodeService
 from labit.api.doc_routes import mount_doc_routes
 from labit.api.doc_service import DocService
 from labit.api.general_chat_routes import mount_general_chat_routes
@@ -286,6 +288,9 @@ def create_app(paths: RepoPaths | None = None) -> FastAPI:
 
     doc_service = DocService(project_service=project_service)
     app.include_router(mount_doc_routes(doc_service))
+
+    code_service = CodeService(project_service=project_service)
+    app.include_router(mount_code_routes(code_service))
 
     _mount_frontend(app, _frontend_dist_dir())
     return app

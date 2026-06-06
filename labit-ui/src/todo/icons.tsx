@@ -34,4 +34,5 @@ export const IconCarry = make(<><path d="M3 12h13" /><path d="M11 6l6 6-6 6" /><
 export const IconX = make(<path d="M6 6l12 12M18 6L6 18" />);
 export const IconFileText = make(<><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" /><path d="M14 3v5h5" /><path d="M9 13h6M9 17h6M9 9h2" /></>);
 export const IconCloud = make(<><path d="M7 18a4 4 0 0 1 0-8 5 5 0 0 1 9.6-1.3A3.5 3.5 0 0 1 17.5 18z" /><path d="M9.5 14.5l2 2 3.5-3.5" /></>);
+export const IconCode = make(<><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 9l-3 3 3 3M15 9l3 3-3 3" /></>);
 export const IconDrag = make(<>{[6, 12, 18].flatMap((cy) => [9, 15].map((cx) => <circle key={`${cx}-${cy}`} cx={cx} cy={cy} r="1" fill="currentColor" stroke="none" />))}</>);
