@@ -21,6 +21,7 @@ class Artifact(BaseModel):
     language: str = ""
     mime_type: str = "text/plain"
     content: str  # the full artifact content
+    file_path: str | None = None  # relative path within chat dir, e.g. "artifacts/proposal.md"
 
 
 class GeneralChatMessage(BaseModel):

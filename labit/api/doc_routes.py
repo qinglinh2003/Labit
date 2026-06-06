@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from labit.api.artifact_storage import write_artifact_file
 from labit.api.downloads import attachment_content_disposition
 from labit.api.general_chat_service import extract_artifacts
 
@@ -299,6 +300,13 @@ def _save_agent_result(
     text = _get_agent_text(task, agent)
     if text:
         cleaned, artifacts = extract_artifacts(text, agent=agent)
+        if artifacts:
+            chat_dir = svc.doc_chat_dir(project, doc_id, chat_id)
+            for art in artifacts:
+                try:
+                    write_artifact_file(chat_dir, art)
+                except Exception:
+                    pass
         svc.append_message(
             project, doc_id, chat_id, "assistant", cleaned,
             agent=agent, artifacts=artifacts if artifacts else None,

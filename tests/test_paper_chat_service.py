@@ -156,7 +156,8 @@ def test_paper_chat_downloads_artifact_from_chat(tmp_path: Path) -> None:
         / "arxiv-2401.12345"
         / "artifacts"
         / "chats"
-        / f"{chat_id}.json"
+        / chat_id
+        / "chat.json"
     )
     chat_path.write_text(json.dumps(chat), encoding="utf-8")
 
@@ -175,6 +176,42 @@ def test_paper_chat_downloads_artifact_from_chat(tmp_path: Path) -> None:
         f"/api/projects/Labit/papers/arxiv:2401.12345/chats/{chat_id}/artifacts/missing/download"
     )
     assert missing_response.status_code == 404
+
+
+def test_paper_chat_delete_removes_new_and_legacy_records(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    _write_paper(paths)
+    client = TestClient(create_app(paths))
+
+    create_response = client.post(
+        "/api/projects/Labit/papers/arxiv:2401.12345/chats",
+        json={"mode": "single"},
+    )
+    assert create_response.status_code == 200
+    chat = create_response.json()
+    chat_id = chat["chat_id"]
+
+    chats_dir = (
+        paths.vault_projects_dir
+        / "Labit"
+        / "papers"
+        / "arxiv-2401.12345"
+        / "artifacts"
+        / "chats"
+    )
+    legacy_path = chats_dir / f"{chat_id}.json"
+    legacy_path.write_text(json.dumps(chat), encoding="utf-8")
+
+    delete_response = client.delete(
+        f"/api/projects/Labit/papers/arxiv:2401.12345/chats/{chat_id}"
+    )
+
+    assert delete_response.status_code == 200
+    assert not (chats_dir / chat_id).exists()
+    assert not legacy_path.exists()
+    list_response = client.get("/api/projects/Labit/papers/arxiv:2401.12345/chats")
+    assert list_response.status_code == 200
+    assert list_response.json() == []
 
 
 def test_chat_request_rejects_unknown_first_agent() -> None:

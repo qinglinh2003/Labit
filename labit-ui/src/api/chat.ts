@@ -9,6 +9,7 @@ export interface ChatArtifact {
   language: string;
   mime_type: string;
   content: string;
+  file_path: string | null;
 }
 
 export interface ChatMessage {

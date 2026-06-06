@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import yaml
@@ -81,3 +82,30 @@ def test_invalid_doc_id_returns_404_for_doc_chat_routes(tmp_path: Path) -> None:
 
     assert response.status_code == 404
     assert "Invalid doc_id" in response.json()["detail"]
+
+
+def test_doc_chat_delete_removes_new_and_legacy_records(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    docs_dir = paths.vault_projects_dir / "Labit" / "docs"
+    (docs_dir / "ideas").mkdir()
+    (docs_dir / "ideas" / "test.md").write_text("# Test\n", encoding="utf-8")
+
+    client = TestClient(create_app(paths))
+    doc_id = encode_doc_id("ideas/test.md")
+    create_response = client.post(f"/api/projects/Labit/docs/{doc_id}/chats", json={})
+    assert create_response.status_code == 200
+    chat = create_response.json()
+    chat_id = chat["chat_id"]
+
+    chats_dir = docs_dir / ".chats" / doc_id
+    legacy_path = chats_dir / f"{chat_id}.json"
+    legacy_path.write_text(json.dumps(chat), encoding="utf-8")
+
+    delete_response = client.delete(f"/api/projects/Labit/docs/{doc_id}/chats/{chat_id}")
+
+    assert delete_response.status_code == 200
+    assert not (chats_dir / chat_id).exists()
+    assert not legacy_path.exists()
+    list_response = client.get(f"/api/projects/Labit/docs/{doc_id}/chats")
+    assert list_response.status_code == 200
+    assert list_response.json() == []

@@ -204,24 +204,42 @@ class DocService:
         if not chats_dir.exists():
             return []
         items: list[DocChatListItem] = []
-        for path in sorted(chats_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        seen_ids: set[str] = set()
+
+        # New format: {chat_id}/chat.json
+        for chat_json in chats_dir.glob("*/chat.json"):
             try:
-                record = DocChatRecord.model_validate_json(path.read_text(encoding="utf-8"))
+                record = DocChatRecord.model_validate_json(chat_json.read_text(encoding="utf-8"))
+                seen_ids.add(record.chat_id)
                 items.append(DocChatListItem(
-                    chat_id=record.chat_id,
-                    title=record.title,
-                    mode=record.mode,
-                    first_agent=record.first_agent,
-                    updated_at=record.updated_at,
-                    message_count=len(record.messages),
+                    chat_id=record.chat_id, title=record.title,
+                    mode=record.mode, first_agent=record.first_agent,
+                    updated_at=record.updated_at, message_count=len(record.messages),
                 ))
             except Exception:
                 continue
+
+        # Old format fallback
+        for path in chats_dir.glob("*.json"):
+            try:
+                record = DocChatRecord.model_validate_json(path.read_text(encoding="utf-8"))
+                if record.chat_id in seen_ids:
+                    continue
+                seen_ids.add(record.chat_id)
+                items.append(DocChatListItem(
+                    chat_id=record.chat_id, title=record.title,
+                    mode=record.mode, first_agent=record.first_agent,
+                    updated_at=record.updated_at, message_count=len(record.messages),
+                ))
+            except Exception:
+                continue
+
+        items.sort(key=lambda x: x.updated_at, reverse=True)
         return items
 
     def get_chat(self, project: str, doc_id: str, chat_id: str) -> DocChatRecord:
         self.get_doc(project, doc_id)
-        path = self._doc_chats_dir(project, doc_id) / f"{chat_id}.json"
+        path = self._doc_chat_path(project, doc_id, chat_id)
         if not path.exists():
             raise FileNotFoundError(f"Chat '{chat_id}' not found.")
         return DocChatRecord.model_validate_json(path.read_text(encoding="utf-8"))
@@ -245,9 +263,12 @@ class DocService:
 
     def delete_chat(self, project: str, doc_id: str, chat_id: str) -> None:
         self.get_doc(project, doc_id)
-        path = self._doc_chats_dir(project, doc_id) / f"{chat_id}.json"
-        if path.exists():
-            path.unlink()
+        chat_dir = self.doc_chat_dir(project, doc_id, chat_id)
+        if chat_dir.exists() and chat_dir.is_dir():
+            shutil.rmtree(chat_dir)
+        old_path = self._doc_chats_dir(project, doc_id) / f"{chat_id}.json"
+        if old_path.exists():
+            old_path.unlink()
 
     def append_message(
         self, project: str, doc_id: str, chat_id: str,
@@ -346,6 +367,10 @@ class DocService:
     def _docs_dir(self, project: str) -> Path:
         return self.project_service.project_dir(project) / "docs"
 
+    def doc_chat_dir(self, project: str, doc_id: str, chat_id: str) -> Path:
+        """Return the per-chat directory for a doc chat."""
+        return self._doc_chats_dir(project, doc_id) / chat_id
+
     def _doc_chats_dir(self, project: str, doc_id: str) -> Path:
         return self._docs_dir(project) / ".chats" / doc_id
 
@@ -428,7 +453,18 @@ class DocService:
         history_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, history_dir / f"{ts}_{path.name}")
 
+    def _doc_chat_path(self, project: str, doc_id: str, chat_id: str) -> Path:
+        # New format: {chat_id}/chat.json
+        new_path = self._doc_chats_dir(project, doc_id) / chat_id / "chat.json"
+        if new_path.exists():
+            return new_path
+        old_path = self._doc_chats_dir(project, doc_id) / f"{chat_id}.json"
+        if old_path.exists():
+            return old_path
+        return new_path
+
     def _save_chat(self, chats_dir: Path, record: DocChatRecord) -> None:
-        chats_dir.mkdir(parents=True, exist_ok=True)
-        path = chats_dir / f"{record.chat_id}.json"
+        chat_dir = chats_dir / record.chat_id
+        chat_dir.mkdir(parents=True, exist_ok=True)
+        path = chat_dir / "chat.json"
         path.write_text(record.model_dump_json(indent=2), encoding="utf-8")

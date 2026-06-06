@@ -31,6 +31,7 @@ from labit.api.general_chat_service import (
     GeneralChatService,
     extract_artifacts,
 )
+from labit.api.artifact_storage import write_artifact_file
 from labit.api.downloads import attachment_content_disposition
 
 router = APIRouter()
@@ -290,6 +291,14 @@ def _save_agent_result(
     text = _get_agent_text(task, agent)
     if text:
         cleaned, artifacts = extract_artifacts(text, agent=agent)
+        # Write artifact files to chat directory
+        if artifacts:
+            chat_dir = svc.chat_dir(project, chat_id)
+            for art in artifacts:
+                try:
+                    write_artifact_file(chat_dir, art)
+                except Exception:
+                    pass  # file write failure shouldn't block message save
         svc.append_message(
             project, chat_id, "assistant", cleaned,
             agent=agent, artifacts=artifacts if artifacts else None,

@@ -231,9 +231,13 @@ class GeneralChatService:
         if not chats_dir.exists():
             return []
         items: list[GeneralChatListItem] = []
-        for path in sorted(chats_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        seen_ids: set[str] = set()
+
+        # New format: chats/{chat_id}/chat.json
+        for chat_json in chats_dir.glob("*/chat.json"):
             try:
-                record = GeneralChatRecord.model_validate_json(path.read_text(encoding="utf-8"))
+                record = GeneralChatRecord.model_validate_json(chat_json.read_text(encoding="utf-8"))
+                seen_ids.add(record.chat_id)
                 items.append(
                     GeneralChatListItem(
                         chat_id=record.chat_id,
@@ -246,6 +250,28 @@ class GeneralChatService:
                 )
             except Exception:
                 continue
+
+        # Old format: chats/{chat_id}.json (backward compat)
+        for path in chats_dir.glob("*.json"):
+            try:
+                record = GeneralChatRecord.model_validate_json(path.read_text(encoding="utf-8"))
+                if record.chat_id in seen_ids:
+                    continue
+                seen_ids.add(record.chat_id)
+                items.append(
+                    GeneralChatListItem(
+                        chat_id=record.chat_id,
+                        title=record.title,
+                        mode=record.mode,
+                        first_agent=record.first_agent,
+                        updated_at=record.updated_at,
+                        message_count=len(record.messages),
+                    )
+                )
+            except Exception:
+                continue
+
+        items.sort(key=lambda x: x.updated_at, reverse=True)
         return items
 
     def get_chat(self, project: str, chat_id: str) -> GeneralChatRecord:
@@ -275,9 +301,27 @@ class GeneralChatService:
         return record
 
     def delete_chat(self, project: str, chat_id: str) -> None:
-        path = self._chat_path(project, chat_id)
-        if path.exists():
-            path.unlink()
+        import shutil
+
+        removed = False
+        # Remove new directory format.
+        chat_dir = self.chat_dir(project, chat_id)
+        if chat_dir.exists() and chat_dir.is_dir():
+            shutil.rmtree(chat_dir)
+            removed = True
+        # Also remove old single-file format. This matters after an old chat has
+        # been read and re-saved in the new directory format.
+        old_path = self._chats_dir(project) / f"{chat_id}.json"
+        if old_path.exists():
+            old_path.unlink()
+            removed = True
+        # Also clean up old attachments dir
+        old_att = self._chats_dir(project) / f"{chat_id}_attachments"
+        if old_att.exists():
+            shutil.rmtree(old_att)
+            removed = True
+        if not removed:
+            return
 
     def append_message(
         self,
@@ -441,19 +485,43 @@ class GeneralChatService:
                     return art
         return None
 
+    def chat_dir(self, project: str, chat_id: str) -> Path:
+        """Return the per-chat directory: chats/{chat_id}/."""
+        return self._chats_dir(project) / chat_id
+
     def _chats_dir(self, project: str) -> Path:
         project_dir = self.project_service.project_dir(project)
         return project_dir / "chats"
 
     def _chat_path(self, project: str, chat_id: str) -> Path:
-        return self._chats_dir(project) / f"{chat_id}.json"
+        # New format: chats/{chat_id}/chat.json
+        new_path = self._chats_dir(project) / chat_id / "chat.json"
+        if new_path.exists():
+            return new_path
+        # Fallback to old format: chats/{chat_id}.json
+        old_path = self._chats_dir(project) / f"{chat_id}.json"
+        if old_path.exists():
+            return old_path
+        # Default to new format for new chats
+        return new_path
 
     def _attachments_dir(self, project: str, chat_id: str) -> Path:
-        return self._chats_dir(project) / f"{chat_id}_attachments"
+        # New format: chats/{chat_id}/attachments/
+        new_dir = self._chats_dir(project) / chat_id / "attachments"
+        if new_dir.exists():
+            return new_dir
+        # Fallback to old format
+        old_dir = self._chats_dir(project) / f"{chat_id}_attachments"
+        if old_dir.exists():
+            return old_dir
+        # Default to new format
+        return new_dir
 
     def _save_chat(self, chats_dir: Path, record: GeneralChatRecord) -> None:
-        chats_dir.mkdir(parents=True, exist_ok=True)
-        path = chats_dir / f"{record.chat_id}.json"
+        # Always save in new directory format: chats/{chat_id}/chat.json
+        chat_dir = chats_dir / record.chat_id
+        chat_dir.mkdir(parents=True, exist_ok=True)
+        path = chat_dir / "chat.json"
         path.write_text(
             record.model_dump_json(indent=2),
             encoding="utf-8",

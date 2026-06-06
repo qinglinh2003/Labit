@@ -184,7 +184,7 @@ def test_general_chat_downloads_artifact_from_chat(tmp_path: Path) -> None:
             "created_at": "2026-06-06T00:00:00+00:00",
         }
     )
-    chat_path = paths.vault_projects_dir / "Labit" / "chats" / f"{chat_id}.json"
+    chat_path = paths.vault_projects_dir / "Labit" / "chats" / chat_id / "chat.json"
     chat_path.write_text(json.dumps(chat), encoding="utf-8")
 
     response = client.get(f"/api/projects/Labit/chats/{chat_id}/artifacts/art_test/download")
@@ -205,3 +205,29 @@ def test_general_chat_downloads_artifact_from_chat(tmp_path: Path) -> None:
         "/api/projects/Labit/chats/missing/artifacts/art_test/download"
     )
     assert missing_chat_response.status_code == 404
+
+
+def test_general_chat_delete_removes_new_and_legacy_records(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    client = TestClient(create_app(paths))
+    create_response = client.post("/api/projects/Labit/chats", json={"mode": "single"})
+    assert create_response.status_code == 200
+    chat = create_response.json()
+    chat_id = chat["chat_id"]
+
+    chats_dir = paths.vault_projects_dir / "Labit" / "chats"
+    legacy_path = chats_dir / f"{chat_id}.json"
+    legacy_attachments = chats_dir / f"{chat_id}_attachments"
+    legacy_path.write_text(json.dumps(chat), encoding="utf-8")
+    legacy_attachments.mkdir()
+    (legacy_attachments / "old.png").write_bytes(PNG_BYTES)
+
+    delete_response = client.delete(f"/api/projects/Labit/chats/{chat_id}")
+
+    assert delete_response.status_code == 200
+    assert not (chats_dir / chat_id).exists()
+    assert not legacy_path.exists()
+    assert not legacy_attachments.exists()
+    list_response = client.get("/api/projects/Labit/chats")
+    assert list_response.status_code == 200
+    assert list_response.json() == []

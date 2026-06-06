@@ -84,21 +84,37 @@ class ChatService:
         if not chats_dir.exists():
             return []
         items: list[ChatListItem] = []
-        for path in sorted(chats_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        seen_ids: set[str] = set()
+
+        # New format: chats/{chat_id}/chat.json
+        for chat_json in chats_dir.glob("*/chat.json"):
             try:
-                record = ChatRecord.model_validate_json(path.read_text(encoding="utf-8"))
-                items.append(
-                    ChatListItem(
-                        chat_id=record.chat_id,
-                        title=record.title,
-                        mode=record.mode,
-                        first_agent=record.first_agent,
-                        updated_at=record.updated_at,
-                        message_count=len(record.messages),
-                    )
-                )
+                record = ChatRecord.model_validate_json(chat_json.read_text(encoding="utf-8"))
+                seen_ids.add(record.chat_id)
+                items.append(ChatListItem(
+                    chat_id=record.chat_id, title=record.title,
+                    mode=record.mode, first_agent=record.first_agent,
+                    updated_at=record.updated_at, message_count=len(record.messages),
+                ))
             except Exception:
                 continue
+
+        # Old format fallback
+        for path in chats_dir.glob("*.json"):
+            try:
+                record = ChatRecord.model_validate_json(path.read_text(encoding="utf-8"))
+                if record.chat_id in seen_ids:
+                    continue
+                seen_ids.add(record.chat_id)
+                items.append(ChatListItem(
+                    chat_id=record.chat_id, title=record.title,
+                    mode=record.mode, first_agent=record.first_agent,
+                    updated_at=record.updated_at, message_count=len(record.messages),
+                ))
+            except Exception:
+                continue
+
+        items.sort(key=lambda x: x.updated_at, reverse=True)
         return items
 
     def get_chat(self, project: str, paper_id: str, chat_id: str) -> ChatRecord:
@@ -129,9 +145,13 @@ class ChatService:
         return record
 
     def delete_chat(self, project: str, paper_id: str, chat_id: str) -> None:
-        path = self._chat_path(project, paper_id, chat_id)
-        if path.exists():
-            path.unlink()
+        import shutil
+        chat_dir = self.chat_dir(project, paper_id, chat_id)
+        if chat_dir.exists() and chat_dir.is_dir():
+            shutil.rmtree(chat_dir)
+        old_path = self._chats_dir(project, paper_id) / f"{chat_id}.json"
+        if old_path.exists():
+            old_path.unlink()
 
     def append_message(
         self,
@@ -161,7 +181,7 @@ class ChatService:
     def get_paper_text(self, project: str, paper_id: str) -> str:
         """Get or extract paper text for LLM context."""
         paper = self.paper_service.get_paper(project=project, paper_id=paper_id)
-        artifacts_dir = self._artifacts_dir(project, paper_id)
+        artifacts_dir = self._paper_artifacts_dir(project, paper_id)
 
         # Try cached text first
         text = get_cached_text(artifacts_dir)
@@ -243,19 +263,32 @@ class ChatService:
                     return art
         return None
 
-    def _chats_dir(self, project: str, paper_id: str) -> Path:
-        return self._artifacts_dir(project, paper_id) / "chats"
+    def chat_dir(self, project: str, paper_id: str, chat_id: str) -> Path:
+        """Return the per-chat directory."""
+        return self._chats_dir(project, paper_id) / chat_id
 
-    def _artifacts_dir(self, project: str, paper_id: str) -> Path:
+    def _chats_dir(self, project: str, paper_id: str) -> Path:
+        return self._paper_artifacts_dir(project, paper_id) / "chats"
+
+    def _paper_artifacts_dir(self, project: str, paper_id: str) -> Path:
         paper = self.paper_service.get_paper(project=project, paper_id=paper_id)
         return self.paper_service.paths.root / paper.artifact_dir_path
 
     def _chat_path(self, project: str, paper_id: str, chat_id: str) -> Path:
-        return self._chats_dir(project, paper_id) / f"{chat_id}.json"
+        # New format: chats/{chat_id}/chat.json
+        new_path = self._chats_dir(project, paper_id) / chat_id / "chat.json"
+        if new_path.exists():
+            return new_path
+        # Fallback to old format
+        old_path = self._chats_dir(project, paper_id) / f"{chat_id}.json"
+        if old_path.exists():
+            return old_path
+        return new_path
 
     def _save_chat(self, chats_dir: Path, record: ChatRecord) -> None:
-        chats_dir.mkdir(parents=True, exist_ok=True)
-        path = chats_dir / f"{record.chat_id}.json"
+        chat_dir = chats_dir / record.chat_id
+        chat_dir.mkdir(parents=True, exist_ok=True)
+        path = chat_dir / "chat.json"
         path.write_text(
             record.model_dump_json(indent=2),
             encoding="utf-8",
