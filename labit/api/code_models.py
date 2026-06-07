@@ -38,7 +38,7 @@ class CodeChatMessage(BaseModel):
 class CodeChatRecord(BaseModel):
     chat_id: str
     title: str
-    file_path: str  # relative path of the file being discussed
+    file_path: str | None = None  # optional: relative path of a file being discussed
     mode: ChatMode = ChatMode.SINGLE
     first_agent: AgentName = "claude"
     participants: list[str] = Field(default_factory=lambda: ["claude", "codex"])
@@ -57,7 +57,7 @@ class CodeChatListItem(BaseModel):
 
 
 class CreateCodeChatRequest(BaseModel):
-    file_path: str  # relative path of the file
+    file_path: str | None = None  # optional: relative path of a file
     title: str = ""
     mode: ChatMode = ChatMode.SINGLE
     first_agent: AgentName = "claude"

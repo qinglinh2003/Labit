@@ -75,6 +75,28 @@ def test_code_tree_omits_and_rejects_internal_directories(tmp_path: Path) -> Non
     assert "Internal directories" in internal_response.json()["detail"]
 
 
+def test_code_chat_can_be_project_level_without_file_path(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    code_dir = paths.vault_projects_dir / "Labit" / "code"
+    (code_dir / "main.py").write_text("print('ok')\n", encoding="utf-8")
+
+    client = TestClient(create_app(paths))
+    create_chat = client.post("/api/projects/Labit/code/chats", json={})
+
+    assert create_chat.status_code == 200
+    chat = create_chat.json()
+    assert chat["title"] == "Code chat"
+    assert chat["file_path"] is None
+
+    all_chats = client.get("/api/projects/Labit/code/chats")
+    assert all_chats.status_code == 200
+    assert [item["chat_id"] for item in all_chats.json()] == [chat["chat_id"]]
+
+    file_chats = client.get("/api/projects/Labit/code/chats?file_path=main.py")
+    assert file_chats.status_code == 200
+    assert file_chats.json() == []
+
+
 def test_code_apply_artifact_requires_requested_file_to_match_chat_file(tmp_path: Path) -> None:
     paths = _create_project(tmp_path)
     code_dir = paths.vault_projects_dir / "Labit" / "code"

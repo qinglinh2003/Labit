@@ -14,6 +14,7 @@ from labit.chat.models import (
 )
 from labit.chat.service import ChatService
 from labit.context.events import WorkingMemorySnapshot
+from labit.api.shared_prompts import project_identity_context
 from labit.paths import RepoPaths
 
 
@@ -348,6 +349,20 @@ def test_project_context_is_injected_from_project_markdown(tmp_path: Path) -> No
     assert prompt.index('id="current_task"') < prompt.index('id="project_context"') < prompt.index('id="history"')
     assert "What should we do next?" in current_task
     assert "Demo is a research workspace." not in history
+
+
+def test_project_identity_context_points_to_repo_config(tmp_path: Path) -> None:
+    project_dir = tmp_path / "vault" / "projects" / "CPL-Reg"
+    project_dir.mkdir(parents=True)
+
+    prompt = project_identity_context("CPL-Reg", str(project_dir))
+
+    assert f"Project directory (cwd): {project_dir}" in prompt
+    assert f"Project config: {tmp_path / 'configs' / 'projects' / 'CPL-Reg.yaml'}" in prompt
+    assert "also reachable from cwd as ../../../configs/projects/CPL-Reg.yaml" in prompt
+    assert f"Global compute configs: {tmp_path / 'configs' / 'compute'}" in prompt
+    assert "also reachable from cwd as ../../../configs/compute/" in prompt
+    assert "Project config: ../../configs/projects/CPL-Reg.yaml" not in prompt
 
 
 def test_missing_project_context_file_is_omitted(tmp_path: Path) -> None:

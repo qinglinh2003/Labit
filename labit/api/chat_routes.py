@@ -33,6 +33,13 @@ from labit.api.chat_models import (
     UpdateChatRequest,
 )
 from labit.api.chat_service import SYSTEM_PROMPT, ChatService
+from labit.api.shared_prompts import (
+    ROUND_ROBIN_REVIEW_ADDENDUM,
+    compute_context,
+    mode_participants_context,
+    project_identity_context,
+    same_turn_peer_input_context,
+)
 
 router = APIRouter()
 
@@ -208,16 +215,14 @@ def _run_agent_to_task(
 ) -> None:
     """Run agent subprocess, pushing events to a BackgroundTask."""
     adapter = _get_adapter(agent)
-    allowed_tools: list[str] = []
+    allowed_tools = ["Read", "Grep", "Glob", "WebSearch", "WebFetch"]
     extra_args: list[str] = []
-    if agent == "claude":
-        allowed_tools = ["Read", "Grep", "Glob", "WebSearch", "WebFetch"]
 
     request = AgentRequest(
         role=AgentRole.DISCUSSANT,
         prompt=prompt,
         system_prompt=system_prompt,
-        timeout_seconds=120,
+        timeout_seconds=600,
         allowed_tools=allowed_tools,
         extra_args=extra_args,
         cwd=cwd,
@@ -234,8 +239,9 @@ def _run_agent_to_task(
 
     try:
         task.push_event({"type": "start", "agent": agent})
-        adapter.run_stream(request, on_text=on_text, on_status=on_status, cancel_event=cancel_event)
-        task.push_event({"type": "done", "agent": agent, "full_text": "".join(collected)})
+        response = adapter.run_stream(request, on_text=on_text, on_status=on_status, cancel_event=cancel_event)
+        final_text = response.raw_output.strip() or "".join(collected)
+        task.push_event({"type": "done", "agent": agent, "full_text": final_text})
     except StreamCancelled:
         task.push_event({"type": "done", "agent": agent, "full_text": "".join(collected)})
     except AgentAdapterError as exc:
@@ -276,6 +282,18 @@ def _save_agent_result(
 # Orchestration threads (one per mode)
 # ---------------------------------------------------------------------------
 
+def _load_compute_profiles(svc: ChatService, project: str):
+    try:
+        ps = svc.paper_service.project_service
+        resolved = ps.resolve_project_name(project)
+        if resolved:
+            spec = ps.load_project(resolved)
+            return spec.compute_profiles
+    except Exception:
+        pass
+    return []
+
+
 def _orchestrate_single(
     svc: ChatService, project: str, paper_id: str, chat_id: str,
     agent: str, task: BackgroundTask,
@@ -283,9 +301,12 @@ def _orchestrate_single(
     try:
         prompt = svc.build_prompt(project, paper_id, chat_id)
         project_cwd = svc.get_project_dir(project)
+        proj_ctx = project_identity_context(project, project_cwd)
+        comp_ctx = compute_context(_load_compute_profiles(svc, project))
+        sys_prompt = SYSTEM_PROMPT + mode_participants_context("single", [agent]) + proj_ctx + comp_ctx
         cancel_event = threading.Event()
         task.cancel_events.append(cancel_event)
-        _run_agent_to_task(agent, prompt, SYSTEM_PROMPT, task, cancel_event, cwd=project_cwd)
+        _run_agent_to_task(agent, prompt, sys_prompt, task, cancel_event, cwd=project_cwd)
         _save_agent_result(svc, project, paper_id, chat_id, agent, task)
     except Exception as exc:
         task.push_event({"type": "error", "error": str(exc)})
@@ -302,13 +323,16 @@ def _orchestrate_parallel(
     try:
         prompt = svc.build_prompt(project, paper_id, chat_id)
         project_cwd = svc.get_project_dir(project)
+        proj_ctx = project_identity_context(project, project_cwd)
+        comp_ctx = compute_context(_load_compute_profiles(svc, project))
+        sys_prompt = SYSTEM_PROMPT + mode_participants_context("parallel", agents) + proj_ctx + comp_ctx
         threads = []
         for agent in agents:
             cancel_event = threading.Event()
             task.cancel_events.append(cancel_event)
             t = threading.Thread(
                 target=_run_agent_to_task,
-                args=(agent, prompt, SYSTEM_PROMPT, task, cancel_event),
+                args=(agent, prompt, sys_prompt, task, cancel_event),
                 kwargs={"cwd": project_cwd},
                 daemon=True,
             )
@@ -331,22 +355,25 @@ def _orchestrate_round_robin(
     agents: list[str], task: BackgroundTask,
 ) -> None:
     try:
-        # First agent
         first = agents[0]
         prompt = svc.build_prompt(project, paper_id, chat_id)
         project_cwd = svc.get_project_dir(project)
+        proj_ctx = project_identity_context(project, project_cwd)
+        comp_ctx = compute_context(_load_compute_profiles(svc, project))
+        sys_prompt = SYSTEM_PROMPT + mode_participants_context("round_robin", agents) + proj_ctx + comp_ctx
         cancel_event = threading.Event()
         task.cancel_events.append(cancel_event)
-        _run_agent_to_task(first, prompt, SYSTEM_PROMPT, task, cancel_event, cwd=project_cwd)
+        _run_agent_to_task(first, prompt, sys_prompt, task, cancel_event, cwd=project_cwd)
         _save_agent_result(svc, project, paper_id, chat_id, first, task)
 
         first_text = _get_agent_text(task, first)
         if len(agents) > 1 and first_text:
             second = agents[1]
-            prompt2 = svc.build_prompt(project, paper_id, chat_id)
+            prompt2 = prompt + same_turn_peer_input_context(first, first_text)
+            review_prompt = sys_prompt + ROUND_ROBIN_REVIEW_ADDENDUM
             cancel_event2 = threading.Event()
             task.cancel_events.append(cancel_event2)
-            _run_agent_to_task(second, prompt2, SYSTEM_PROMPT, task, cancel_event2, cwd=project_cwd)
+            _run_agent_to_task(second, prompt2, review_prompt, task, cancel_event2, cwd=project_cwd)
             _save_agent_result(svc, project, paper_id, chat_id, second, task)
     except Exception as exc:
         task.push_event({"type": "error", "error": str(exc)})

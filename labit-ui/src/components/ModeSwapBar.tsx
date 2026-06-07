@@ -2,9 +2,9 @@ import type { ChatMode } from "../api/chat";
 import { ClaudeIcon, CodexIcon } from "./AgentIcons";
 
 const MODES: { value: ChatMode; label: string }[] = [
-  { value: "single", label: "1" },
-  { value: "parallel", label: "2" },
-  { value: "round_robin", label: "RR" },
+  { value: "single", label: "single" },
+  { value: "parallel", label: "parallel" },
+  { value: "round_robin", label: "round robin" },
 ];
 
 const MODE_LABELS: Record<ChatMode, string> = {
@@ -36,7 +36,7 @@ export default function ModeSwapBar({
             disabled={disabled}
             title={MODE_LABELS[m.value]}
             aria-label={MODE_LABELS[m.value]}
-            className={`h-7 min-w-8 px-2 font-medium ${
+            className={`h-7 px-2.5 font-medium whitespace-nowrap ${
               mode === m.value
                 ? "bg-slate-800 text-white"
                 : "bg-white text-slate-600 hover:bg-slate-100"

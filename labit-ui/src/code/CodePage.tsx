@@ -815,17 +815,19 @@ function ArtifactCard({
           )}
         </button>
         <div className="flex items-center gap-1 flex-shrink-0">
-          <button
-            onClick={handleApply}
-            disabled={applying || applied}
-            className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-colors ${
-              applied ? "bg-green-100 text-green-700" : "bg-blue-100 text-blue-700 hover:bg-blue-200"
-            } disabled:opacity-50`}
-            title="Apply to file"
-          >
-            {applied ? <Check size={11} /> : <FileCode size={11} />}
-            {applied ? "Applied" : "Apply"}
-          </button>
+          {fileId && (
+            <button
+              onClick={handleApply}
+              disabled={applying || applied}
+              className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-colors ${
+                applied ? "bg-green-100 text-green-700" : "bg-blue-100 text-blue-700 hover:bg-blue-200"
+              } disabled:opacity-50`}
+              title="Apply to file"
+            >
+              {applied ? <Check size={11} /> : <FileCode size={11} />}
+              {applied ? "Applied" : "Apply"}
+            </button>
+          )}
           <button
             onClick={handleCopy}
             className="p-1 rounded hover:bg-slate-200 text-slate-400 hover:text-slate-600 transition-colors"
@@ -1015,7 +1017,7 @@ function CodeChatPanel({
   onArtifactApplied,
 }: {
   project: string;
-  filePath: string;
+  filePath: string;  // currently open file (may be empty)
   chatId: string;
   onArtifactApplied: () => void;
 }) {
@@ -1027,7 +1029,7 @@ function CodeChatPanel({
   const composingRef = useRef(false);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
 
-  const fileId = encodeFileId(filePath);
+  const fileId = filePath ? encodeFileId(filePath) : "";
 
   const buildStreamHandlers = useCallback(() => {
     const activeStreams: Record<string, string[]> = {};
@@ -1141,7 +1143,7 @@ function CodeChatPanel({
       <div ref={messagesContainerRef} className="flex-1 overflow-y-auto px-3 py-3 space-y-2">
         {chat.messages.length === 0 && streamingAgents.length === 0 && (
           <div className="flex h-full items-center justify-center">
-            <p className="text-sm text-slate-400">Ask about this code or request changes</p>
+            <p className="text-sm text-slate-400">Ask about this project or request code changes</p>
           </div>
         )}
         {chat.messages.map((msg) => (
@@ -1157,7 +1159,7 @@ function CodeChatPanel({
           <textarea
             rows={1}
             className="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-slate-400 focus:outline-none focus:ring-1 focus:ring-slate-400/30 resize-none overflow-hidden"
-            placeholder="Discuss or modify this code... (Enter to send)"
+            placeholder="Discuss this project or request code changes... (Enter to send)"
             value={input}
             onChange={(e) => {
               setInput(e.target.value);
@@ -1191,7 +1193,7 @@ function CodeChatPanel({
 }
 
 // ---------------------------------------------------------------------------
-// Right sidebar (chats for current file)
+// Right sidebar (project-level chats)
 // ---------------------------------------------------------------------------
 
 function RightSidebar({
@@ -1203,7 +1205,7 @@ function RightSidebar({
   onArtifactApplied,
 }: {
   project: string;
-  filePath: string;
+  filePath: string;  // currently open file (may be empty)
   onCollapse: () => void;
   onResizeMouseDown: (e: React.MouseEvent) => void;
   width: number;
@@ -1221,23 +1223,22 @@ function RightSidebar({
   const noteSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const refreshChats = useCallback(() => {
-    listChats(project, filePath).then(setChats).catch(() => {});
-  }, [project, filePath]);
+    listChats(project).then(setChats).catch(() => {});
+  }, [project]);
 
   useEffect(() => {
     refreshChats();
-    setActiveChatId("");
-  }, [project, filePath, refreshChats]);
+  }, [project, refreshChats]);
 
   useEffect(() => {
     if (!activeChatId && chats.length > 0) setActiveChatId(chats[0].chat_id);
   }, [activeChatId, chats]);
 
   const handleCreateChat = useCallback(async () => {
-    const chat = await createChat(project, filePath);
+    const chat = await createChat(project);
     setActiveChatId(chat.chat_id);
     refreshChats();
-  }, [project, filePath, refreshChats]);
+  }, [project, refreshChats]);
 
   const handleDeleteChat = useCallback(async (chatId: string) => {
     await deleteChat(project, chatId);
@@ -1375,16 +1376,20 @@ function RightSidebar({
         ) : (
           <div className="h-full overflow-y-auto p-4">
             <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">File Info</h4>
-            <dl className="space-y-2 text-xs">
-              <div className="grid grid-cols-[70px_minmax(0,1fr)] gap-2">
-                <dt className="text-slate-500">Path</dt>
-                <dd className="text-slate-800 break-all">{filePath}</dd>
-              </div>
-              <div className="grid grid-cols-[70px_minmax(0,1fr)] gap-2">
-                <dt className="text-slate-500">Language</dt>
-                <dd className="text-slate-800">{filePath.split(".").pop() ?? "-"}</dd>
-              </div>
-            </dl>
+            {filePath ? (
+              <dl className="space-y-2 text-xs">
+                <div className="grid grid-cols-[70px_minmax(0,1fr)] gap-2">
+                  <dt className="text-slate-500">Path</dt>
+                  <dd className="text-slate-800 break-all">{filePath}</dd>
+                </div>
+                <div className="grid grid-cols-[70px_minmax(0,1fr)] gap-2">
+                  <dt className="text-slate-500">Language</dt>
+                  <dd className="text-slate-800">{filePath.split(".").pop() ?? "-"}</dd>
+                </div>
+              </dl>
+            ) : (
+              <p className="text-xs text-slate-400">No file selected.</p>
+            )}
           </div>
         )}
       </div>
@@ -1504,7 +1509,7 @@ export default function CodePage({ project }: { project: string }) {
       </div>
 
       {/* Right sidebar: chat */}
-      {rightOpen && selectedPath && (
+      {rightOpen && (
         <RightSidebar
           project={project}
           filePath={selectedPath}
@@ -1516,7 +1521,7 @@ export default function CodePage({ project }: { project: string }) {
       )}
 
       {/* Right expand button (visible when collapsed) */}
-      {!rightOpen && selectedPath && (
+      {!rightOpen && (
         <button
           onClick={() => setRightOpen(true)}
           className="absolute right-0 top-3 z-20 flex h-7 w-7 items-center justify-center rounded-l-md border border-r-0 border-slate-300 bg-white shadow-sm hover:bg-slate-100"

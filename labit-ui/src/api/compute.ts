@@ -61,3 +61,33 @@ export async function testComputeProfile(project: string, name: string): Promise
   if (!res.ok) throw new Error(`Failed to test compute profile: ${res.status}`);
   return res.json();
 }
+
+export interface SyncCodeResponse {
+  success: boolean;
+  profile_name: string;
+  local_path: string;
+  remote_path: string;
+  stdout: string;
+  stderr: string;
+}
+
+export interface GpuCheckResponse {
+  success: boolean;
+  output: string;
+}
+
+export async function syncCode(project: string, name: string): Promise<SyncCodeResponse> {
+  const res = await fetch(`${API}/api/projects/${project}/compute/${encodeURIComponent(name)}/sync-code`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error(`Failed to sync code: ${res.status}`);
+  return res.json();
+}
+
+export async function checkGpu(project: string, name: string): Promise<GpuCheckResponse> {
+  const res = await fetch(`${API}/api/projects/${project}/compute/${encodeURIComponent(name)}/check-gpu`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error(`Failed to check GPU: ${res.status}`);
+  return res.json();
+}

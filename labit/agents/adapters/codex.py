@@ -29,8 +29,7 @@ class CodexAdapter(AgentAdapter):
             cmd = [
                 "codex",
                 "exec",
-                "--sandbox",
-                "danger-full-access",
+                "--dangerously-bypass-approvals-and-sandbox",
                 "--skip-git-repo-check",
                 "--color",
                 "never",
@@ -115,8 +114,7 @@ class CodexAdapter(AgentAdapter):
         cmd = [
             "codex",
             "exec",
-            "--sandbox",
-            "danger-full-access",
+            "--dangerously-bypass-approvals-and-sandbox",
             "--skip-git-repo-check",
             "--color",
             "never",
@@ -129,18 +127,26 @@ class CodexAdapter(AgentAdapter):
                 cmd.extend(["--image", image_path])
         if request.extra_args:
             cmd.extend(request.extra_args)
-        cmd.append("-")
+
+        out_handle = NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8")
+        out_path = Path(out_handle.name)
+        out_handle.close()
+
+        cmd.extend(["--output-last-message", str(out_path), "-"])
 
         raw_output = ""
         session_id = request.session_id
-        emitted = False
+        # Track which item IDs had their text already streamed via deltas,
+        # so we don't double-emit on item.completed.
+        delta_emitted_items: set[str] = set()
+        current_delta_item: str | None = None
 
         def _emit_status(message: str) -> None:
             if on_status is not None and message:
                 on_status(message)
 
         def _handle_stdout(line: str) -> None:
-            nonlocal raw_output, session_id, emitted
+            nonlocal raw_output, session_id, current_delta_item
             stripped = line.strip()
             if not stripped:
                 return
@@ -167,11 +173,17 @@ class CodexAdapter(AgentAdapter):
                 chunk = _extract_codex_text_delta(payload)
                 if chunk and on_text is not None:
                     on_text(chunk)
-                    emitted = True
+                    # Mark current item as already streamed via deltas
+                    if current_delta_item:
+                        delta_emitted_items.add(current_delta_item)
                 return
 
             if payload_type in {"item.created", "item.started"}:
-                _emit_status(_describe_codex_item(payload.get("item"), prefix="running"))
+                item = payload.get("item") or {}
+                item_id = str(item.get("id", ""))
+                if item.get("type") == "agent_message":
+                    current_delta_item = item_id
+                _emit_status(_describe_codex_item(item, prefix="running"))
                 return
 
             if payload_type == "item.completed":
@@ -179,11 +191,13 @@ class CodexAdapter(AgentAdapter):
                 if item.get("type") != "agent_message":
                     _emit_status(_describe_codex_item(item, prefix="completed"))
                     return
-                text = str(item.get("text", ""))
+                item_id = str(item.get("id", ""))
+                text = _extract_codex_item_text(item)
                 raw_output = text.strip() or raw_output
-                if on_text is not None and text and not emitted:
+                # Emit if this item wasn't already streamed via deltas
+                if on_text is not None and text and item_id not in delta_emitted_items:
                     on_text(text)
-                    emitted = True
+                current_delta_item = None
 
         try:
             result = stream_subprocess_lines(
@@ -199,9 +213,14 @@ class CodexAdapter(AgentAdapter):
                 f"Codex adapter timed out after {request.timeout_seconds}s."
             ) from exc
 
+        final_output = out_path.read_text().strip() if out_path.exists() else ""
+        out_path.unlink(missing_ok=True)
+
         if result.returncode != 0:
             detail = "".join(result.stderr_lines).strip() or "".join(result.stdout_lines).strip()
             raise AgentAdapterError(f"Codex adapter failed: {detail}")
+
+        raw_output = final_output or raw_output
 
         return AgentResponse(
             provider=self.provider,
@@ -248,4 +267,34 @@ def _extract_codex_text_delta(payload: dict) -> str:
             nested = value.get("text") or value.get("content")
             if isinstance(nested, str):
                 return nested
+    return ""
+
+
+def _extract_codex_item_text(item: dict) -> str:
+    value = item.get("text")
+    if isinstance(value, str):
+        return value
+
+    value = item.get("content")
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for part in value:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text") or part.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+
+    value = item.get("message")
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        text = value.get("text") or value.get("content")
+        if isinstance(text, str):
+            return text
+
     return ""

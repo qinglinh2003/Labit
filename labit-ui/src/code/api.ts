@@ -43,7 +43,7 @@ export interface ChatMessage {
 export interface ChatRecord {
   chat_id: string;
   title: string;
-  file_path: string;
+  file_path: string | null;
   mode: ChatMode;
   first_agent: string;
   participants: string[];
@@ -126,11 +126,13 @@ function chatBase(project: string): string {
   return `${codeBase(project)}/chats`;
 }
 
-export async function createChat(project: string, filePath: string, opts: { title?: string; mode?: ChatMode; first_agent?: string } = {}): Promise<ChatRecord> {
+export async function createChat(project: string, filePath?: string, opts: { title?: string; mode?: ChatMode; first_agent?: string } = {}): Promise<ChatRecord> {
+  const body: Record<string, string> = { title: opts.title ?? "", mode: opts.mode ?? "single", first_agent: opts.first_agent ?? "claude" };
+  if (filePath) body.file_path = filePath;
   const res = await fetch(chatBase(project), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ file_path: filePath, title: opts.title ?? "", mode: opts.mode ?? "single", first_agent: opts.first_agent ?? "claude" }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(await res.text());
   return res.json();

@@ -234,19 +234,21 @@ class CodeService:
     # -- Code Chat -----------------------------------------------------------
 
     def create_chat(
-        self, project: str, file_path: str,
+        self, project: str, file_path: str | None = None,
         title: str = "", mode: ChatMode = ChatMode.SINGLE,
         first_agent: AgentName = "claude",
     ) -> CodeChatRecord:
-        file_id = encode_file_id(file_path)
-        # Verify file exists
-        self.get_file(project, file_id)
+        if file_path:
+            file_id = encode_file_id(file_path)
+            # Verify file exists
+            self.get_file(project, file_id)
         chats_dir = self._code_chats_dir(project)
         chat_id = uuid.uuid4().hex[:12]
         now = datetime.now(UTC).replace(microsecond=0).isoformat()
+        default_title = f"Chat about {file_path.split('/')[-1]}" if file_path else "Code chat"
         record = CodeChatRecord(
             chat_id=chat_id,
-            title=title or f"Chat about {file_path.split('/')[-1]}",
+            title=title or default_title,
             file_path=file_path,
             mode=mode,
             first_agent=first_agent,
@@ -357,11 +359,16 @@ class CodeService:
         parts: list[str] = []
 
         # Only tell the agent which file is open — don't inject full content
-        # Prefix with code/ since cwd is now the project root
-        parts.append(
-            f"[Current open file: code/{record.file_path}]\n"
-            f"Use your tools to read this file or any other files you need."
-        )
+        if record.file_path:
+            parts.append(
+                f"[Current open file: code/{record.file_path}]\n"
+                f"Use your tools to read this file or any other files you need."
+            )
+        else:
+            parts.append(
+                "[Project-level code chat — no specific file open.]\n"
+                "Use your tools to explore the codebase as needed."
+            )
 
         # Chat history
         for msg in record.messages:
@@ -382,7 +389,7 @@ class CodeService:
         prompt = "\n\n".join(parts)
 
         # Code modification reminder
-        if record.messages and record.messages[-1].role == "user":
+        if record.file_path and record.messages and record.messages[-1].role == "user":
             last_user = record.messages[-1].content.lower()
             _MOD_KEYWORDS = [
                 "修改", "改一下", "修", "fix", "update", "modify",
@@ -421,7 +428,7 @@ class CodeService:
         """Apply an artifact's content to the file."""
         record = self.get_chat(project, chat_id)
         requested_file = self.get_file(project, file_id)
-        if requested_file.path != record.file_path:
+        if record.file_path and requested_file.path != record.file_path:
             raise ValueError("Artifact chat does not belong to the requested file")
         art = self.get_artifact(project, chat_id, artifact_id)
         if art is None:

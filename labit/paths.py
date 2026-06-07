@@ -43,6 +43,7 @@ def discover_repo_root(start: Path | None = None) -> Path:
     current = (start or Path.cwd()).expanduser().resolve()
     candidates = [current, *current.parents]
 
+    matches: list[Path] = []
     for candidate in candidates:
         has_markers = (
             (candidate / ".git").exists()
@@ -52,7 +53,10 @@ def discover_repo_root(start: Path | None = None) -> Path:
             and (candidate / "vault").exists()
         )
         if has_markers:
-            return candidate
+            matches.append(candidate)
+
+    if matches:
+        return matches[-1]
 
     raise RuntimeError(
         "Could not locate the repository root. Run from inside the repo or set LABIT_REPO_ROOT."

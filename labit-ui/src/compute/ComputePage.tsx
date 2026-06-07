@@ -6,22 +6,28 @@ import {
   saveComputeProfile,
   deleteComputeProfile,
   testComputeProfile,
+  syncCode,
+  checkGpu,
   type ComputeProfile,
   type SaveProfileRequest,
 } from "../api/compute";
 
-type TestStatus = "idle" | "testing" | "success" | "failed";
+type OpStatus = "idle" | "running" | "success" | "failed";
 
-interface ProfileTestState {
-  status: TestStatus;
+interface OpState {
+  status: OpStatus;
   message: string;
 }
+
+type ProfileTestState = OpState;
 
 export default function ComputePage({ project }: { project: string }) {
   const queryClient = useQueryClient();
   const [showModal, setShowModal] = useState(false);
   const [editingProfile, setEditingProfile] = useState<ComputeProfile | null>(null);
   const [testStates, setTestStates] = useState<Record<string, ProfileTestState>>({});
+  const [syncStates, setSyncStates] = useState<Record<string, OpState>>({});
+  const [gpuStates, setGpuStates] = useState<Record<string, OpState>>({});
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
 
   const profilesQuery = useQuery({
@@ -32,7 +38,7 @@ export default function ComputePage({ project }: { project: string }) {
   const profiles = profilesQuery.data ?? [];
 
   const handleTest = useCallback(async (name: string) => {
-    setTestStates((s) => ({ ...s, [name]: { status: "testing", message: "" } }));
+    setTestStates((s) => ({ ...s, [name]: { status: "running", message: "" } }));
     try {
       const result = await testComputeProfile(project, name);
       setTestStates((s) => ({
@@ -41,6 +47,40 @@ export default function ComputePage({ project }: { project: string }) {
       }));
     } catch (err: any) {
       setTestStates((s) => ({ ...s, [name]: { status: "failed", message: err.message } }));
+    }
+  }, [project]);
+
+  const handleSync = useCallback(async (name: string) => {
+    setSyncStates((s) => ({ ...s, [name]: { status: "running", message: "Syncing..." } }));
+    try {
+      const result = await syncCode(project, name);
+      setSyncStates((s) => ({
+        ...s,
+        [name]: {
+          status: result.success ? "success" : "failed",
+          message: result.success
+            ? `Synced to ${result.remote_path}`
+            : result.stderr || "Sync failed",
+        },
+      }));
+    } catch (err: any) {
+      setSyncStates((s) => ({ ...s, [name]: { status: "failed", message: err.message } }));
+    }
+  }, [project]);
+
+  const handleGpu = useCallback(async (name: string) => {
+    setGpuStates((s) => ({ ...s, [name]: { status: "running", message: "Checking..." } }));
+    try {
+      const result = await checkGpu(project, name);
+      setGpuStates((s) => ({
+        ...s,
+        [name]: {
+          status: result.success ? "success" : "failed",
+          message: result.output,
+        },
+      }));
+    } catch (err: any) {
+      setGpuStates((s) => ({ ...s, [name]: { status: "failed", message: err.message } }));
     }
   }, [project]);
 
@@ -103,7 +143,9 @@ export default function ComputePage({ project }: { project: string }) {
         ) : (
           <div className="space-y-3">
             {profiles.map((p) => {
-              const ts = testStates[p.name] ?? { status: "idle" as TestStatus, message: "" };
+              const ts = testStates[p.name] ?? { status: "idle" as OpStatus, message: "" };
+              const ss = syncStates[p.name] ?? { status: "idle" as OpStatus, message: "" };
+              const gs = gpuStates[p.name] ?? { status: "idle" as OpStatus, message: "" };
               return (
                 <div key={p.name} className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
                   {/* Top row: name + actions */}
@@ -173,31 +215,74 @@ export default function ComputePage({ project }: { project: string }) {
                     )}
                   </div>
 
-                  {/* Test row */}
-                  <div className="flex items-center gap-3 border-t border-slate-100 pt-3">
+                  {/* Actions row */}
+                  <div className="flex flex-wrap items-center gap-2 border-t border-slate-100 pt-3">
                     <button
                       onClick={() => void handleTest(p.name)}
-                      disabled={ts.status === "testing"}
+                      disabled={ts.status === "running"}
                       className="flex items-center gap-1.5 rounded-md border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
                     >
-                      {ts.status === "testing" ? (
+                      {ts.status === "running" ? (
                         <><Loader2 size={12} className="animate-spin" /> Testing...</>
                       ) : (
                         <>Test SSH</>
                       )}
                     </button>
+                    <button
+                      onClick={() => void handleSync(p.name)}
+                      disabled={ss.status === "running"}
+                      className="flex items-center gap-1.5 rounded-md border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                    >
+                      {ss.status === "running" ? (
+                        <><Loader2 size={12} className="animate-spin" /> Syncing...</>
+                      ) : (
+                        <>Sync Code</>
+                      )}
+                    </button>
+                    <button
+                      onClick={() => void handleGpu(p.name)}
+                      disabled={gs.status === "running"}
+                      className="flex items-center gap-1.5 rounded-md border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                    >
+                      {gs.status === "running" ? (
+                        <><Loader2 size={12} className="animate-spin" /> Checking...</>
+                      ) : (
+                        <>Check GPU</>
+                      )}
+                    </button>
+                  </div>
+
+                  {/* Status feedback */}
+                  <div className="mt-2 space-y-1">
                     {ts.status === "success" && (
                       <span className="flex items-center gap-1 text-xs text-green-600">
                         <CheckCircle2 size={13} /> {ts.message}
                       </span>
                     )}
                     {ts.status === "failed" && (
-                      <span className="flex items-center gap-1 text-xs text-red-500 max-w-md truncate" title={ts.message}>
+                      <span className="flex items-center gap-1 text-xs text-red-500" title={ts.message}>
                         <AlertCircle size={13} /> {ts.message}
                       </span>
                     )}
-                    {ts.status === "idle" && (
-                      <span className="text-xs text-slate-400">Not tested</span>
+                    {ss.status === "success" && (
+                      <span className="flex items-center gap-1 text-xs text-green-600">
+                        <CheckCircle2 size={13} /> {ss.message}
+                      </span>
+                    )}
+                    {ss.status === "failed" && (
+                      <span className="flex items-center gap-1 text-xs text-red-500" title={ss.message}>
+                        <AlertCircle size={13} /> {ss.message}
+                      </span>
+                    )}
+                    {gs.status === "success" && (
+                      <pre className="mt-1 max-h-40 overflow-auto rounded bg-slate-900 p-2 text-xs text-green-400 font-mono whitespace-pre">
+                        {gs.message}
+                      </pre>
+                    )}
+                    {gs.status === "failed" && (
+                      <span className="flex items-center gap-1 text-xs text-red-500" title={gs.message}>
+                        <AlertCircle size={13} /> {gs.message}
+                      </span>
                     )}
                   </div>
                 </div>

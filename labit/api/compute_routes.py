@@ -31,6 +31,20 @@ class TestResult(BaseModel):
     message: str
 
 
+class SyncCodeResponse(BaseModel):
+    success: bool
+    profile_name: str
+    local_path: str
+    remote_path: str
+    stdout: str
+    stderr: str
+
+
+class GpuCheckResponse(BaseModel):
+    success: bool
+    output: str
+
+
 def _to_response(profile) -> ComputeProfileResponse:
     return ComputeProfileResponse(
         name=profile.name,
@@ -102,5 +116,44 @@ def mount_compute_routes(svc: ComputeService) -> APIRouter:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except Exception as exc:
             return TestResult(success=False, message=str(exc))
+
+    @router.post("/{name}/sync-code", response_model=SyncCodeResponse)
+    def sync_code(project: str, name: str) -> SyncCodeResponse:
+        try:
+            result = svc.sync_code(project, name)
+            return SyncCodeResponse(
+                success=result.success,
+                profile_name=result.profile_name,
+                local_path=result.local_path,
+                remote_path=result.remote_path,
+                stdout=result.stdout,
+                stderr=result.stderr,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            return SyncCodeResponse(
+                success=False,
+                profile_name=name,
+                local_path="",
+                remote_path="",
+                stdout="",
+                stderr=str(exc),
+            )
+
+    @router.post("/{name}/check-gpu", response_model=GpuCheckResponse)
+    def check_gpu(project: str, name: str) -> GpuCheckResponse:
+        try:
+            result = svc.check_gpu(project, name)
+            if result.returncode == 0:
+                return GpuCheckResponse(success=True, output=result.stdout.strip())
+            return GpuCheckResponse(
+                success=False,
+                output=result.stderr.strip() or result.stdout.strip() or "nvidia-smi failed",
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            return GpuCheckResponse(success=False, output=str(exc))
 
     return router

@@ -54,9 +54,9 @@ function agentStyle(agent: string) {
 // ---------------------------------------------------------------------------
 
 const MODES: { value: ChatMode; label: string; desc: string }[] = [
-  { value: "single", label: "1", desc: "Single agent" },
-  { value: "parallel", label: "2", desc: "Parallel agents" },
-  { value: "round_robin", label: "RR", desc: "Round Robin" },
+  { value: "single", label: "single", desc: "Single agent" },
+  { value: "parallel", label: "parallel", desc: "Parallel agents" },
+  { value: "round_robin", label: "round robin", desc: "Round Robin" },
 ];
 
 function ModeSwapBar({
@@ -82,7 +82,7 @@ function ModeSwapBar({
             disabled={disabled}
             title={m.desc}
             aria-label={m.desc}
-            className={`h-8 min-w-9 px-2 font-medium transition-colors ${
+            className={`h-8 px-2.5 font-medium whitespace-nowrap transition-colors ${
               mode === m.value
                 ? "bg-slate-800 text-white"
                 : "bg-white text-slate-500 hover:bg-slate-50 hover:text-slate-700"
