@@ -11,20 +11,30 @@ from labit.models import ProjectSpec, ProjectSummary
 from labit.paths import RepoPaths
 
 
-PROJECT_SUBDIRS = ("digests", "sparks", "code", "docs", "papers")
+PROJECT_SUBDIRS = ("code", "docs", "papers")
 
 
 class ProjectService:
     def __init__(self, paths: RepoPaths):
         self.paths = paths
 
-    def list_project_names(self) -> list[str]:
+    def list_project_names(self, *, include_archived: bool = False) -> list[str]:
         if not self.paths.project_configs_dir.exists():
             return []
-        return sorted(path.stem for path in self.paths.project_configs_dir.glob("*.yaml"))
+        names = sorted(path.stem for path in self.paths.project_configs_dir.glob("*.yaml"))
+        if include_archived:
+            return names
+        return [n for n in names if not self._is_archived(n)]
 
-    def resolve_project_name(self, name: str) -> str | None:
-        for candidate in self.list_project_names():
+    def _is_archived(self, name: str) -> bool:
+        config_path = self.paths.project_configs_dir / f"{name}.yaml"
+        if not config_path.exists():
+            return False
+        raw = yaml.safe_load(config_path.read_text()) or {}
+        return bool(raw.get("archived"))
+
+    def resolve_project_name(self, name: str, *, include_archived: bool = True) -> str | None:
+        for candidate in self.list_project_names(include_archived=include_archived):
             if candidate.lower() == name.lower():
                 return candidate
         return None
@@ -33,7 +43,10 @@ class ProjectService:
         if not self.paths.active_project_path.exists():
             return None
         value = self.paths.active_project_path.read_text().strip()
-        return value or None
+        if not value:
+            return None
+        resolved = self.resolve_project_name(value, include_archived=False)
+        return resolved
 
     def load_project(self, name: str) -> ProjectSpec:
         resolved = self.resolve_project_name(name)
@@ -116,7 +129,7 @@ class ProjectService:
         }
 
     def set_active_project(self, name: str) -> None:
-        resolved = self.resolve_project_name(name)
+        resolved = self.resolve_project_name(name, include_archived=False)
         if resolved is None:
             raise FileNotFoundError(
                 f"Project '{name}' not found. Available projects: {', '.join(self.list_project_names()) or '(none)'}"
@@ -134,12 +147,35 @@ class ProjectService:
             keyword_count=len(spec.keywords),
             compute_count=len(spec.compute_profiles),
             is_active=(active == resolved),
+            archived=spec.archived,
             config_path=str(self.paths.project_configs_dir / f"{resolved}.yaml"),
         )
 
-    def list_project_summaries(self) -> list[ProjectSummary]:
+    def archive_project(self, name: str) -> dict:
+        spec = self.load_project(name)
+        resolved = self.resolve_project_name(name) or spec.name
+        if spec.archived:
+            return {"name": resolved, "archived": True, "changed": False}
+        was_active = self.active_project_name() == resolved
+        spec.archived = True
+        self.save_project(spec, force=True)
+        if was_active:
+            if self.paths.active_project_path.exists():
+                self.paths.active_project_path.unlink()
+        return {"name": resolved, "archived": True, "changed": True}
+
+    def unarchive_project(self, name: str) -> dict:
+        spec = self.load_project(name)
+        resolved = self.resolve_project_name(name) or spec.name
+        if not spec.archived:
+            return {"name": resolved, "archived": False, "changed": False}
+        spec.archived = False
+        self.save_project(spec, force=True)
+        return {"name": resolved, "archived": False, "changed": True}
+
+    def list_project_summaries(self, *, include_archived: bool = False) -> list[ProjectSummary]:
         summaries: list[ProjectSummary] = []
-        for name in self.list_project_names():
+        for name in self.list_project_names(include_archived=include_archived):
             try:
                 summaries.append(self.get_project_summary(name))
             except ValueError:

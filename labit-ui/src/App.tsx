@@ -2,12 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { BookOpen, Check, ChevronDown, ChevronLeft, ChevronRight, Edit3, Eye, FileText, FolderOpen, FolderPlus, MessageSquare, NotebookPen, Plus, RefreshCw, Search, Settings, Star, Tag, X } from "lucide-react";
+import { Archive, ArchiveRestore, BookOpen, Check, ChevronDown, ChevronLeft, ChevronRight, Edit3, Eye, FileText, FolderOpen, FolderPlus, MessageSquare, NotebookPen, Plus, RefreshCw, Search, Settings, Star, Tag, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import {
+  archiveProject,
   createProject,
   getNote,
   listArtifacts,
@@ -17,6 +18,7 @@ import {
   prefetchReaderManifest,
   saveNote,
   togglePaperStar,
+  unarchiveProject,
   updatePaperStatus,
   updatePaperTags,
 } from "./api/client";
@@ -81,16 +83,22 @@ const fieldLabelCls = "block text-[11px] font-semibold text-[var(--muted,#5a6b82
 
 function ProjectMenu({
   projects,
+  archivedProjects,
   activeProject,
   onSelect,
   onRefresh,
   spinning,
+  showArchived,
+  onToggleShowArchived,
 }: {
   projects: string[];
+  archivedProjects: string[];
   activeProject: string;
   onSelect: (name: string) => void;
   onRefresh: () => void;
   spinning: boolean;
+  showArchived: boolean;
+  onToggleShowArchived: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -127,6 +135,27 @@ function ProjectMenu({
   const resetForm = () => {
     setFormName(""); setFormDesc(""); setFormRepo("");
     setFormKeywords(""); setFormRelevance(""); setError("");
+  };
+
+  const handleArchive = async (name: string) => {
+    try {
+      await archiveProject(name);
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["projects-archived"] });
+      if (name === activeProject) {
+        // Switch to first non-archived project
+        const remaining = projects.filter((p) => p !== name);
+        onSelect(remaining[0] ?? "");
+      }
+    } catch {}
+  };
+
+  const handleUnarchive = async (name: string) => {
+    try {
+      await unarchiveProject(name);
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["projects-archived"] });
+    } catch {}
   };
 
   const handleCreate = async () => {
@@ -190,32 +219,74 @@ function ProjectMenu({
             {projects.map((name) => {
               const isActive = name === activeProject;
               return (
-                <button
-                  key={name}
-                  onClick={() => {
-                    onSelect(name);
-                    setOpen(false);
-                    setCreating(false);
-                    resetForm();
-                  }}
-                  className={`flex items-center gap-2.5 w-full px-2.5 py-[7px] rounded-lg text-left transition-colors ${
-                    isActive
-                      ? "bg-[var(--ink,#0e72ed)]/[0.08] text-[var(--ink,#0e72ed)]"
-                      : "hover:bg-[var(--surface-3,#e9f1fb)] text-[var(--text,#0d1b2e)]"
-                  }`}
-                >
-                  <span className={`flex items-center justify-center w-[22px] h-[22px] rounded-md text-[11px] font-bold flex-shrink-0 ${
-                    isActive
-                      ? "bg-[var(--ink,#0e72ed)] text-white"
-                      : "bg-[var(--surface-3,#e9f1fb)] text-[var(--muted,#5a6b82)]"
-                  }`}>
-                    {name.charAt(0).toUpperCase()}
-                  </span>
-                  <span className="text-[13px] font-medium truncate flex-1">{name}</span>
-                  {isActive && <Check size={14} className="text-[var(--ink,#0e72ed)] flex-shrink-0" />}
-                </button>
+                <div key={name} className="group flex items-center">
+                  <button
+                    onClick={() => {
+                      onSelect(name);
+                      setOpen(false);
+                      setCreating(false);
+                      resetForm();
+                    }}
+                    className={`flex items-center gap-2.5 flex-1 min-w-0 px-2.5 py-[7px] rounded-lg text-left transition-colors ${
+                      isActive
+                        ? "bg-[var(--ink,#0e72ed)]/[0.08] text-[var(--ink,#0e72ed)]"
+                        : "hover:bg-[var(--surface-3,#e9f1fb)] text-[var(--text,#0d1b2e)]"
+                    }`}
+                  >
+                    <span className={`flex items-center justify-center w-[22px] h-[22px] rounded-md text-[11px] font-bold flex-shrink-0 ${
+                      isActive
+                        ? "bg-[var(--ink,#0e72ed)] text-white"
+                        : "bg-[var(--surface-3,#e9f1fb)] text-[var(--muted,#5a6b82)]"
+                    }`}>
+                      {name.charAt(0).toUpperCase()}
+                    </span>
+                    <span className="text-[13px] font-medium truncate flex-1">{name}</span>
+                    {isActive && <Check size={14} className="text-[var(--ink,#0e72ed)] flex-shrink-0" />}
+                  </button>
+                  <button
+                    onClick={() => void handleArchive(name)}
+                    title="Archive project"
+                    className="flex items-center justify-center w-6 h-6 rounded-md opacity-0 group-hover:opacity-100 hover:bg-[var(--surface-3,#e9f1fb)] transition-all flex-shrink-0 mr-1"
+                  >
+                    <Archive size={12} className="text-[var(--muted,#5a6b82)]" />
+                  </button>
+                </div>
               );
             })}
+
+            {/* Archived projects section */}
+            {archivedProjects.length > 0 && (
+              <>
+                <button
+                  type="button"
+                  onClick={onToggleShowArchived}
+                  className="flex items-center gap-1.5 w-full px-2.5 py-1.5 mt-1 text-[11px] font-medium text-[var(--muted,#5a6b82)] hover:text-[var(--text,#0d1b2e)] transition-colors"
+                >
+                  <Archive size={11} />
+                  <span>Archived ({archivedProjects.length})</span>
+                  <ChevronDown size={11} className={`ml-auto transition-transform ${showArchived ? "rotate-180" : ""}`} />
+                </button>
+                {showArchived && archivedProjects.map((name) => (
+                  <div key={name} className="group flex items-center">
+                    <div
+                      className="flex items-center gap-2.5 flex-1 min-w-0 px-2.5 py-[7px] rounded-lg text-left transition-colors hover:bg-[var(--surface-3,#e9f1fb)] text-[var(--muted,#5a6b82)]"
+                    >
+                      <span className="flex items-center justify-center w-[22px] h-[22px] rounded-md text-[11px] font-bold flex-shrink-0 bg-[var(--surface-3,#e9f1fb)] text-[var(--muted,#5a6b82)] opacity-60">
+                        {name.charAt(0).toUpperCase()}
+                      </span>
+                      <span className="text-[13px] font-medium truncate flex-1 opacity-60">{name}</span>
+                    </div>
+                    <button
+                      onClick={() => void handleUnarchive(name)}
+                      title="Unarchive project"
+                      className="flex items-center justify-center w-6 h-6 rounded-md opacity-0 group-hover:opacity-100 hover:bg-[var(--surface-3,#e9f1fb)] transition-all flex-shrink-0 mr-1"
+                    >
+                      <ArchiveRestore size={12} className="text-[var(--muted,#5a6b82)]" />
+                    </button>
+                  </div>
+                ))}
+              </>
+            )}
           </div>
 
           {/* Divider */}
@@ -333,12 +404,18 @@ function ProjectMenu({
 export function App() {
   const { project, selectedPaperId, activeTab, chatActiveChatId, setProject, setSelectedPaperId, setActiveTab, setChatActiveChatId } = useUiStore();
   const [spinning, setSpinning] = useState(false);
-  const projectsQuery = useQuery({ queryKey: ["projects"], queryFn: listProjects });
+  const [showArchived, setShowArchived] = useState(false);
+  const projectsQuery = useQuery({ queryKey: ["projects"], queryFn: () => listProjects(false) });
+  const archivedQuery = useQuery({ queryKey: ["projects-archived"], queryFn: () => listProjects(true) });
   const projects = projectsQuery.data?.projects ?? [];
+  const allProjects = archivedQuery.data?.projects ?? [];
+  const archivedProjects = allProjects.filter((p) => !projects.includes(p));
 
   useEffect(() => {
     if (projects.length > 0 && (!project || !projects.includes(project))) {
       setProject(projectsQuery.data?.active_project ?? projects[0]);
+    } else if (projects.length === 0 && project) {
+      setProject("");
     }
   }, [project, projects, projectsQuery.data?.active_project, setProject]);
 
@@ -399,10 +476,13 @@ export function App() {
           </div>
           <ProjectMenu
             projects={projects}
+            archivedProjects={archivedProjects}
             activeProject={project}
             onSelect={setProject}
             onRefresh={refresh}
             spinning={spinning}
+            showArchived={showArchived}
+            onToggleShowArchived={() => setShowArchived((v) => !v)}
           />
         </div>
       </header>

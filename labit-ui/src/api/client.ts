@@ -67,8 +67,21 @@ async function getJson<T>(path: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-export function listProjects(): Promise<ProjectListResponse> {
-  return getJson<ProjectListResponse>("/api/projects");
+export function listProjects(includeArchived = false): Promise<ProjectListResponse> {
+  const qs = includeArchived ? "?include_archived=true" : "";
+  return getJson<ProjectListResponse>(`/api/projects${qs}`);
+}
+
+export async function archiveProject(project: string): Promise<{ name: string; archived: boolean; changed: boolean }> {
+  const response = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(project)}/archive`, { method: "PUT" });
+  if (!response.ok) throw new Error(await response.text());
+  return response.json() as Promise<{ name: string; archived: boolean; changed: boolean }>;
+}
+
+export async function unarchiveProject(project: string): Promise<{ name: string; archived: boolean; changed: boolean }> {
+  const response = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(project)}/archive`, { method: "DELETE" });
+  if (!response.ok) throw new Error(await response.text());
+  return response.json() as Promise<{ name: string; archived: boolean; changed: boolean }>;
 }
 
 export interface CreateProjectPayload {

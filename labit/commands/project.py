@@ -260,9 +260,12 @@ def current(json_output: bool = typer.Option(False, "--json", help="Emit JSON ou
 
 
 @project_app.command("list", help="List all projects.")
-def list_projects(json_output: bool = typer.Option(False, "--json", help="Emit JSON output.")) -> None:
+def list_projects(
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+    archived: bool = typer.Option(False, "--archived", help="Include archived projects."),
+) -> None:
     service = _service()
-    summaries = [{"name": summary.name, "active": summary.is_active} for summary in service.list_project_summaries()]
+    summaries = [{"name": summary.name, "active": summary.is_active, "archived": summary.archived} for summary in service.list_project_summaries(include_archived=archived)]
     if json_output:
         _emit({"projects": summaries}, as_json=True)
         return
@@ -272,6 +275,8 @@ def list_projects(json_output: bool = typer.Option(False, "--json", help="Emit J
         return
     for item in summaries:
         suffix = " (active)" if item["active"] else ""
+        if item["archived"]:
+            suffix += " (archived)"
         console.print(f"- {item['name']}{suffix}")
 
 
@@ -429,6 +434,50 @@ def delete_project(
         rows.append(("Active project", "cleared"))
     rows.append(("Next", "labit project list"))
     _print_kv_summary("Project deleted", rows)
+
+
+@project_app.command("archive", help="Archive a project (hide from default listing).")
+def archive_project(
+    name: str | None = typer.Argument(None, help="Project name. Defaults to the active project."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    service = _service()
+    project_name = name or service.active_project_name()
+    if project_name is None:
+        raise typer.Exit(code=_fail("No active project. Pass a name or create a project first.", as_json=json_output))
+
+    try:
+        result = service.archive_project(project_name)
+    except (FileNotFoundError, ValueError) as exc:
+        raise typer.Exit(code=_fail(str(exc), as_json=json_output))
+
+    if json_output:
+        _emit(result, as_json=True)
+        return
+    if result["changed"]:
+        console.print(f"Archived project [bold]{result['name']}[/bold].")
+    else:
+        console.print(f"Project [bold]{result['name']}[/bold] is already archived.")
+
+
+@project_app.command("unarchive", help="Unarchive a project (show in default listing).")
+def unarchive_project(
+    name: str = typer.Argument(..., help="Project name."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    service = _service()
+    try:
+        result = service.unarchive_project(name)
+    except (FileNotFoundError, ValueError) as exc:
+        raise typer.Exit(code=_fail(str(exc), as_json=json_output))
+
+    if json_output:
+        _emit(result, as_json=True)
+        return
+    if result["changed"]:
+        console.print(f"Unarchived project [bold]{result['name']}[/bold].")
+    else:
+        console.print(f"Project [bold]{result['name']}[/bold] is not archived.")
 
 
 def _fail(message: str, *, as_json: bool) -> int:

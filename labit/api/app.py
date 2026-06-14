@@ -102,9 +102,9 @@ def create_app(paths: RepoPaths | None = None) -> FastAPI:
         return {"status": "ok"}
 
     @app.get("/api/projects", response_model=ProjectListResponse)
-    def list_projects() -> ProjectListResponse:
+    def list_projects(include_archived: bool = False) -> ProjectListResponse:
         return ProjectListResponse(
-            projects=project_service.list_project_names(),
+            projects=project_service.list_project_names(include_archived=include_archived),
             active_project=project_service.active_project_name(),
         )
 
@@ -145,6 +145,20 @@ def create_app(paths: RepoPaths | None = None) -> FastAPI:
             background_tasks.add_task(_clone)
 
         return result
+
+    @app.put("/api/projects/{project}/archive")
+    def archive_project(project: str) -> dict:
+        try:
+            return project_service.archive_project(project)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.delete("/api/projects/{project}/archive")
+    def unarchive_project(project: str) -> dict:
+        try:
+            return project_service.unarchive_project(project)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/projects/{project}/papers", response_model=list[PaperRecord])
     def list_papers(project: str) -> list[PaperRecord]:

@@ -136,6 +136,7 @@ class ProjectSpec(BaseModel):
     repo: str | None = None
     keywords: list[str] = Field(default_factory=list)
     relevance_criteria: str = ""
+    archived: bool = False
     compute_profiles: list[ComputeProfile] = Field(default_factory=list)
 
     @field_validator("name")
@@ -170,7 +171,11 @@ class ProjectSpec(BaseModel):
         return values
 
     def to_yaml_dict(self) -> dict[str, Any]:
-        return self.model_dump(mode="json", exclude_none=True)
+        data = self.model_dump(mode="json", exclude_none=True)
+        # Omit archived=False to keep YAML clean for non-archived projects
+        if not data.get("archived"):
+            data.pop("archived", None)
+        return data
 
 
 class ProjectSummary(BaseModel):
@@ -179,4 +184,5 @@ class ProjectSummary(BaseModel):
     keyword_count: int
     compute_count: int
     is_active: bool
+    archived: bool = False
     config_path: str
