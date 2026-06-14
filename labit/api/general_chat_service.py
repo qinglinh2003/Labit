@@ -23,6 +23,7 @@ from labit.api.chat_storage import (
     append_message as _append_message,
     delete_chat_dir,
     find_artifact,
+    format_history,
     list_chat_records,
     load_chat,
     save_chat,
@@ -203,33 +204,11 @@ class GeneralChatService:
             max_history: If set, only include the last N messages from history.
         """
         record = self.get_chat(project, chat_id)
-        parts: list[str] = []
-
-        messages = record.messages
-        if max_history is not None and len(messages) > max_history:
-            omitted = len(messages) - max_history
-            parts.append(f"[{omitted} earlier messages omitted for brevity]")
-            messages = messages[-max_history:]
-
-        for msg in messages:
-            if msg.role == "user":
-                text = msg.content
-                if msg.attachments:
-                    labels = ", ".join(a.filename for a in msg.attachments)
-                    text += f"\n[Attached images: {labels}]"
-                parts.append(f"User: {text}")
-            else:
-                label = msg.agent or "assistant"
-                text = msg.content
-                # Inject artifact context for previous artifacts
-                if msg.artifacts:
-                    for art in msg.artifacts:
-                        text += (
-                            f"\n\n[Previous artifact: {art.filename}]\n"
-                            f"{art.content}\n"
-                            f"[End of artifact]"
-                        )
-                parts.append(f"{label}: {text}")
+        parts = format_history(
+            record.messages,
+            max_history=max_history,
+            include_attachments=True,
+        )
 
         prompt = "\n\n".join(parts)
 

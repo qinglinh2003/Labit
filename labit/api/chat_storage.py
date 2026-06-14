@@ -166,3 +166,68 @@ def find_artifact(messages: list[Any], artifact_id: str) -> Any | None:
             if art.id == artifact_id:
                 return art
     return None
+
+
+# ---------------------------------------------------------------------------
+# Prompt history formatting
+# ---------------------------------------------------------------------------
+
+def format_history(
+    messages: list[Any],
+    *,
+    max_history: int | None = None,
+    include_attachments: bool = False,
+) -> list[str]:
+    """Format chat messages into prompt parts with artifact compression.
+
+    Only the *last* assistant message that contains artifacts gets full
+    artifact content injected.  Earlier artifacts are replaced with a
+    short reference to save context window space.
+
+    Returns a list of prompt parts (one per message, plus an optional
+    truncation notice at the front).
+    """
+    parts: list[str] = []
+
+    if max_history is not None and len(messages) > max_history:
+        omitted = len(messages) - max_history
+        parts.append(f"[{omitted} earlier messages omitted for brevity]")
+        messages = messages[-max_history:]
+
+    # Find the index of the last assistant message that has artifacts
+    last_artifact_idx: int | None = None
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].role != "user" and messages[i].artifacts:
+            last_artifact_idx = i
+            break
+
+    for i, msg in enumerate(messages):
+        if msg.role == "user":
+            text = msg.content
+            if include_attachments and msg.attachments:
+                labels = ", ".join(a.filename for a in msg.attachments)
+                text += f"\n[Attached images: {labels}]"
+            parts.append(f"User: {text}")
+        else:
+            label = msg.agent or "assistant"
+            text = msg.content
+            if msg.artifacts:
+                if i == last_artifact_idx:
+                    # Most recent artifacts: include full content
+                    for art in msg.artifacts:
+                        text += (
+                            f"\n\n[Previous artifact: {art.filename}]\n"
+                            f"{art.content}\n"
+                            f"[End of artifact]"
+                        )
+                else:
+                    # Older artifacts: reference only
+                    for art in msg.artifacts:
+                        text += (
+                            f"\n\n[Previous artifact: {art.filename} "
+                            f"- content omitted from prompt. "
+                            f"Read from chat history if needed.]"
+                        )
+            parts.append(f"{label}: {text}")
+
+    return parts

@@ -20,6 +20,7 @@ from labit.api.chat_storage import (
     append_message as _append_message,
     delete_chat_dir,
     find_artifact,
+    format_history,
     list_chat_records,
     load_chat,
     save_chat,
@@ -286,27 +287,8 @@ class DocService:
             f"</document_context>"
         )
 
-        # Chat history (optionally truncated)
-        messages = record.messages
-        if max_history is not None and len(messages) > max_history:
-            omitted = len(messages) - max_history
-            parts.append(f"[{omitted} earlier messages omitted for brevity]")
-            messages = messages[-max_history:]
-
-        for msg in messages:
-            if msg.role == "user":
-                parts.append(f"User: {msg.content}")
-            else:
-                label = msg.agent or "assistant"
-                text = msg.content
-                if msg.artifacts:
-                    for art in msg.artifacts:
-                        text += (
-                            f"\n\n[Previous artifact: {art.filename}]\n"
-                            f"{art.content}\n"
-                            f"[End of artifact]"
-                        )
-                parts.append(f"{label}: {text}")
+        # Chat history with artifact compression
+        parts.extend(format_history(record.messages, max_history=max_history))
 
         prompt = "\n\n".join(parts)
 
