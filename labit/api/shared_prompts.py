@@ -80,7 +80,11 @@ PROJECT_FILES_CONTEXT = (
     "`.chats/` and `chats/` directories contain full chat history (JSON files "
     "with complete conversation records). You can read them to recall earlier "
     "discussions, check what was decided, or find context the user references. "
-    "Do not modify these files unless the user explicitly asks.\n"
+    "Do not modify these files unless the user explicitly asks.\n\n"
+    "## Git operations\n\n"
+    "Only run git commands (commit, push, branch, etc.) inside `code/`. "
+    "The `code/` directory is the only git-managed part of the project. "
+    "Never run git operations in the outer workspace or in `docs/`, `papers/`, `chats/`.\n"
 )
 
 
