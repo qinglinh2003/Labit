@@ -136,6 +136,51 @@ def test_api_toggles_project_paper_star(tmp_path: Path) -> None:
     assert yaml.safe_load(metadata_path.read_text(encoding="utf-8"))["starred"] is False
 
 
+def test_api_paper_list_hides_rejected_unless_requested(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    client = TestClient(create_app(paths))
+    first_metadata = {
+        "arxiv_id": "2401.12345",
+        "title": "Rejected Paper",
+        "authors": ["Ada Lovelace"],
+        "abstract": "A compact abstract.",
+        "url": "https://arxiv.org/abs/2401.12345",
+        "pdf_url": "https://arxiv.org/pdf/2401.12345",
+    }
+    second_metadata = {
+        "arxiv_id": "2401.54321",
+        "title": "Useful Paper",
+        "authors": ["Grace Hopper"],
+        "abstract": "Another compact abstract.",
+        "url": "https://arxiv.org/abs/2401.54321",
+        "pdf_url": "https://arxiv.org/pdf/2401.54321",
+    }
+    client.post(
+        "/api/projects/Labit/papers/import/arxiv",
+        data={"metadata": json.dumps(first_metadata)},
+        files={"pdf": ("paper.pdf", b"%PDF-1.7\n", "application/pdf")},
+    )
+    client.post(
+        "/api/projects/Labit/papers/import/arxiv",
+        data={"metadata": json.dumps(second_metadata)},
+        files={"pdf": ("paper.pdf", b"%PDF-1.7\n", "application/pdf")},
+    )
+
+    reject_response = client.put(
+        "/api/projects/Labit/papers/arxiv-2401.12345/status",
+        json={"status": "rejected"},
+    )
+    default_response = client.get("/api/projects/Labit/papers")
+    included_response = client.get("/api/projects/Labit/papers?include_rejected=true")
+
+    assert reject_response.status_code == 200
+    assert reject_response.json()["status"] == "rejected"
+    assert default_response.status_code == 200
+    assert [item["title"] for item in default_response.json()] == ["Useful Paper"]
+    assert included_response.status_code == 200
+    assert {item["title"] for item in included_response.json()} == {"Rejected Paper", "Useful Paper"}
+
+
 def test_api_backfills_project_paper_submitted_dates(tmp_path: Path, monkeypatch) -> None:
     paths = _create_project(tmp_path)
 

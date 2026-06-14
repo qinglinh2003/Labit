@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { Archive, ArchiveRestore, BookOpen, Check, ChevronDown, ChevronLeft, ChevronRight, Edit3, Eye, FileText, FolderOpen, FolderPlus, MessageSquare, NotebookPen, Plus, RefreshCw, Search, Settings, Star, Tag, X } from "lucide-react";
+import { Archive, ArchiveRestore, Ban, BookOpen, Check, ChevronDown, ChevronLeft, ChevronRight, Edit3, Eye, FileText, FolderOpen, FolderPlus, MessageSquare, NotebookPen, Plus, RefreshCw, Search, Settings, Star, Tag, Undo2, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -421,7 +421,7 @@ export function App() {
 
   const papersQuery = useQuery({
     queryKey: ["papers", project],
-    queryFn: () => listPapers(project),
+    queryFn: () => listPapers(project, true),
     enabled: Boolean(project),
     refetchInterval: 5000,
   });
@@ -681,6 +681,13 @@ function StatusGlyph({ status }: { status: string }) {
         <path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" />
       </svg>
     );
+  if (status === "rejected")
+    return (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+        <circle cx="12" cy="12" r="9" />
+        <path d="M15 9l-6 6M9 9l6 6" />
+      </svg>
+    );
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
       <circle cx="12" cy="12" r="9" />
@@ -689,14 +696,15 @@ function StatusGlyph({ status }: { status: string }) {
 }
 
 const STATUS_META: Record<string, { label: string; color: string; soft: string; ink: string; pill: string }> = {
-  reading: { label: "Reading", color: "var(--lb-blue)", soft: "var(--lb-blue-soft)", ink: "var(--lb-blue)", pill: "var(--lb-blue)" },
-  unread:  { label: "Unread",  color: "var(--lb-faintest)", soft: "#f6f6f7", ink: "#52525b", pill: "#8a8a93" },
-  read:    { label: "Read",    color: "var(--lb-green)", soft: "var(--lb-green-soft)", ink: "var(--lb-green)", pill: "var(--lb-green)" },
+  reading:  { label: "Reading",  color: "var(--lb-blue)", soft: "var(--lb-blue-soft)", ink: "var(--lb-blue)", pill: "var(--lb-blue)" },
+  unread:   { label: "Unread",   color: "var(--lb-faintest)", soft: "#f6f6f7", ink: "#52525b", pill: "#8a8a93" },
+  read:     { label: "Read",     color: "var(--lb-green)", soft: "var(--lb-green-soft)", ink: "var(--lb-green)", pill: "var(--lb-green)" },
+  rejected: { label: "Rejected", color: "#dc2626", soft: "#fef2f2", ink: "#991b1b", pill: "#dc2626" },
 };
 
-function getPaperStatus(paper: PaperRecord): "reading" | "unread" | "read" {
+function getPaperStatus(paper: PaperRecord): "reading" | "unread" | "read" | "rejected" {
   const s = paper.status;
-  if (s === "reading" || s === "read") return s;
+  if (s === "reading" || s === "read" || s === "rejected") return s;
   return "unread";
 }
 
@@ -726,7 +734,8 @@ function PaperList({
   width: number;
 }) {
   const [mode, setMode] = useState<"time" | "topic" | "status">("status");
-  const [stOpen, setStOpen] = useState<Record<string, boolean>>({ reading: true, unread: true, read: false });
+  const [stOpen, setStOpen] = useState<Record<string, boolean>>({ reading: true, unread: true, read: false, rejected: false });
+  const [showRejected, setShowRejected] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [starredOnly, setStarredOnly] = useState(false);
 
@@ -740,7 +749,9 @@ function PaperList({
   const cycleStatus = useCallback(
     (paper: PaperRecord) => {
       if (!project) return;
-      const next = STATUS_CYCLE[getPaperStatus(paper)];
+      const current = getPaperStatus(paper);
+      if (current === "rejected") return; // use restore button instead
+      const next = STATUS_CYCLE[current];
       // Optimistic update
       queryClient.setQueryData<PaperRecord[]>(["papers", project], (old) =>
         old?.map((p) => (p.id === paper.id ? { ...p, status: next } : p)),
@@ -766,9 +777,26 @@ function PaperList({
     [project, queryClient],
   );
 
-  // Filter by search and starred
+  const rejectPaper = useCallback(
+    (paper: PaperRecord) => {
+      if (!project) return;
+      const next = getPaperStatus(paper) === "rejected" ? "unread" : "rejected";
+      queryClient.setQueryData<PaperRecord[]>(["papers", project], (old) =>
+        old?.map((p) => (p.id === paper.id ? { ...p, status: next } : p)),
+      );
+      void updatePaperStatus(project, paper.id, next).catch(() => {
+        void queryClient.invalidateQueries({ queryKey: ["papers", project] });
+      });
+    },
+    [project, queryClient],
+  );
+
+  // Filter by search, starred, and rejected
   const filtered = useMemo(() => {
     let result = papers;
+    if (!showRejected) {
+      result = result.filter((p) => getPaperStatus(p) !== "rejected");
+    }
     if (starredOnly) {
       result = result.filter((p) => p.starred);
     }
@@ -783,7 +811,9 @@ function PaperList({
       );
     }
     return result;
-  }, [papers, searchQuery, starredOnly]);
+  }, [papers, searchQuery, starredOnly, showRejected]);
+
+  const rejectedCount = useMemo(() => papers.filter((p) => getPaperStatus(p) === "rejected").length, [papers]);
 
   // Render a paper card
   const Card = useCallback(
@@ -834,11 +864,23 @@ function PaperList({
             >
               <Star size={12} />
             </span>
+            <span
+              className={`lb-reject${status === "rejected" ? " rejected" : ""}`}
+              title={status === "rejected" ? "Restore paper" : "Reject — not worth reading"}
+              role="button"
+              tabIndex={-1}
+              onClick={(e) => {
+                e.stopPropagation();
+                rejectPaper(p);
+              }}
+            >
+              {status === "rejected" ? <Undo2 size={12} /> : <Ban size={12} />}
+            </span>
           </div>
         </button>
       );
     },
-    [selectedPaperId, onSelect, project, cycleStatus, toggleStar],
+    [selectedPaperId, onSelect, project, cycleStatus, toggleStar, rejectPaper],
   );
 
   // Build body based on mode
@@ -873,7 +915,7 @@ function PaperList({
       );
     });
   } else if (mode === "status") {
-    const statuses: Array<"reading" | "unread" | "read"> = ["reading", "unread", "read"];
+    const statuses: Array<"reading" | "unread" | "read" | "rejected"> = showRejected ? ["reading", "unread", "read", "rejected"] : ["reading", "unread", "read"];
     body = statuses.map((s) => {
       const ps = filtered.filter((p) => getPaperStatus(p) === s);
       if (ps.length === 0) return null;
@@ -944,6 +986,16 @@ function PaperList({
         >
           <Star size={15} fill={starredOnly ? "#e0a800" : "none"} color={starredOnly ? "#e0a800" : "currentColor"} />
         </button>
+        {rejectedCount > 0 && (
+          <button
+            type="button"
+            className={`lb-iconbtn${showRejected ? " lb-filter-active" : ""}`}
+            title={showRejected ? "Hide rejected papers" : `Show ${rejectedCount} rejected`}
+            onClick={() => setShowRejected((v) => !v)}
+          >
+            <Ban size={15} color={showRejected ? "#dc2626" : "currentColor"} />
+          </button>
+        )}
         <button type="button" className="lb-iconbtn" title="Collapse" onClick={onCollapse}>
           <ChevronLeft size={15} />
         </button>
@@ -996,16 +1048,41 @@ function PaperList({
 }
 
 function PaperDetail({ project, paper }: { project: string; paper?: PaperRecord; showSidebar?: boolean }) {
+  const queryClient = useQueryClient();
+
   if (!paper) {
     return <EmptyState label="Select a paper" />;
   }
 
+  const status = getPaperStatus(paper);
+  const isRejected = status === "rejected";
+  const setRejected = () => {
+    const next = isRejected ? "unread" : "rejected";
+    queryClient.setQueryData<PaperRecord[]>(["papers", project], (old) =>
+      old?.map((p) => (p.id === paper.id ? { ...p, status: next } : p)),
+    );
+    void updatePaperStatus(project, paper.id, next).catch(() => {
+      void queryClient.invalidateQueries({ queryKey: ["papers", project] });
+    });
+  };
+
   return (
     <div className="min-w-0 overflow-y-auto p-5">
-      <div className="mb-4">
-        <div className="text-xs font-medium uppercase tracking-wide text-slate-500">{paper.id}</div>
-        <h2 className="mt-1 max-w-5xl text-2xl font-semibold leading-tight">{paper.title}</h2>
-        <p className="mt-2 max-w-4xl text-sm text-slate-600">{paper.authors.join(", ")}</p>
+      <div className="mb-4 flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <div className="text-xs font-medium uppercase tracking-wide text-slate-500">{paper.id}</div>
+          <h2 className="mt-1 max-w-5xl text-2xl font-semibold leading-tight">{paper.title}</h2>
+          <p className="mt-2 max-w-4xl text-sm text-slate-600">{paper.authors.join(", ")}</p>
+        </div>
+        <button
+          type="button"
+          className={`lb-detail-reject${isRejected ? " rejected" : ""}`}
+          onClick={setRejected}
+          title={isRejected ? "Restore paper" : "Reject — not worth reading"}
+        >
+          {isRejected ? <Undo2 size={14} /> : <Ban size={14} />}
+          <span>{isRejected ? "Restore" : "Reject"}</span>
+        </button>
       </div>
       {paper.local_pdf_path ? (
         <PaperImageReader project={project} paper={paper} />

@@ -161,9 +161,9 @@ def create_app(paths: RepoPaths | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/projects/{project}/papers", response_model=list[PaperRecord])
-    def list_papers(project: str) -> list[PaperRecord]:
+    def list_papers(project: str, include_rejected: bool = False) -> list[PaperRecord]:
         try:
-            return paper_service.list_papers(project)
+            return paper_service.list_papers(project, include_rejected=include_rejected)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 

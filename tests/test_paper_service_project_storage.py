@@ -124,6 +124,34 @@ def test_project_paper_reimport_preserves_starred_flag(tmp_path: Path) -> None:
     assert updated.starred is True
 
 
+def test_project_paper_list_hides_rejected_by_default(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    service = PaperService(paths)
+    service.import_arxiv_pdf(
+        project="Labit",
+        metadata=ArxivPaperMetadata(arxiv_id="2401.12345", title="Rejected Paper"),
+        pdf_content=b"first",
+    )
+    service.import_arxiv_pdf(
+        project="Labit",
+        metadata=ArxivPaperMetadata(arxiv_id="2401.54321", title="Useful Paper"),
+        pdf_content=b"second",
+    )
+
+    rejected = service.update_paper_status(
+        project="Labit",
+        paper_id="arxiv-2401.12345",
+        status="rejected",
+    )
+
+    assert rejected.status == "rejected"
+    assert [paper.title for paper in service.list_papers("Labit")] == ["Useful Paper"]
+    assert {paper.title for paper in service.list_papers("Labit", include_rejected=True)} == {
+        "Rejected Paper",
+        "Useful Paper",
+    }
+
+
 def test_project_paper_toggle_star_round_trips(tmp_path: Path) -> None:
     paths = _create_project(tmp_path)
     service = PaperService(paths)

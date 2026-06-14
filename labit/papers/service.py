@@ -173,7 +173,7 @@ class PaperService:
         self._atomic_write(metadata_path, yaml_text)
         return record
 
-    def list_papers(self, project: str) -> list[PaperRecord]:
+    def list_papers(self, project: str, *, include_rejected: bool = False) -> list[PaperRecord]:
         resolved = self._require_project(project)
         target_dir = self._paper_dir(resolved)
         if not target_dir.exists():
@@ -183,7 +183,10 @@ class PaperService:
         for path in sorted(target_dir.glob("arxiv-*/paper.yaml")):
             try:
                 raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-                records.append(PaperRecord.model_validate(raw))
+                record = PaperRecord.model_validate(raw)
+                if not include_rejected and record.status == "rejected":
+                    continue
+                records.append(record)
             except Exception:
                 continue
         return sorted(records, key=lambda item: (item.added_at, item.arxiv_id), reverse=True)
@@ -257,7 +260,7 @@ class PaperService:
         self._atomic_write(metadata_path, yaml_text)
         return PaperRecord.model_validate(raw)
 
-    _VALID_STATUSES = {"unread", "reading", "read"}
+    _VALID_STATUSES = {"unread", "reading", "read", "rejected"}
 
     def update_paper_status(self, *, project: str, paper_id: str, status: str) -> PaperRecord:
         if status not in self._VALID_STATUSES:

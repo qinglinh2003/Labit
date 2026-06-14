@@ -20,7 +20,7 @@ export interface PaperRecord {
   artifact_dir_path: string;
   tags: string[];
   starred: boolean;
-  status: "unread" | "reading" | "read";
+  status: "unread" | "reading" | "read" | "rejected";
   status_updated_at: string;
   submitted_date: string;
   added_at: string;
@@ -108,8 +108,9 @@ export async function createProject(payload: CreateProjectPayload): Promise<{ na
   return response.json() as Promise<{ name: string }>;
 }
 
-export function listPapers(project: string): Promise<PaperRecord[]> {
-  return getJson<PaperRecord[]>(`/api/projects/${encodeURIComponent(project)}/papers`);
+export function listPapers(project: string, includeRejected = false): Promise<PaperRecord[]> {
+  const params = includeRejected ? "?include_rejected=true" : "";
+  return getJson<PaperRecord[]>(`/api/projects/${encodeURIComponent(project)}/papers${params}`);
 }
 
 export async function togglePaperStar(project: string, paperId: string): Promise<PaperRecord> {
