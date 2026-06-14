@@ -20,6 +20,7 @@ from labit.agents.models import AgentRequest, AgentRole
 from labit.api.artifact_storage import extract_artifacts, write_artifact_file
 from labit.api.chat_models import ChatMode
 from labit.api.shared_prompts import (
+    SUPERPOWERS_WORKFLOW_CONTEXT,
     compute_context,
     mode_participants_context,
     project_identity_context,
@@ -256,7 +257,13 @@ def orchestrate(
     try:
         proj_ctx = project_identity_context(config.project, config.cwd)
         comp_ctx = compute_context(config.compute_profiles)
-        sys_base = config.system_prompt + mode_participants_context(mode.value, agents) + proj_ctx + comp_ctx
+        sys_base = (
+            config.system_prompt
+            + mode_participants_context(mode.value, agents)
+            + SUPERPOWERS_WORKFLOW_CONTEXT
+            + proj_ctx
+            + comp_ctx
+        )
 
         if mode == ChatMode.SINGLE:
             _orchestrate_single(agents[0], task, sys_base, config, build_prompt, save_result)

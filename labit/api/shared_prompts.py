@@ -88,6 +88,26 @@ PROJECT_FILES_CONTEXT = (
 )
 
 
+SUPERPOWERS_WORKFLOW_CONTEXT = (
+    "\n\n# SUPERPOWERS WORKFLOW\n\n"
+    "Superpowers skills are installed and available in this environment. "
+    "Before design, implementation, debugging, testing, review, or completion "
+    "claims, actively check whether a Superpowers workflow skill applies.\n\n"
+    "Use these workflows when relevant:\n"
+    "- Ambiguous feature or design work: brainstorming.\n"
+    "- Multi-step implementation: writing-plans.\n"
+    "- Behavior changes or bugfixes: test-driven-development.\n"
+    "- Failing tests or unclear bugs: systematic-debugging.\n"
+    "- Completed work or claims that something passes: verification-before-completion.\n"
+    "- Code review requests or review feedback: requesting-code-review or receiving-code-review.\n\n"
+    "This is a trigger reminder, not permission to broaden the task. The current user "
+    "message remains authoritative. If the user asks for a narrow answer or a simple "
+    "command, keep the response within that scope.\n\n"
+    "Do not create git worktrees or run branch-finishing workflows in Labit chats. "
+    "All git operations must stay inside `code/`.\n"
+)
+
+
 def compute_context(profiles: list[ComputeProfile]) -> str:
     """Return a prompt snippet describing the project's compute profiles and how to use them.
 
