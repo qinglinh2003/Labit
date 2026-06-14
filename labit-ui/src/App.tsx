@@ -792,9 +792,11 @@ function PaperList({
   );
 
   // Filter by search, starred, and rejected
+  // In status view, always include rejected papers (status view IS the management UI for rejected)
+  // In time/topic view, respect the showRejected toggle
   const filtered = useMemo(() => {
     let result = papers;
-    if (!showRejected) {
+    if (!showRejected && mode !== "status") {
       result = result.filter((p) => getPaperStatus(p) !== "rejected");
     }
     if (starredOnly) {
@@ -811,7 +813,7 @@ function PaperList({
       );
     }
     return result;
-  }, [papers, searchQuery, starredOnly, showRejected]);
+  }, [papers, searchQuery, starredOnly, showRejected, mode]);
 
   const rejectedCount = useMemo(() => papers.filter((p) => getPaperStatus(p) === "rejected").length, [papers]);
 
@@ -915,7 +917,7 @@ function PaperList({
       );
     });
   } else if (mode === "status") {
-    const statuses: Array<"reading" | "unread" | "read" | "rejected"> = showRejected ? ["reading", "unread", "read", "rejected"] : ["reading", "unread", "read"];
+    const statuses: Array<"reading" | "unread" | "read" | "rejected"> = ["reading", "unread", "read", "rejected"];
     body = statuses.map((s) => {
       const ps = filtered.filter((p) => getPaperStatus(p) === s);
       if (ps.length === 0) return null;
