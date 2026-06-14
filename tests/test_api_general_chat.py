@@ -7,7 +7,7 @@ import yaml
 from fastapi.testclient import TestClient
 
 from labit.api.app import create_app
-from labit.api.general_chat_service import extract_artifacts
+from labit.api.artifact_storage import extract_artifacts
 from labit.paths import RepoPaths
 
 
@@ -52,12 +52,13 @@ def test_general_chat_upload_serves_and_sends_image_attachment(tmp_path: Path, m
     paths = _create_project(tmp_path)
     captured: dict[str, list[str]] = {}
 
-    def fake_orchestrate_single(svc, project, chat_id, agent, task, image_paths=None):
-        captured["image_paths"] = image_paths or []
+    def fake_orchestrate(mode, agents, task, registry, task_key, config, *, build_prompt, save_result):
+        captured["image_paths"] = config.image_paths or []
         task.push_event({"type": "end"})
         task.mark_done()
+        registry.remove(task_key)
 
-    monkeypatch.setattr("labit.api.general_chat_routes._orchestrate_single", fake_orchestrate_single)
+    monkeypatch.setattr("labit.api.general_chat_routes.orchestrate", fake_orchestrate)
 
     client = TestClient(create_app(paths))
     create_response = client.post("/api/projects/Labit/chats", json={"mode": "single"})
@@ -153,6 +154,28 @@ def test_general_chat_extracts_artifacts_with_nested_code_fences() -> None:
     assert artifact.filename == "proposal.md"
     assert "```python\nprint('hello')\n```" in artifact.content
     assert "## Conclusion" in artifact.content
+
+
+def test_general_chat_extracts_artifact_without_metadata() -> None:
+    cleaned, artifacts = extract_artifacts(
+        "Here is the document.\n\n"
+        "`````artifact:phase_ab_summary.md\n"
+        "# Phase A/B Summary\n\n"
+        "```python\n"
+        "print('nested code block')\n"
+        "```\n\n"
+        "The artifact should still be extracted.\n"
+        "`````\n\n"
+        "Done.",
+        agent="codex",
+    )
+
+    assert len(artifacts) == 1
+    artifact = artifacts[0]
+    assert artifact.filename == "phase_ab_summary.md"
+    assert artifact.title == "phase ab summary"
+    assert "```python\nprint('nested code block')\n```" in artifact.content
+    assert "artifact:phase_ab_summary.md" not in cleaned
     assert "nested code fence" not in cleaned
 
 

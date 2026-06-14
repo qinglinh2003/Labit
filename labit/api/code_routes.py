@@ -1,45 +1,50 @@
 """Code API routes: file browsing, content read/write, code-scoped chat with SSE."""
 from __future__ import annotations
 
-import asyncio
-import json
+import logging
+import mimetypes
 import threading
-from collections.abc import AsyncGenerator
-from dataclasses import dataclass, field
 
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException, Response, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-from labit.api.artifact_storage import write_artifact_file
+from labit.api.agent_runtime import (
+    CODEX_MAX_HISTORY,
+    BackgroundTask,
+    OrchestrationConfig,
+    TaskRegistry,
+    orchestrate,
+    save_agent_result,
+    stream_from_task,
+)
+from labit.api.chat_models import (
+    AskRequest,
+    Attachment,
+    ChatListItem,
+    ChatMode,
+    ChatRecord,
+    CreateChatRequest,
+    UpdateChatRequest,
+)
 from labit.api.downloads import attachment_content_disposition
-from labit.api.general_chat_service import extract_artifacts
-
-from labit.agents.adapters.base import AgentAdapterError, StreamCancelled
-from labit.agents.adapters.claude import ClaudeAdapter
-from labit.agents.adapters.codex import CodexAdapter
-from labit.agents.models import AgentRequest, AgentRole
 from labit.api.code_models import (
-    CodeAskRequest,
-    CodeChatListItem,
-    CodeChatRecord,
     CodeFileContent,
     CodeFileRecord,
     CodeTreeEntry,
-    CreateCodeChatRequest,
-    UpdateCodeChatRequest,
 )
-from labit.api.code_service import CODE_SYSTEM_PROMPT, CodeService
-from labit.api.shared_prompts import (
-    ROUND_ROBIN_REVIEW_ADDENDUM,
-    compute_context,
-    mode_participants_context,
-    project_identity_context,
-    same_turn_peer_input_context,
+from labit.api.attachment_utils import ALLOWED_MIME_TYPES, MAX_UPLOAD_BYTES
+from labit.api.code_service import (
+    CODE_SYSTEM_PROMPT,
+    CodeService,
+    decode_file_id,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 _code_service: CodeService | None = None
+_task_registry = TaskRegistry()
 
 
 def mount_code_routes(code_service: CodeService) -> APIRouter:
@@ -51,6 +56,10 @@ def mount_code_routes(code_service: CodeService) -> APIRouter:
 def _svc() -> CodeService:
     assert _code_service is not None
     return _code_service
+
+
+def _task_key(project: str, chat_id: str) -> str:
+    return f"code/{project}/{chat_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +91,63 @@ def get_file_content(project: str, file_id: str) -> CodeFileContent:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/api/projects/{project}/code/files/{file_id}/preview.pdf")
+def preview_code_file_pdf(project: str, file_id: str) -> Response:
+    """Render a markdown code file as PDF via weasyprint."""
+    try:
+        content = _svc().get_content(project, file_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    try:
+        decoded_path = decode_file_id(file_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if not decoded_path.lower().endswith((".md", ".mdx", ".markdown")):
+        raise HTTPException(status_code=400, detail="PDF preview only supports markdown files")
+
+    from markdown_it import MarkdownIt
+    from mdit_py_plugins.dollarmath import dollarmath_plugin
+
+    md = MarkdownIt().enable("table").enable("strikethrough")
+    dollarmath_plugin(md)
+    body_html = md.render(content)
+
+    full_html = (
+        '<!DOCTYPE html><html><head><meta charset="utf-8">'
+        "<style>"
+        "body { font-family: sans-serif; max-width: 700px; margin: 40px auto;"
+        " font-size: 14px; line-height: 1.6; color: #1e293b; }"
+        "h1 { font-size: 24px; border-bottom: 1px solid #e2e8f0; padding-bottom: 8px; }"
+        "h2 { font-size: 20px; } h3 { font-size: 16px; }"
+        "table { border-collapse: collapse; width: 100%; margin: 16px 0; }"
+        "th, td { border: 1px solid #cbd5e1; padding: 6px 12px; text-align: left; }"
+        "th { background: #f1f5f9; font-weight: 600; }"
+        "code { background: #f1f5f9; padding: 2px 4px; border-radius: 3px; font-size: 13px; }"
+        "pre { background: #f1f5f9; padding: 12px; border-radius: 4px; overflow-x: auto; }"
+        "pre code { background: none; padding: 0; }"
+        "blockquote { border-left: 3px solid #94a3b8; margin: 16px 0; padding: 8px 16px;"
+        " color: #475569; background: #f8fafc; }"
+        "img { max-width: 100%; }"
+        "hr { border: none; border-top: 1px solid #e2e8f0; margin: 24px 0; }"
+        ".math { font-family: serif; font-style: italic; text-align: center;"
+        " margin: 16px 0; font-size: 16px; }"
+        "</style></head><body>"
+        f"{body_html}"
+        "</body></html>"
+    )
+
+    import weasyprint
+    pdf_bytes = weasyprint.HTML(string=full_html).write_pdf()
+
+    filename = decoded_path.rsplit("/", 1)[-1] if "/" in decoded_path else decoded_path
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{filename}.pdf"'},
+    )
+
+
 @router.put("/api/projects/{project}/code/files/{file_id}/content", response_model=CodeFileRecord)
 def save_file_content(project: str, file_id: str, body: CodeFileContent) -> CodeFileRecord:
     try:
@@ -111,8 +177,8 @@ def apply_artifact(project: str, file_id: str, body: ApplyArtifactRequest) -> Co
 # Code Chat CRUD
 # ---------------------------------------------------------------------------
 
-@router.post("/api/projects/{project}/code/chats", response_model=CodeChatRecord)
-def create_code_chat(project: str, body: CreateCodeChatRequest) -> CodeChatRecord:
+@router.post("/api/projects/{project}/code/chats", response_model=ChatRecord)
+def create_code_chat(project: str, body: CreateChatRequest) -> ChatRecord:
     try:
         return _svc().create_chat(
             project, file_path=body.file_path,
@@ -122,21 +188,21 @@ def create_code_chat(project: str, body: CreateCodeChatRequest) -> CodeChatRecor
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/api/projects/{project}/code/chats", response_model=list[CodeChatListItem])
-def list_code_chats(project: str, file_path: str | None = None) -> list[CodeChatListItem]:
+@router.get("/api/projects/{project}/code/chats", response_model=list[ChatListItem])
+def list_code_chats(project: str, file_path: str | None = None) -> list[ChatListItem]:
     return _svc().list_chats(project, file_path=file_path)
 
 
-@router.get("/api/projects/{project}/code/chats/{chat_id}", response_model=CodeChatRecord)
-def get_code_chat(project: str, chat_id: str) -> CodeChatRecord:
+@router.get("/api/projects/{project}/code/chats/{chat_id}", response_model=ChatRecord)
+def get_code_chat(project: str, chat_id: str) -> ChatRecord:
     try:
         return _svc().get_chat(project, chat_id)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.patch("/api/projects/{project}/code/chats/{chat_id}", response_model=CodeChatRecord)
-def update_code_chat(project: str, chat_id: str, body: UpdateCodeChatRequest) -> CodeChatRecord:
+@router.patch("/api/projects/{project}/code/chats/{chat_id}", response_model=ChatRecord)
+def update_code_chat(project: str, chat_id: str, body: UpdateChatRequest) -> ChatRecord:
     try:
         return _svc().update_chat(project, chat_id, mode=body.mode, first_agent=body.first_agent, title=body.title)
     except (FileNotFoundError, ValueError) as exc:
@@ -174,146 +240,47 @@ def download_code_artifact(project: str, chat_id: str, artifact_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Background task registry
+# Attachments
 # ---------------------------------------------------------------------------
 
-@dataclass
-class BackgroundTask:
-    events: list[dict] = field(default_factory=list)
-    cancel_events: list[threading.Event] = field(default_factory=list)
-    done: bool = False
-    _lock: threading.Lock = field(default_factory=threading.Lock)
-
-    def push_event(self, event: dict) -> None:
-        with self._lock:
-            self.events.append(event)
-
-    def mark_done(self) -> None:
-        with self._lock:
-            self.done = True
-
-    def snapshot(self) -> tuple[list[dict], bool]:
-        with self._lock:
-            return list(self.events), self.done
-
-    def cancel(self) -> None:
-        for ce in self.cancel_events:
-            ce.set()
-
-
-_active_tasks: dict[str, BackgroundTask] = {}
-_tasks_lock = threading.Lock()
-
-
-def _task_key(project: str, chat_id: str) -> str:
-    return f"code/{project}/{chat_id}"
-
-
-def _get_task(project: str, chat_id: str) -> BackgroundTask | None:
-    with _tasks_lock:
-        return _active_tasks.get(_task_key(project, chat_id))
-
-
-def _set_task(project: str, chat_id: str, task: BackgroundTask) -> None:
-    key = _task_key(project, chat_id)
-    with _tasks_lock:
-        old = _active_tasks.get(key)
-        if old and not old.done:
-            old.cancel()
-        _active_tasks[key] = task
-
-
-def _remove_task(project: str, chat_id: str) -> None:
-    with _tasks_lock:
-        _active_tasks.pop(_task_key(project, chat_id), None)
-
-
-# ---------------------------------------------------------------------------
-# Agent execution
-# ---------------------------------------------------------------------------
-
-def _get_adapter(agent: str):
-    if agent == "claude":
-        return ClaudeAdapter()
-    elif agent == "codex":
-        return CodexAdapter()
-    raise ValueError(f"Unknown agent: {agent}")
-
-
-def _run_agent_to_task(
-    agent: str, prompt: str, system_prompt: str,
-    task: BackgroundTask, cancel_event: threading.Event,
-    *,
-    cwd: str | None = None,
-) -> None:
-    adapter = _get_adapter(agent)
-    allowed_tools = ["Read", "Grep", "Glob", "Edit", "Write", "Bash", "WebSearch", "WebFetch"]
-
-    request = AgentRequest(
-        role=AgentRole.DISCUSSANT,
-        prompt=prompt,
-        system_prompt=system_prompt,
-        timeout_seconds=600,
-        allowed_tools=allowed_tools,
-        cwd=cwd,
-    )
-
-    collected: list[str] = []
-
-    def on_text(chunk: str) -> None:
-        collected.append(chunk)
-        task.push_event({"type": "text", "agent": agent, "text": chunk})
-
-    def on_status(status: str) -> None:
-        task.push_event({"type": "status", "agent": agent, "status": status})
-
+@router.post(
+    "/api/projects/{project}/code/chats/{chat_id}/attachments",
+    response_model=Attachment,
+)
+async def upload_attachment(project: str, chat_id: str, file: UploadFile) -> Attachment:
+    svc = _svc()
     try:
-        task.push_event({"type": "start", "agent": agent})
-        response = adapter.run_stream(request, on_text=on_text, on_status=on_status, cancel_event=cancel_event)
-        final_text = response.raw_output.strip() or "".join(collected)
-        task.push_event({"type": "done", "agent": agent, "full_text": final_text})
-    except StreamCancelled:
-        task.push_event({"type": "done", "agent": agent, "full_text": "".join(collected)})
-    except AgentAdapterError as exc:
-        task.push_event({"type": "error", "agent": agent, "error": str(exc), "full_text": "".join(collected)})
-    except Exception as exc:
-        task.push_event({"type": "error", "agent": agent, "error": str(exc), "full_text": "".join(collected)})
+        svc.get_chat(project, chat_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    mime = file.content_type or mimetypes.guess_type(file.filename or "")[0] or ""
+    if mime not in ALLOWED_MIME_TYPES:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {mime}. Allowed: {', '.join(sorted(ALLOWED_MIME_TYPES))}")
+
+    data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail=f"File too large ({len(data)} bytes). Max: {MAX_UPLOAD_BYTES} bytes.")
+
+    return svc.upload_attachment(project, chat_id, filename=file.filename or "image.png", mime_type=mime, data=data)
 
 
-def _get_agent_text(task: BackgroundTask, agent: str) -> str:
-    events, _ = task.snapshot()
-    for ev in events:
-        if ev.get("agent") == agent and ev.get("type") in ("done", "error"):
-            return ev.get("full_text", "")
-    return ""
-
-
-def _save_agent_result(
-    svc: CodeService, project: str, chat_id: str,
-    agent: str, task: BackgroundTask,
-) -> None:
-    text = _get_agent_text(task, agent)
-    if text:
-        cleaned, artifacts = extract_artifacts(text, agent=agent)
-        if artifacts:
-            chat_dir = svc.code_chat_dir(project, chat_id)
-            for art in artifacts:
-                try:
-                    write_artifact_file(chat_dir, art)
-                except Exception:
-                    pass
-        svc.append_message(
-            project, chat_id, "assistant", cleaned,
-            agent=agent, artifacts=artifacts if artifacts else None,
-        )
+@router.get("/api/projects/{project}/code/chats/{chat_id}/attachments/{att_id}")
+def get_attachment(project: str, chat_id: str, att_id: str):
+    svc = _svc()
+    att_id_clean = att_id.rsplit(".", 1)[0] if "." in att_id else att_id
+    path = svc.get_attachment_path(project, chat_id, att_id_clean)
+    if not path or not path.exists():
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+    return FileResponse(path, media_type=mime)
 
 
 # ---------------------------------------------------------------------------
-# Orchestration
+# Orchestration helpers
 # ---------------------------------------------------------------------------
 
 def _load_compute_profiles(svc: CodeService, project: str):
-    """Load compute profiles for prompt injection."""
     try:
         ps = svc.project_service
         resolved = ps.resolve_project_name(project)
@@ -325,155 +292,77 @@ def _load_compute_profiles(svc: CodeService, project: str):
     return []
 
 
-def _orchestrate_single(
-    svc: CodeService, project: str, chat_id: str,
-    agent: str, task: BackgroundTask,
-) -> None:
-    try:
-        prompt = svc.build_prompt(project, chat_id)
-        code_cwd = svc.get_project_dir(project)
-        proj_ctx = project_identity_context(project, code_cwd)
-        comp_ctx = compute_context(_load_compute_profiles(svc, project))
-        sys_prompt = CODE_SYSTEM_PROMPT + mode_participants_context("single", [agent]) + proj_ctx + comp_ctx
-        cancel_event = threading.Event()
-        task.cancel_events.append(cancel_event)
-        _run_agent_to_task(agent, prompt, sys_prompt, task, cancel_event, cwd=code_cwd)
-        _save_agent_result(svc, project, chat_id, agent, task)
-    except Exception as exc:
-        task.push_event({"type": "error", "error": str(exc)})
-    finally:
-        task.push_event({"type": "end"})
-        task.mark_done()
-        _remove_task(project, chat_id)
-
-
-def _orchestrate_parallel(
-    svc: CodeService, project: str, chat_id: str,
-    agents: list[str], task: BackgroundTask,
-) -> None:
-    try:
-        prompt = svc.build_prompt(project, chat_id)
-        code_cwd = svc.get_project_dir(project)
-        proj_ctx = project_identity_context(project, code_cwd)
-        comp_ctx = compute_context(_load_compute_profiles(svc, project))
-        sys_prompt = CODE_SYSTEM_PROMPT + mode_participants_context("parallel", agents) + proj_ctx + comp_ctx
-        threads = []
-        for agent in agents:
-            cancel_event = threading.Event()
-            task.cancel_events.append(cancel_event)
-            t = threading.Thread(
-                target=_run_agent_to_task,
-                args=(agent, prompt, sys_prompt, task, cancel_event),
-                kwargs={"cwd": code_cwd},
-                daemon=True,
-            )
-            t.start()
-            threads.append(t)
-        for t in threads:
-            t.join()
-        for agent in agents:
-            _save_agent_result(svc, project, chat_id, agent, task)
-    except Exception as exc:
-        task.push_event({"type": "error", "error": str(exc)})
-    finally:
-        task.push_event({"type": "end"})
-        task.mark_done()
-        _remove_task(project, chat_id)
-
-
-def _orchestrate_round_robin(
-    svc: CodeService, project: str, chat_id: str,
-    agents: list[str], task: BackgroundTask,
-) -> None:
-    try:
-        first = agents[0]
-        code_cwd = svc.get_project_dir(project)
-        proj_ctx = project_identity_context(project, code_cwd)
-        comp_ctx = compute_context(_load_compute_profiles(svc, project))
-        prompt = svc.build_prompt(project, chat_id)
-        sys_prompt = CODE_SYSTEM_PROMPT + mode_participants_context("round_robin", agents) + proj_ctx + comp_ctx
-        cancel_event = threading.Event()
-        task.cancel_events.append(cancel_event)
-        _run_agent_to_task(first, prompt, sys_prompt, task, cancel_event, cwd=code_cwd)
-        _save_agent_result(svc, project, chat_id, first, task)
-
-        first_text = _get_agent_text(task, first)
-        if len(agents) > 1 and first_text:
-            second = agents[1]
-            prompt2 = prompt + same_turn_peer_input_context(first, first_text)
-            review_prompt = sys_prompt + ROUND_ROBIN_REVIEW_ADDENDUM
-            cancel_event2 = threading.Event()
-            task.cancel_events.append(cancel_event2)
-            _run_agent_to_task(second, prompt2, review_prompt, task, cancel_event2, cwd=code_cwd)
-            _save_agent_result(svc, project, chat_id, second, task)
-    except Exception as exc:
-        task.push_event({"type": "error", "error": str(exc)})
-    finally:
-        task.push_event({"type": "end"})
-        task.mark_done()
-        _remove_task(project, chat_id)
-
-
-# ---------------------------------------------------------------------------
-# SSE streaming
-# ---------------------------------------------------------------------------
-
-async def _stream_from_task(task: BackgroundTask) -> AsyncGenerator[str, None]:
-    cursor = 0
-    while True:
-        events, done = task.snapshot()
-        while cursor < len(events):
-            event = events[cursor]
-            event_type = event.get("type", "unknown")
-            yield f"event: {event_type}\ndata: {json.dumps(event)}\n\n"
-            cursor += 1
-            if event_type == "end":
-                return
-        if done:
-            return
-        yield ": keepalive\n\n"
-        await asyncio.sleep(0.5)
-
-
 # ---------------------------------------------------------------------------
 # SSE endpoints
 # ---------------------------------------------------------------------------
 
 @router.post("/api/projects/{project}/code/chats/{chat_id}/ask")
-async def code_ask(project: str, chat_id: str, body: CodeAskRequest):
+async def code_ask(project: str, chat_id: str, body: AskRequest):
     svc = _svc()
     try:
         chat = svc.get_chat(project, chat_id)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    svc.append_message(project, chat_id, "user", body.content)
+    # Resolve attachments
+    attachments: list[Attachment] = []
+    if body.attachment_ids:
+        attachments = svc.resolve_attachment_ids(project, chat_id, body.attachment_ids)
+        found_ids = {att.id for att in attachments}
+        missing_ids = [att_id for att_id in body.attachment_ids if att_id not in found_ids]
+        if missing_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Attachment not found for chat: {', '.join(missing_ids)}",
+            )
+
+    svc.append_message(project, chat_id, "user", body.content, attachments=attachments)
+
+    image_paths = [a.path for a in attachments if a.kind == "image"]
 
     mode = chat.mode
     first = chat.first_agent
     second = "codex" if first == "claude" else "claude"
+    agents = [first] if mode == ChatMode.SINGLE else [first, second]
 
     task = BackgroundTask()
-    _set_task(project, chat_id, task)
+    key = _task_key(project, chat_id)
+    _task_registry.set(key, task)
 
-    from labit.api.chat_models import ChatMode
-    if mode == ChatMode.SINGLE:
-        target = _orchestrate_single
-        args = (svc, project, chat_id, first, task)
-    elif mode == ChatMode.PARALLEL:
-        target = _orchestrate_parallel
-        args = (svc, project, chat_id, [first, second], task)
-    else:
-        target = _orchestrate_round_robin
-        args = (svc, project, chat_id, [first, second], task)
+    code_cwd = svc.get_project_dir(project)
+    config = OrchestrationConfig(
+        system_prompt=CODE_SYSTEM_PROMPT,
+        allowed_tools=["Read", "Grep", "Glob", "Edit", "Write", "Bash", "WebSearch", "WebFetch"],
+        cwd=code_cwd,
+        image_paths=image_paths,
+        project=project,
+        compute_profiles=_load_compute_profiles(svc, project),
+    )
 
-    threading.Thread(target=target, args=args, daemon=True).start()
-    return StreamingResponse(_stream_from_task(task), media_type="text/event-stream")
+    def build_prompt(agent: str) -> str:
+        max_history = CODEX_MAX_HISTORY if agent == "codex" else None
+        return svc.build_prompt(project, chat_id, max_history=max_history)
+
+    def do_save_result(agent: str) -> None:
+        save_agent_result(
+            task, agent,
+            chat_dir=svc.code_chat_dir(project, chat_id),
+            append_message_fn=lambda role, content, **kw: svc.append_message(project, chat_id, role, content, **kw),
+        )
+
+    threading.Thread(
+        target=orchestrate,
+        args=(mode, agents, task, _task_registry, key, config),
+        kwargs={"build_prompt": build_prompt, "save_result": do_save_result},
+        daemon=True,
+    ).start()
+
+    return StreamingResponse(stream_from_task(task), media_type="text/event-stream")
 
 
 @router.get("/api/projects/{project}/code/chats/{chat_id}/active-task")
 def get_active_task(project: str, chat_id: str):
-    task = _get_task(project, chat_id)
+    task = _task_registry.get(_task_key(project, chat_id))
     if not task or task.done:
         return {"active": False}
     events, _ = task.snapshot()
@@ -482,15 +371,15 @@ def get_active_task(project: str, chat_id: str):
 
 @router.get("/api/projects/{project}/code/chats/{chat_id}/active-task/stream")
 async def stream_active_task(project: str, chat_id: str):
-    task = _get_task(project, chat_id)
+    task = _task_registry.get(_task_key(project, chat_id))
     if not task or task.done:
         raise HTTPException(status_code=404, detail="No active task")
-    return StreamingResponse(_stream_from_task(task), media_type="text/event-stream")
+    return StreamingResponse(stream_from_task(task), media_type="text/event-stream")
 
 
 @router.post("/api/projects/{project}/code/chats/{chat_id}/stop")
 def stop_task(project: str, chat_id: str):
-    task = _get_task(project, chat_id)
+    task = _task_registry.get(_task_key(project, chat_id))
     if task and not task.done:
         task.cancel()
         return {"stopped": True}

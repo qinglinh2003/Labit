@@ -2,22 +2,41 @@
 from __future__ import annotations
 
 import base64
-import re
 import shutil
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from labit.api.chat_models import AgentName, Artifact, ChatMode
+import mimetypes
+
+from labit.api.attachment_utils import (
+    get_attachment_path as _get_attachment_path,
+    resolve_attachment_ids as _resolve_attachment_ids,
+    upload_attachment as _upload_attachment,
+)
+from labit.api.chat_models import (
+    AgentName,
+    Artifact,
+    Attachment,
+    ChatListItem,
+    ChatMessage,
+    ChatMode,
+    ChatRecord,
+)
+from labit.api.chat_storage import (
+    append_message as _append_message,
+    delete_chat_dir,
+    find_artifact,
+    list_chat_records,
+    load_chat,
+    save_chat,
+    update_chat_fields,
+)
 from labit.api.code_models import (
-    CodeChatListItem,
-    CodeChatMessage,
-    CodeChatRecord,
     CodeFileContent,
     CodeFileRecord,
     CodeTreeEntry,
 )
-from labit.api.general_chat_service import extract_artifacts
 from labit.services.project_service import ProjectService
 
 
@@ -68,7 +87,7 @@ _IGNORE_DIRS = {
     "venv", ".venv", "env", ".env",
     "dist", "build", ".next", ".nuxt",
     ".eggs", "*.egg-info",
-    ".history", ".chats",
+    ".history",
     "htmlcov", "coverage",
 }
 
@@ -237,7 +256,7 @@ class CodeService:
         self, project: str, file_path: str | None = None,
         title: str = "", mode: ChatMode = ChatMode.SINGLE,
         first_agent: AgentName = "claude",
-    ) -> CodeChatRecord:
+    ) -> ChatRecord:
         if file_path:
             file_id = encode_file_id(file_path)
             # Verify file exists
@@ -246,7 +265,7 @@ class CodeService:
         chat_id = uuid.uuid4().hex[:12]
         now = datetime.now(UTC).replace(microsecond=0).isoformat()
         default_title = f"Chat about {file_path.split('/')[-1]}" if file_path else "Code chat"
-        record = CodeChatRecord(
+        record = ChatRecord(
             chat_id=chat_id,
             title=title or default_title,
             file_path=file_path,
@@ -255,105 +274,92 @@ class CodeService:
             created_at=now,
             updated_at=now,
         )
-        self._save_chat(chats_dir, record)
+        save_chat(chats_dir, record)
         return record
 
-    def list_chats(self, project: str, file_path: str | None = None) -> list[CodeChatListItem]:
-        chats_dir = self._code_chats_dir(project)
-        if not chats_dir.exists():
-            return []
-        items: list[CodeChatListItem] = []
-        seen_ids: set[str] = set()
+    def list_chats(self, project: str, file_path: str | None = None) -> list[ChatListItem]:
+        records = list_chat_records(self._code_chats_dir(project), ChatRecord)
+        if file_path:
+            records = [r for r in records if r.file_path == file_path]
+        return [
+            ChatListItem(
+                chat_id=r.chat_id, title=r.title, mode=r.mode,
+                first_agent=r.first_agent, updated_at=r.updated_at,
+                message_count=len(r.messages),
+            )
+            for r in records
+        ]
 
-        # New format: {chat_id}/chat.json
-        for chat_json in chats_dir.glob("*/chat.json"):
-            try:
-                record = CodeChatRecord.model_validate_json(chat_json.read_text(encoding="utf-8"))
-                if file_path and record.file_path != file_path:
-                    continue
-                seen_ids.add(record.chat_id)
-                items.append(CodeChatListItem(
-                    chat_id=record.chat_id, title=record.title,
-                    mode=record.mode, first_agent=record.first_agent,
-                    updated_at=record.updated_at, message_count=len(record.messages),
-                ))
-            except Exception:
-                continue
-
-        # Old format fallback
-        for path in chats_dir.glob("*.json"):
-            try:
-                record = CodeChatRecord.model_validate_json(path.read_text(encoding="utf-8"))
-                if record.chat_id in seen_ids:
-                    continue
-                if file_path and record.file_path != file_path:
-                    continue
-                seen_ids.add(record.chat_id)
-                items.append(CodeChatListItem(
-                    chat_id=record.chat_id, title=record.title,
-                    mode=record.mode, first_agent=record.first_agent,
-                    updated_at=record.updated_at, message_count=len(record.messages),
-                ))
-            except Exception:
-                continue
-
-        items.sort(key=lambda x: x.updated_at, reverse=True)
-        return items
-
-    def get_chat(self, project: str, chat_id: str) -> CodeChatRecord:
-        path = self._code_chat_path(project, chat_id)
-        if not path.exists():
-            raise FileNotFoundError(f"Chat '{chat_id}' not found.")
-        return CodeChatRecord.model_validate_json(path.read_text(encoding="utf-8"))
+    def get_chat(self, project: str, chat_id: str) -> ChatRecord:
+        return load_chat(self._code_chats_dir(project), chat_id, ChatRecord)
 
     def update_chat(
         self, project: str, chat_id: str, *,
         mode: ChatMode | None = None,
         first_agent: AgentName | None = None,
         title: str | None = None,
-    ) -> CodeChatRecord:
-        record = self.get_chat(project, chat_id)
-        if mode is not None:
-            record.mode = mode
-        if first_agent is not None:
-            record.first_agent = first_agent
-        if title is not None:
-            record.title = title
-        record.updated_at = datetime.now(UTC).replace(microsecond=0).isoformat()
-        self._save_chat(self._code_chats_dir(project), record)
-        return record
+    ) -> ChatRecord:
+        return update_chat_fields(
+            self._code_chats_dir(project), chat_id, ChatRecord,
+            mode=mode, first_agent=first_agent, title=title,
+        )
 
     def delete_chat(self, project: str, chat_id: str) -> None:
-        chat_dir = self.code_chat_dir(project, chat_id)
-        if chat_dir.exists() and chat_dir.is_dir():
-            shutil.rmtree(chat_dir)
-        old_path = self._code_chats_dir(project) / f"{chat_id}.json"
-        if old_path.exists():
-            old_path.unlink()
+        delete_chat_dir(self._code_chats_dir(project), chat_id)
 
     def append_message(
         self, project: str, chat_id: str,
         role: str, content: str,
         agent: str | None = None,
+        attachments: list[Attachment] | None = None,
         artifacts: list[Artifact] | None = None,
-    ) -> CodeChatMessage:
-        record = self.get_chat(project, chat_id)
-        now = datetime.now(UTC).replace(microsecond=0).isoformat()
-        msg = CodeChatMessage(
-            id=f"msg_{uuid.uuid4().hex[:8]}",
-            role=role,
-            content=content,
-            agent=agent,
-            artifacts=artifacts or [],
-            created_at=now,
+    ) -> ChatMessage:
+        extra: dict = {}
+        if attachments:
+            extra["attachments"] = attachments
+        if artifacts:
+            extra["artifacts"] = artifacts
+        return _append_message(
+            self._code_chats_dir(project), chat_id, ChatRecord,
+            ChatMessage, role=role, content=content, agent=agent,
+            extra_fields=extra or None,
         )
-        record.messages.append(msg)
-        record.updated_at = now
-        self._save_chat(self._code_chats_dir(project), record)
-        return msg
 
-    def build_prompt(self, project: str, chat_id: str) -> str:
-        """Build prompt with file path hint + chat history (no full content injection)."""
+    # ---- Attachments ----
+
+    def _attachments_dir(self, project: str, chat_id: str) -> Path:
+        return self.code_chat_dir(project, chat_id) / "attachments"
+
+    def upload_attachment(
+        self,
+        project: str,
+        chat_id: str,
+        filename: str,
+        mime_type: str,
+        data: bytes,
+    ) -> Attachment:
+        return _upload_attachment(
+            self._attachments_dir(project, chat_id), filename, mime_type, data,
+        )
+
+    def get_attachment_path(self, project: str, chat_id: str, att_id: str) -> Path | None:
+        return _get_attachment_path(self._attachments_dir(project, chat_id), att_id)
+
+    def resolve_attachment_ids(
+        self, project: str, chat_id: str, attachment_ids: list[str],
+    ) -> list[Attachment]:
+        record = self.get_chat(project, chat_id)
+        return _resolve_attachment_ids(
+            self._attachments_dir(project, chat_id), record.messages, attachment_ids,
+        )
+
+    def build_prompt(self, project: str, chat_id: str, *, max_history: int | None = None) -> str:
+        """Build prompt with file path hint + chat history (no full content injection).
+
+        Args:
+            max_history: If set, only include the last N messages from history.
+                         Older messages are summarized with a count notice.
+        """
         record = self.get_chat(project, chat_id)
 
         parts: list[str] = []
@@ -370,8 +376,14 @@ class CodeService:
                 "Use your tools to explore the codebase as needed."
             )
 
-        # Chat history
-        for msg in record.messages:
+        # Chat history (optionally truncated)
+        messages = record.messages
+        if max_history is not None and len(messages) > max_history:
+            omitted = len(messages) - max_history
+            parts.append(f"[{omitted} earlier messages omitted for brevity]")
+            messages = messages[-max_history:]
+
+        for msg in messages:
             if msg.role == "user":
                 parts.append(f"User: {msg.content}")
             else:
@@ -418,11 +430,7 @@ class CodeService:
 
     def get_artifact(self, project: str, chat_id: str, artifact_id: str) -> Artifact | None:
         record = self.get_chat(project, chat_id)
-        for msg in record.messages:
-            for art in msg.artifacts:
-                if art.id == artifact_id:
-                    return art
-        return None
+        return find_artifact(record.messages, artifact_id)
 
     def apply_artifact(self, project: str, file_id: str, chat_id: str, artifact_id: str) -> CodeFileRecord:
         """Apply an artifact's content to the file."""
@@ -444,7 +452,29 @@ class CodeService:
         return self._code_chats_dir(project) / chat_id
 
     def _code_chats_dir(self, project: str) -> Path:
-        return self._code_dir(project) / ".chats"
+        target = self._code_dir(project) / ".chats"
+        # Migrate: move project-level code_chats back into code/.chats
+        old_external = self.project_service.project_dir(project) / "code_chats"
+        if old_external.exists() and not target.exists():
+            old_external.rename(target)
+        self._ensure_git_exclude(project)
+        return target
+
+    def _ensure_git_exclude(self, project: str) -> None:
+        """Add .chats to code/.git/info/exclude if not already present."""
+        git_dir = self._code_dir(project) / ".git"
+        if not git_dir.is_dir():
+            return
+        info_dir = git_dir / "info"
+        info_dir.mkdir(parents=True, exist_ok=True)
+        exclude_file = info_dir / "exclude"
+        marker = ".chats"
+        if exclude_file.exists():
+            content = exclude_file.read_text()
+            if marker in content.splitlines():
+                return
+        with exclude_file.open("a") as f:
+            f.write(f"\n{marker}\n")
 
     def _resolve_file_path(self, code_dir: Path, file_id: str) -> Path:
         rel = decode_file_id(file_id)
@@ -468,17 +498,3 @@ class CodeService:
         history_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, history_dir / f"{ts}_{path.name}")
 
-    def _code_chat_path(self, project: str, chat_id: str) -> Path:
-        new_path = self._code_chats_dir(project) / chat_id / "chat.json"
-        if new_path.exists():
-            return new_path
-        old_path = self._code_chats_dir(project) / f"{chat_id}.json"
-        if old_path.exists():
-            return old_path
-        return new_path
-
-    def _save_chat(self, chats_dir: Path, record: CodeChatRecord) -> None:
-        chat_dir = chats_dir / record.chat_id
-        chat_dir.mkdir(parents=True, exist_ok=True)
-        path = chat_dir / "chat.json"
-        path.write_text(record.model_dump_json(indent=2), encoding="utf-8")

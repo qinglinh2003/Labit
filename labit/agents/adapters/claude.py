@@ -24,12 +24,10 @@ class ClaudeAdapter(AgentAdapter):
                 text=True,
                 cwd=request.cwd,
                 check=True,
-                timeout=request.timeout_seconds,
+                timeout=None,
             )
         except subprocess.TimeoutExpired as exc:
-            raise AgentAdapterError(
-                f"Claude adapter timed out after {request.timeout_seconds}s."
-            ) from exc
+            raise AgentAdapterError("Claude adapter timed out.") from exc
         except subprocess.CalledProcessError as exc:
             detail = (exc.stderr or exc.stdout or str(exc)).strip()
             raise AgentAdapterError(f"Claude adapter failed: {detail}") from exc
@@ -132,15 +130,12 @@ class ClaudeAdapter(AgentAdapter):
             result = stream_subprocess_lines(
                 cmd,
                 cwd=request.cwd,
-                timeout_seconds=request.timeout_seconds,
                 input_text=request.prompt,
                 on_stdout_line=_handle_stdout,
                 cancel_event=cancel_event,
             )
         except subprocess.TimeoutExpired as exc:
-            raise AgentAdapterError(
-                f"Claude adapter timed out after {request.timeout_seconds}s."
-            ) from exc
+            raise AgentAdapterError("Claude adapter timed out.") from exc
 
         if stream_error:
             raise AgentAdapterError(stream_error)

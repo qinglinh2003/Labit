@@ -74,6 +74,22 @@ def test_doc_list_omits_internal_chat_artifacts(tmp_path: Path) -> None:
     assert paths == ["ideas/test.md"]
 
 
+def test_markdown_doc_preview_renders_pdf(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    docs_dir = paths.vault_projects_dir / "Labit" / "docs"
+    (docs_dir / "ideas").mkdir()
+    (docs_dir / "ideas" / "test.md").write_text("# Test\n\nSome markdown.", encoding="utf-8")
+
+    client = TestClient(create_app(paths))
+    doc_id = encode_doc_id("ideas/test.md")
+
+    response = client.get(f"/api/projects/Labit/docs/{doc_id}/preview.pdf")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/pdf"
+    assert response.content.startswith(b"%PDF")
+
+
 def test_invalid_doc_id_returns_404_for_doc_chat_routes(tmp_path: Path) -> None:
     paths = _create_project(tmp_path)
     client = TestClient(create_app(paths))

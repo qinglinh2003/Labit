@@ -2,12 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { BookOpen, ChevronDown, ChevronLeft, ChevronRight, Edit3, Eye, FileText, FolderOpen, MessageSquare, NotebookPen, Plus, RefreshCw, Search, Settings, Star, Tag, X } from "lucide-react";
+import { BookOpen, Check, ChevronDown, ChevronLeft, ChevronRight, Edit3, Eye, FileText, FolderOpen, FolderPlus, MessageSquare, NotebookPen, Plus, RefreshCw, Search, Settings, Star, Tag, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import {
+  createProject,
   getNote,
   listArtifacts,
   listPapers,
@@ -28,12 +29,13 @@ import ChatPage from "./chat/ChatPage";
 import DocsPage from "./docs/DocsPage";
 import CodePage from "./code/CodePage";
 import ComputePage from "./compute/ComputePage";
+import ExperimentsPage from "./experiments/ExperimentsPage";
 import {
   IconBook, IconPaper, IconCheckSquare, IconFlask, IconTerminal, IconCapture,
   IconRefresh, IconCloud, IconChevronDown, IconChat, IconFileText, IconCode, IconCompute,
 } from "./todo/icons";
 
-type ModuleTab = "papers" | "docs" | "code" | "todos" | "chat" | "compute";
+type ModuleTab = "papers" | "docs" | "code" | "todos" | "chat" | "compute" | "experiments";
 
 interface UiState {
   project: string;
@@ -69,7 +71,264 @@ const NAV_TABS: { id: ModuleTab; label: string; Icon: React.ComponentType<any> }
   { id: "chat", label: "Chat", Icon: IconChat },
   { id: "todos", label: "Todos", Icon: IconCheckSquare },
   { id: "compute", label: "Compute", Icon: IconCompute },
+  { id: "experiments", label: "Experiments", Icon: IconFlask },
 ];
+
+/* ── Project selector dropdown with create-new ── */
+
+const fieldInputCls = "w-full h-8 px-2.5 rounded-lg border border-[var(--border,#e1e9f4)] bg-[var(--surface-2,#f4f8fd)] text-[13px] focus:outline-none focus:border-[var(--ink,#0e72ed)] focus:ring-1 focus:ring-[var(--ink,#0e72ed)]/30 placeholder:text-[var(--muted,#5a6b82)]/50";
+const fieldLabelCls = "block text-[11px] font-semibold text-[var(--muted,#5a6b82)] mb-1";
+
+function ProjectMenu({
+  projects,
+  activeProject,
+  onSelect,
+  onRefresh,
+  spinning,
+}: {
+  projects: string[];
+  activeProject: string;
+  onSelect: (name: string) => void;
+  onRefresh: () => void;
+  spinning: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [formName, setFormName] = useState("");
+  const [formDesc, setFormDesc] = useState("");
+  const [formRepo, setFormRepo] = useState("");
+  const [formKeywords, setFormKeywords] = useState("");
+  const [formRelevance, setFormRelevance] = useState("");
+  const [error, setError] = useState("");
+  const menuRef = useRef<HTMLDivElement>(null);
+  const nameRef = useRef<HTMLInputElement>(null);
+  const queryClient = useQueryClient();
+
+  // Close on click outside
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setOpen(false);
+        setCreating(false);
+        resetForm();
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [open]);
+
+  // Focus name input when entering create mode
+  useEffect(() => {
+    if (creating) nameRef.current?.focus();
+  }, [creating]);
+
+  const resetForm = () => {
+    setFormName(""); setFormDesc(""); setFormRepo("");
+    setFormKeywords(""); setFormRelevance(""); setError("");
+  };
+
+  const handleCreate = async () => {
+    const trimmed = formName.trim();
+    if (!trimmed) return;
+    setError("");
+    setSubmitting(true);
+    try {
+      await createProject({
+        name: trimmed,
+        description: formDesc.trim(),
+        repo: formRepo.trim() || undefined,
+        keywords: formKeywords.split(",").map((s) => s.trim()).filter(Boolean),
+        relevance_criteria: formRelevance.trim(),
+      });
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      onSelect(trimmed);
+      resetForm();
+      setCreating(false);
+      setOpen(false);
+    } catch (err: any) {
+      setError(
+        err?.message?.includes("409") || err?.message?.includes("already exists")
+          ? "Project already exists"
+          : err?.message || "Failed to create project"
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div ref={menuRef} className="relative">
+      {/* Trigger button */}
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-1.5 h-8 pl-2.5 pr-1.5 rounded-lg border border-[var(--border,#e1e9f4)] bg-[var(--surface-2,#f4f8fd)] hover:bg-[var(--surface-3,#e9f1fb)] transition-colors"
+      >
+        <span className="w-[7px] h-[7px] rounded-full bg-emerald-400 flex-shrink-0" />
+        <span className="text-[13px] font-semibold max-w-[120px] truncate">{activeProject || "Select"}</span>
+        <ChevronDown size={13} className={`text-[var(--muted,#5a6b82)] transition-transform ${open ? "rotate-180" : ""}`} />
+      </button>
+
+      {/* Dropdown */}
+      {open && (
+        <div className="absolute right-0 top-[calc(100%+6px)] z-50 w-[320px] rounded-xl border border-[var(--border,#e1e9f4)] bg-white shadow-[0_8px_30px_rgba(0,0,0,.12)] overflow-hidden animate-[fadeIn_0.15s_ease]">
+          {/* Header */}
+          <div className="flex items-center justify-between px-3.5 pt-3 pb-2">
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-[var(--muted,#5a6b82)]">Projects</span>
+            <button
+              onClick={() => { onRefresh(); }}
+              title="Refresh"
+              className="flex items-center justify-center w-6 h-6 rounded-md hover:bg-[var(--surface-3,#e9f1fb)] transition-colors"
+            >
+              <IconRefresh size={13} stroke={1.9} className={`text-[var(--muted,#5a6b82)] ${spinning ? "animate-[spin_0.65s_ease]" : ""}`} />
+            </button>
+          </div>
+
+          {/* Project list */}
+          <div className="max-h-[240px] overflow-y-auto px-1.5 pb-1">
+            {projects.map((name) => {
+              const isActive = name === activeProject;
+              return (
+                <button
+                  key={name}
+                  onClick={() => {
+                    onSelect(name);
+                    setOpen(false);
+                    setCreating(false);
+                    resetForm();
+                  }}
+                  className={`flex items-center gap-2.5 w-full px-2.5 py-[7px] rounded-lg text-left transition-colors ${
+                    isActive
+                      ? "bg-[var(--ink,#0e72ed)]/[0.08] text-[var(--ink,#0e72ed)]"
+                      : "hover:bg-[var(--surface-3,#e9f1fb)] text-[var(--text,#0d1b2e)]"
+                  }`}
+                >
+                  <span className={`flex items-center justify-center w-[22px] h-[22px] rounded-md text-[11px] font-bold flex-shrink-0 ${
+                    isActive
+                      ? "bg-[var(--ink,#0e72ed)] text-white"
+                      : "bg-[var(--surface-3,#e9f1fb)] text-[var(--muted,#5a6b82)]"
+                  }`}>
+                    {name.charAt(0).toUpperCase()}
+                  </span>
+                  <span className="text-[13px] font-medium truncate flex-1">{name}</span>
+                  {isActive && <Check size={14} className="text-[var(--ink,#0e72ed)] flex-shrink-0" />}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Divider */}
+          <div className="mx-3 border-t border-[var(--border,#e1e9f4)]" />
+
+          {/* Create new project */}
+          {creating ? (
+            <div className="px-3.5 py-3 space-y-2.5">
+              <div className="flex items-center justify-between">
+                <span className="text-[12px] font-semibold text-[var(--text,#0d1b2e)]">New Project</span>
+                <button
+                  onClick={() => { setCreating(false); resetForm(); }}
+                  className="flex items-center justify-center w-5 h-5 rounded hover:bg-[var(--surface-3,#e9f1fb)] transition-colors"
+                >
+                  <X size={12} className="text-[var(--muted,#5a6b82)]" />
+                </button>
+              </div>
+
+              {/* Name (required) */}
+              <div>
+                <label className={fieldLabelCls}>Name <span className="text-red-400">*</span></label>
+                <input
+                  ref={nameRef}
+                  type="text"
+                  className={fieldInputCls}
+                  placeholder="MyProject"
+                  value={formName}
+                  onChange={(e) => { setFormName(e.target.value); setError(""); }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") { setCreating(false); resetForm(); }
+                  }}
+                />
+              </div>
+
+              {/* Description */}
+              <div>
+                <label className={fieldLabelCls}>Description</label>
+                <input
+                  type="text"
+                  className={fieldInputCls}
+                  placeholder="Brief project description"
+                  value={formDesc}
+                  onChange={(e) => setFormDesc(e.target.value)}
+                />
+              </div>
+
+              {/* Repository */}
+              <div>
+                <label className={fieldLabelCls}>Repository URL</label>
+                <input
+                  type="text"
+                  className={fieldInputCls}
+                  placeholder="git@github.com:user/repo.git"
+                  value={formRepo}
+                  onChange={(e) => setFormRepo(e.target.value)}
+                />
+              </div>
+
+              {/* Keywords */}
+              <div>
+                <label className={fieldLabelCls}>Keywords <span className="text-[10px] font-normal text-[var(--muted,#5a6b82)]">(comma-separated)</span></label>
+                <input
+                  type="text"
+                  className={fieldInputCls}
+                  placeholder="NLP, transformers, ..."
+                  value={formKeywords}
+                  onChange={(e) => setFormKeywords(e.target.value)}
+                />
+              </div>
+
+              {/* Relevance criteria */}
+              <div>
+                <label className={fieldLabelCls}>Relevance Criteria</label>
+                <input
+                  type="text"
+                  className={fieldInputCls}
+                  placeholder="What papers/topics are relevant?"
+                  value={formRelevance}
+                  onChange={(e) => setFormRelevance(e.target.value)}
+                />
+              </div>
+
+              {/* Error */}
+              {error && <p className="text-[11px] text-red-500">{error}</p>}
+
+              {/* Submit */}
+              <button
+                onClick={() => void handleCreate()}
+                disabled={!formName.trim() || submitting}
+                className="flex items-center justify-center gap-1.5 w-full h-8 rounded-lg bg-[var(--ink,#0e72ed)] text-white text-[13px] font-medium hover:opacity-90 disabled:opacity-40 transition-opacity"
+              >
+                {submitting ? (
+                  <IconRefresh size={13} stroke={1.9} className="animate-spin" />
+                ) : (
+                  <FolderPlus size={13} />
+                )}
+                <span>{submitting ? "Creating..." : "Create Project"}</span>
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={() => setCreating(true)}
+              className="flex items-center gap-2.5 w-full px-4 py-2.5 text-[13px] font-medium text-[var(--muted,#5a6b82)] hover:text-[var(--ink,#0e72ed)] hover:bg-[var(--surface-3,#e9f1fb)] transition-colors"
+            >
+              <FolderPlus size={15} />
+              <span>New Project</span>
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export function App() {
   const { project, selectedPaperId, activeTab, chatActiveChatId, setProject, setSelectedPaperId, setActiveTab, setChatActiveChatId } = useUiStore();
@@ -138,19 +397,13 @@ export function App() {
             <IconCloud size={15} stroke={1.9} className="text-[var(--accent,#0e72ed)] opacity-80" />
             <span className="font-mono whitespace-nowrap">saved to vault</span>
           </div>
-          <select
-            className="h-8 rounded-[9px] border border-[var(--border,#e1e9f4)] bg-[var(--surface-2,#f4f8fd)] px-2 text-[13px] font-medium max-w-[140px]"
-            value={project}
-            onChange={(event) => setProject(event.target.value)}
-          >
-            {projects.map((name) => (
-              <option key={name} value={name}>{name}</option>
-            ))}
-          </select>
-          <button onClick={refresh} title="Refresh"
-            className="flex items-center justify-center w-8 h-8 rounded-[9px] bg-[var(--ink,#0e72ed)] text-[var(--ink-text,#fff)] hover:opacity-90">
-            <IconRefresh size={15} stroke={1.9} className={spinning ? "animate-[spin_0.65s_ease]" : ""} />
-          </button>
+          <ProjectMenu
+            projects={projects}
+            activeProject={project}
+            onSelect={setProject}
+            onRefresh={refresh}
+            spinning={spinning}
+          />
         </div>
       </header>
 
@@ -163,6 +416,8 @@ export function App() {
         <DocsPage project={project} />
       ) : activeTab === "compute" ? (
         <ComputePage project={project} />
+      ) : activeTab === "experiments" ? (
+        <ExperimentsPage project={project} />
       ) : activeTab === "todos" ? (
         <TodoPage project={project} />
       ) : (

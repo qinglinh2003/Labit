@@ -5,18 +5,20 @@ import os
 from pathlib import Path
 from typing import Iterator
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from labit.api.chat_routes import mount_chat_routes
 from labit.api.chat_service import ChatService
 from labit.api.code_routes import mount_code_routes
 from labit.api.code_service import CodeService
 from labit.api.compute_routes import mount_compute_routes
+from labit.api.experiment_routes import mount_experiment_routes
 from labit.services.compute_service import ComputeService
+from labit.services.experiment_service import ExperimentService
 from labit.api.doc_routes import mount_doc_routes
 from labit.api.doc_service import DocService
 from labit.api.general_chat_routes import mount_general_chat_routes
@@ -46,6 +48,14 @@ PDF_RANGE_CHUNK_SIZE = 1024 * 1024
 class ProjectListResponse(BaseModel):
     projects: list[str]
     active_project: str | None = None
+
+
+class CreateProjectRequest(BaseModel):
+    name: str
+    description: str = ""
+    repo: str | None = None
+    keywords: list[str] = Field(default_factory=list)
+    relevance_criteria: str = ""
 
 
 class UpdateStatusRequest(BaseModel):
@@ -97,6 +107,44 @@ def create_app(paths: RepoPaths | None = None) -> FastAPI:
             projects=project_service.list_project_names(),
             active_project=project_service.active_project_name(),
         )
+
+    @app.post("/api/projects", status_code=201)
+    def create_project(body: CreateProjectRequest, background_tasks: BackgroundTasks) -> dict:
+        from labit.models import ProjectSpec
+        try:
+            spec = ProjectSpec(
+                name=body.name,
+                description=body.description,
+                repo=body.repo or None,
+                keywords=body.keywords,
+                relevance_criteria=body.relevance_criteria,
+            )
+        except (ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        try:
+            result = project_service.save_project(spec, set_active=True)
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        # Clone repo in background if provided
+        if spec.repo:
+            import shutil
+            import subprocess as _sp
+
+            code_dir = project_service.project_code_dir(spec.name)
+
+            def _clone() -> None:
+                git = shutil.which("git")
+                if git is None:
+                    return
+                code_dir.mkdir(parents=True, exist_ok=True)
+                if any(code_dir.iterdir()):
+                    return
+                _sp.run([git, "clone", "--", spec.repo or "", str(code_dir)], check=False, capture_output=True, text=True)
+
+            background_tasks.add_task(_clone)
+
+        return result
 
     @app.get("/api/projects/{project}/papers", response_model=list[PaperRecord])
     def list_papers(project: str) -> list[PaperRecord]:
@@ -296,6 +344,11 @@ def create_app(paths: RepoPaths | None = None) -> FastAPI:
 
     compute_service = ComputeService(repo_paths, project_service=project_service)
     app.include_router(mount_compute_routes(compute_service))
+
+    experiment_service = ExperimentService(
+        repo_paths, project_service=project_service, compute_service=compute_service,
+    )
+    app.include_router(mount_experiment_routes(experiment_service))
 
     _mount_frontend(app, _frontend_dist_dir())
     return app

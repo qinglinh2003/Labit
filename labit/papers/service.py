@@ -485,7 +485,7 @@ class PaperService:
         # At most 1 retry — don't hammer arXiv
         for attempt in range(2):
             try:
-                with urllib.request.urlopen(request, timeout=60) as response:
+                with urllib.request.urlopen(request, timeout=None) as response:
                     charset = response.headers.get_content_charset() or "utf-8"
                     return response.read().decode(charset, errors="replace")
             except urllib.error.HTTPError as exc:

@@ -8,14 +8,24 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from labit.api.chat_models import AgentName, Artifact, ChatMode
-from labit.api.doc_models import (
-    DocChatListItem,
-    DocChatMessage,
-    DocChatRecord,
-    DocRecord,
+from labit.api.chat_models import (
+    AgentName,
+    Artifact,
+    ChatListItem,
+    ChatMessage,
+    ChatMode,
+    ChatRecord,
 )
-from labit.api.general_chat_service import extract_artifacts
+from labit.api.chat_storage import (
+    append_message as _append_message,
+    delete_chat_dir,
+    find_artifact,
+    list_chat_records,
+    load_chat,
+    save_chat,
+    update_chat_fields,
+)
+from labit.api.doc_models import DocRecord
 from labit.services.project_service import ProjectService
 
 
@@ -182,14 +192,14 @@ class DocService:
         self, project: str, doc_id: str,
         title: str = "", mode: ChatMode = ChatMode.SINGLE,
         first_agent: AgentName = "claude",
-    ) -> DocChatRecord:
+    ) -> ChatRecord:
         # Verify doc exists
         self.get_doc(project, doc_id)
         chats_dir = self._doc_chats_dir(project, doc_id)
         chats_dir.mkdir(parents=True, exist_ok=True)
         now = datetime.now(UTC).replace(microsecond=0).isoformat()
         chat_id = uuid.uuid4().hex[:12]
-        record = DocChatRecord(
+        record = ChatRecord(
             chat_id=chat_id,
             title=title or f"Chat {chat_id[:6]}",
             doc_id=doc_id,
@@ -198,104 +208,68 @@ class DocService:
             created_at=now,
             updated_at=now,
         )
-        self._save_chat(chats_dir, record)
+        save_chat(chats_dir, record)
         return record
 
-    def list_chats(self, project: str, doc_id: str) -> list[DocChatListItem]:
+    def list_chats(self, project: str, doc_id: str) -> list[ChatListItem]:
         self.get_doc(project, doc_id)
-        chats_dir = self._doc_chats_dir(project, doc_id)
-        if not chats_dir.exists():
-            return []
-        items: list[DocChatListItem] = []
-        seen_ids: set[str] = set()
+        records = list_chat_records(self._doc_chats_dir(project, doc_id), ChatRecord)
+        return [
+            ChatListItem(
+                chat_id=r.chat_id, title=r.title, mode=r.mode,
+                first_agent=r.first_agent, updated_at=r.updated_at,
+                message_count=len(r.messages),
+            )
+            for r in records
+        ]
 
-        # New format: {chat_id}/chat.json
-        for chat_json in chats_dir.glob("*/chat.json"):
-            try:
-                record = DocChatRecord.model_validate_json(chat_json.read_text(encoding="utf-8"))
-                seen_ids.add(record.chat_id)
-                items.append(DocChatListItem(
-                    chat_id=record.chat_id, title=record.title,
-                    mode=record.mode, first_agent=record.first_agent,
-                    updated_at=record.updated_at, message_count=len(record.messages),
-                ))
-            except Exception:
-                continue
-
-        # Old format fallback
-        for path in chats_dir.glob("*.json"):
-            try:
-                record = DocChatRecord.model_validate_json(path.read_text(encoding="utf-8"))
-                if record.chat_id in seen_ids:
-                    continue
-                seen_ids.add(record.chat_id)
-                items.append(DocChatListItem(
-                    chat_id=record.chat_id, title=record.title,
-                    mode=record.mode, first_agent=record.first_agent,
-                    updated_at=record.updated_at, message_count=len(record.messages),
-                ))
-            except Exception:
-                continue
-
-        items.sort(key=lambda x: x.updated_at, reverse=True)
-        return items
-
-    def get_chat(self, project: str, doc_id: str, chat_id: str) -> DocChatRecord:
+    def get_chat(self, project: str, doc_id: str, chat_id: str) -> ChatRecord:
         self.get_doc(project, doc_id)
-        path = self._doc_chat_path(project, doc_id, chat_id)
-        if not path.exists():
-            raise FileNotFoundError(f"Chat '{chat_id}' not found.")
-        return DocChatRecord.model_validate_json(path.read_text(encoding="utf-8"))
+        return load_chat(self._doc_chats_dir(project, doc_id), chat_id, ChatRecord)
 
     def update_chat(
         self, project: str, doc_id: str, chat_id: str, *,
         mode: ChatMode | None = None,
         first_agent: AgentName | None = None,
         title: str | None = None,
-    ) -> DocChatRecord:
-        record = self.get_chat(project, doc_id, chat_id)
-        if mode is not None:
-            record.mode = mode
-        if first_agent is not None:
-            record.first_agent = first_agent
-        if title is not None:
-            record.title = title
-        record.updated_at = datetime.now(UTC).replace(microsecond=0).isoformat()
-        self._save_chat(self._doc_chats_dir(project, doc_id), record)
-        return record
+    ) -> ChatRecord:
+        return update_chat_fields(
+            self._doc_chats_dir(project, doc_id), chat_id, ChatRecord,
+            mode=mode, first_agent=first_agent, title=title,
+        )
 
     def delete_chat(self, project: str, doc_id: str, chat_id: str) -> None:
         self.get_doc(project, doc_id)
-        chat_dir = self.doc_chat_dir(project, doc_id, chat_id)
-        if chat_dir.exists() and chat_dir.is_dir():
-            shutil.rmtree(chat_dir)
-        old_path = self._doc_chats_dir(project, doc_id) / f"{chat_id}.json"
-        if old_path.exists():
-            old_path.unlink()
+        delete_chat_dir(self._doc_chats_dir(project, doc_id), chat_id)
 
     def append_message(
         self, project: str, doc_id: str, chat_id: str,
         role: str, content: str,
         agent: str | None = None,
         artifacts: list[Artifact] | None = None,
-    ) -> DocChatMessage:
-        record = self.get_chat(project, doc_id, chat_id)
-        now = datetime.now(UTC).replace(microsecond=0).isoformat()
-        msg = DocChatMessage(
-            id=f"msg_{uuid.uuid4().hex[:8]}",
-            role=role,
-            content=content,
-            agent=agent,
-            artifacts=artifacts or [],
-            created_at=now,
+    ) -> ChatMessage:
+        extra: dict = {}
+        if artifacts:
+            extra["artifacts"] = artifacts
+        return _append_message(
+            self._doc_chats_dir(project, doc_id), chat_id, ChatRecord,
+            ChatMessage, role=role, content=content, agent=agent,
+            extra_fields=extra or None,
         )
-        record.messages.append(msg)
-        record.updated_at = now
-        self._save_chat(self._doc_chats_dir(project, doc_id), record)
-        return msg
 
-    def build_prompt(self, project: str, doc_id: str, chat_id: str) -> str:
-        """Build prompt with current document content + chat history."""
+    def build_prompt(
+        self,
+        project: str,
+        doc_id: str,
+        chat_id: str,
+        *,
+        max_history: int | None = None,
+    ) -> str:
+        """Build prompt with current document content + chat history.
+
+        Args:
+            max_history: If set, only include the last N messages from history.
+        """
         doc = self.get_doc(project, doc_id)
         doc_content = self.get_content(project, doc_id)
         record = self.get_chat(project, doc_id, chat_id)
@@ -312,8 +286,14 @@ class DocService:
             f"</document_context>"
         )
 
-        # Chat history
-        for msg in record.messages:
+        # Chat history (optionally truncated)
+        messages = record.messages
+        if max_history is not None and len(messages) > max_history:
+            omitted = len(messages) - max_history
+            parts.append(f"[{omitted} earlier messages omitted for brevity]")
+            messages = messages[-max_history:]
+
+        for msg in messages:
             if msg.role == "user":
                 parts.append(f"User: {msg.content}")
             else:
@@ -352,11 +332,7 @@ class DocService:
         self, project: str, doc_id: str, chat_id: str, artifact_id: str,
     ) -> Artifact | None:
         record = self.get_chat(project, doc_id, chat_id)
-        for msg in record.messages:
-            for art in msg.artifacts:
-                if art.id == artifact_id:
-                    return art
-        return None
+        return find_artifact(record.messages, artifact_id)
 
     def apply_artifact(self, project: str, doc_id: str, artifact_id: str, chat_id: str) -> DocRecord:
         """Apply an artifact's content to the document."""
@@ -460,18 +436,3 @@ class DocService:
         history_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, history_dir / f"{ts}_{path.name}")
 
-    def _doc_chat_path(self, project: str, doc_id: str, chat_id: str) -> Path:
-        # New format: {chat_id}/chat.json
-        new_path = self._doc_chats_dir(project, doc_id) / chat_id / "chat.json"
-        if new_path.exists():
-            return new_path
-        old_path = self._doc_chats_dir(project, doc_id) / f"{chat_id}.json"
-        if old_path.exists():
-            return old_path
-        return new_path
-
-    def _save_chat(self, chats_dir: Path, record: DocChatRecord) -> None:
-        chat_dir = chats_dir / record.chat_id
-        chat_dir.mkdir(parents=True, exist_ok=True)
-        path = chat_dir / "chat.json"
-        path.write_text(record.model_dump_json(indent=2), encoding="utf-8")

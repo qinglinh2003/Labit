@@ -80,6 +80,7 @@ def compute_context(profiles: list[ComputeProfile]) -> str:
         return (
             "\n\n# REMOTE COMPUTE\n\n"
             "This project has no compute profiles configured.\n"
+            + EXPERIMENT_PROTOCOL
         )
 
     lines = ["\n\n# REMOTE COMPUTE\n\n"]
@@ -100,7 +101,76 @@ def compute_context(profiles: list[ComputeProfile]) -> str:
         "4. Check logs: ssh <ssh-options> <target> \"tail -100 <workdir>/log.txt\"\n"
         "5. Check GPU status: ssh <ssh-options> <target> \"nvidia-smi\"\n"
     )
+    lines.append(EXPERIMENT_PROTOCOL)
     return "".join(lines)
+
+
+EXPERIMENT_PROTOCOL = (
+    "\n\n# EXPERIMENT PROTOCOL\n\n"
+    "Experiments live under code/experiments/<experiment_id>/.\n"
+    "Each experiment directory MUST contain:\n"
+    "- manifest.yaml: name, description, profile (target compute), optional tags\n"
+    "- run.sh: self-contained script, runnable via `bash experiments/<id>/run.sh` from code/\n\n"
+    "The directory name IS the experiment ID (e.g. exp_001_sft_baseline).\n"
+    "Write all setup, dependencies, and commands inside run.sh.\n"
+    "Do NOT launch experiments directly via SSH — use Labit's experiment launcher\n"
+    "so runs are tracked with metadata (git commit, PID, logs, exit code).\n\n"
+    "manifest.yaml example:\n"
+    "```yaml\n"
+    "name: \"SFT Baseline\"\n"
+    "description: \"Qwen2.5-VL-3B + LoRA SFT on 5K LLaVA samples\"\n"
+    "profile: vastA100\n"
+    "tags: [baseline, sft]\n"
+    "```\n\n"
+    "run.sh example:\n"
+    "```bash\n"
+    "#!/usr/bin/env bash\n"
+    "set -euo pipefail\n"
+    "source ~/.bashrc && conda activate myenv\n"
+    "python scripts/train.py --config experiments/exp_001/config.yaml\n"
+    "```\n"
+    "\n\n# EXPERIMENT LOG PROTOCOL\n\n"
+    "When writing training scripts, emit structured logs to stdout using JSONL.\n"
+    "Each structured line must be a JSON object with `\"__labit__\": true` and a `\"type\"` field.\n"
+    "Labit parses these lines for metrics charts, event timelines, and config display.\n"
+    "Regular print() output is still captured as plain log text.\n\n"
+    "Supported types:\n"
+    "- metric: {\"__labit__\": true, \"type\": \"metric\", \"step\": N, \"data\": {\"loss\": ..., \"lr\": ...}}\n"
+    "- status: {\"__labit__\": true, \"type\": \"status\", \"status\": \"training\", \"message\": \"...\"}\n"
+    "- config: {\"__labit__\": true, \"type\": \"config\", \"data\": {\"model\": \"...\", \"batch_size\": ...}}\n"
+    "- eval:   {\"__labit__\": true, \"type\": \"eval\", \"benchmark\": \"POPE\", \"data\": {\"accuracy\": ...}}\n"
+    "- artifact: {\"__labit__\": true, \"type\": \"artifact\", \"name\": \"checkpoint\", \"path\": \"...\"}\n"
+    "- error:  {\"__labit__\": true, \"type\": \"error\", \"severity\": \"warning\", \"message\": \"...\"}\n\n"
+    "Write a zero-dependency labit_log.py helper in the experiment directory:\n"
+    "```python\n"
+    "import json, sys\n"
+    "def log_metric(step, data, epoch=None):\n"
+    "    e = {\"__labit__\": True, \"type\": \"metric\", \"step\": step, \"data\": data}\n"
+    "    if epoch is not None: e[\"epoch\"] = epoch\n"
+    "    print(json.dumps(e), flush=True)\n"
+    "def log_status(status, message=\"\"):\n"
+    "    print(json.dumps({\"__labit__\": True, \"type\": \"status\", \"status\": status, \"message\": message}), flush=True)\n"
+    "def log_config(data):\n"
+    "    print(json.dumps({\"__labit__\": True, \"type\": \"config\", \"data\": data}), flush=True)\n"
+    "def log_eval(benchmark, data, split=None, step=None):\n"
+    "    e = {\"__labit__\": True, \"type\": \"eval\", \"benchmark\": benchmark, \"data\": data}\n"
+    "    if split: e[\"split\"] = split\n"
+    "    if step is not None: e[\"step\"] = step\n"
+    "    print(json.dumps(e), flush=True)\n"
+    "def log_artifact(name, path, **kw):\n"
+    "    print(json.dumps({\"__labit__\": True, \"type\": \"artifact\", \"name\": name, \"path\": path, **kw}), flush=True)\n"
+    "```\n\n"
+    "Then in your training code:\n"
+    "```python\n"
+    "from labit_log import log_metric, log_status, log_config\n"
+    "log_config({\"model\": \"Qwen2.5-VL-3B\", \"batch_size\": 4})\n"
+    "log_status(\"training\", \"Starting training\")\n"
+    "for step, batch in enumerate(dataloader):\n"
+    "    loss = train_step(batch)\n"
+    "    if step % 10 == 0:\n"
+    "        log_metric(step, {\"loss\": loss.item(), \"lr\": scheduler.get_last_lr()[0]})\n"
+    "```\n"
+)
 
 
 def project_identity_context(project: str, project_dir: str) -> str:

@@ -31,11 +31,20 @@ export interface ChatArtifact {
   file_path: string | null;
 }
 
+export interface ChatAttachment {
+  id: string;
+  kind: string;
+  filename: string;
+  mime_type: string;
+  path: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
   agent: string | null;
+  attachments?: ChatAttachment[];
   artifacts: ChatArtifact[];
   created_at: string;
 }
@@ -108,6 +117,10 @@ export async function saveFileContent(project: string, fileId: string, content: 
   return res.json();
 }
 
+export function codeFilePreviewPdfUrl(project: string, fileId: string): string {
+  return `${API_BASE}/api/projects/${encodeURIComponent(project)}/code/files/${encodeURIComponent(fileId)}/preview.pdf`;
+}
+
 export async function applyArtifact(project: string, fileId: string, chatId: string, artifactId: string): Promise<CodeFileRecord> {
   const res = await fetch(`${codeBase(project)}/files/${encodeURIComponent(fileId)}/apply-artifact`, {
     method: "POST",
@@ -167,6 +180,33 @@ export async function deleteChat(project: string, chatId: string): Promise<void>
 }
 
 // ---------------------------------------------------------------------------
+// Attachments
+// ---------------------------------------------------------------------------
+
+export async function uploadAttachment(
+  project: string,
+  chatId: string,
+  file: File,
+): Promise<ChatAttachment> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch(
+    `${chatBase(project)}/${encodeURIComponent(chatId)}/attachments`,
+    { method: "POST", body: form },
+  );
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export function attachmentUrl(
+  project: string,
+  chatId: string,
+  attId: string,
+): string {
+  return `${chatBase(project)}/${encodeURIComponent(chatId)}/attachments/${encodeURIComponent(attId)}`;
+}
+
+// ---------------------------------------------------------------------------
 // SSE
 // ---------------------------------------------------------------------------
 
@@ -210,13 +250,18 @@ export function askStream(
   content: string,
   onEvent: (event: SSEEvent) => void,
   onDone: () => void,
+  attachmentIds?: string[],
 ): AbortController {
   const controller = new AbortController();
   const url = `${chatBase(project)}/${encodeURIComponent(chatId)}/ask`;
+  const payload: Record<string, unknown> = { content };
+  if (attachmentIds && attachmentIds.length > 0) {
+    payload.attachment_ids = attachmentIds;
+  }
   fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content }),
+    body: JSON.stringify(payload),
     signal: controller.signal,
   }).then(async (res) => {
     if (!res.ok) { onEvent({ type: "error", error: await res.text() }); onDone(); return; }

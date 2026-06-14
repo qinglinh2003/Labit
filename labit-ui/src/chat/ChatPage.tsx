@@ -361,13 +361,24 @@ function hasAssistantMessage(messages: ChatMessage[], agent: string, content: st
 
 function mergeMissing(server: ChatRecord, local: ChatRecord | null): ChatRecord {
   if (!local) return server;
-  // Only preserve local user messages that haven't been saved to the server yet.
-  // Don't preserve local assistant messages — the server version has cleaned
-  // content (artifact blocks extracted) and artifacts attached, so comparing
-  // raw content vs cleaned content would cause duplicates.
-  const missing = local.messages.filter(
-    (m) => m.role === "user" && m.id.startsWith("local_") && !server.messages.some((sm) => sm.role === "user" && sm.content === m.content),
+  // Find assistant messages from the current turn on the server (after the last user message).
+  const lastUserIdx = (() => { for (let i = server.messages.length - 1; i >= 0; i--) { if (server.messages[i].role === "user") return i; } return -1; })();
+  const serverTurnAgents = new Set(
+    server.messages.slice(lastUserIdx + 1).filter((m) => m.role === "assistant").map((m) => m.agent),
   );
+  const missing: ChatMessage[] = [];
+  for (const m of local.messages) {
+    if (m.role === "user" && m.id.startsWith("local_") && !server.messages.some((sm) => sm.role === "user" && sm.content === m.content)) {
+      missing.push(m);
+    } else if (m.role === "assistant" && (m.id.startsWith("done_") || m.id.startsWith("partial_"))) {
+      // If the server already has an assistant message from this agent in the current turn,
+      // the server version wins (it has cleaned content with artifacts properly extracted).
+      // Only preserve the local version if the server has no response from this agent yet.
+      if (!serverTurnAgents.has(m.agent)) {
+        missing.push(m);
+      }
+    }
+  }
   if (missing.length === 0) return server;
   return { ...server, messages: [...server.messages, ...missing] };
 }
@@ -588,7 +599,10 @@ export default function ChatPage({ project, activeChatId, onActiveChatIdChange }
           a.agent === event.agent ? { ...a, chunks: [...(activeStreams[event.agent] || [])], hasText: true, status: "generating" } : a,
         ));
       } else if ((event.type === "done" || event.type === "error") && event.agent) {
-        const finalText = event.full_text ?? (activeStreams[event.agent] || []).join("");
+        let finalText = event.full_text ?? (activeStreams[event.agent] || []).join("");
+        if (!finalText.trim() && event.type === "error" && event.error) {
+          finalText = `${event.agent} error: ${event.error}`;
+        }
         if (finalText.trim()) {
           const msg: ChatMessage = {
             id: `done_${event.agent}_${Date.now()}`,
@@ -627,7 +641,19 @@ export default function ChatPage({ project, activeChatId, onActiveChatIdChange }
       setRunningChatIds((prev) => { const next = new Set(prev); next.delete(activeChatId); return next; });
       // Re-fetch to get server state
       if (project && activeChatId) {
-        getChat(project, activeChatId).then((server) => setChat((local) => mergeMissing(server, local)));
+        const chatIdCapture = activeChatId;
+        getChat(project, chatIdCapture).then((server) => {
+          const merged = mergeMissing(server, null);
+          setChat((local) => {
+            const result = mergeMissing(server, local);
+            if (result.messages.length > merged.messages.length) {
+              setTimeout(() => {
+                getChat(project, chatIdCapture).then((retry) => setChat((prev) => mergeMissing(retry, prev)));
+              }, 2000);
+            }
+            return result;
+          });
+        });
       }
       refreshList();
     };

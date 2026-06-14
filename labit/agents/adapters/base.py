@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import subprocess
 import threading
-import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from queue import Empty, Queue
+from queue import Queue
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -32,7 +31,6 @@ def stream_subprocess_lines(
     cmd: list[str],
     *,
     cwd: str | None = None,
-    timeout_seconds: int | None = None,
     input_text: str | None = None,
     on_stdout_line: Callable[[str], None] | None = None,
     cancel_event: threading.Event | None = None,
@@ -69,26 +67,15 @@ def stream_subprocess_lines(
     stderr_thread.start()
 
     finished_streams: set[str] = set()
-    deadline = time.monotonic() + timeout_seconds if timeout_seconds else None
-
     try:
         while len(finished_streams) < 2:
             if cancel_event is not None and cancel_event.is_set():
                 process.kill()
-                stdout_thread.join(timeout=0.2)
-                stderr_thread.join(timeout=0.2)
+                stdout_thread.join()
+                stderr_thread.join()
                 raise StreamCancelled("Stream cancelled by user")
 
-            if deadline is not None and time.monotonic() > deadline:
-                process.kill()
-                stdout_thread.join(timeout=0.2)
-                stderr_thread.join(timeout=0.2)
-                raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout_seconds)
-
-            try:
-                stream_name, payload = queue.get(timeout=0.1)
-            except Empty:
-                continue
+            stream_name, payload = queue.get()
 
             if payload is None:
                 finished_streams.add(stream_name)
@@ -102,13 +89,13 @@ def stream_subprocess_lines(
                 stderr_lines.append(payload)
     except KeyboardInterrupt:
         process.kill()
-        stdout_thread.join(timeout=0.2)
-        stderr_thread.join(timeout=0.2)
+        stdout_thread.join()
+        stderr_thread.join()
         raise StreamCancelled("Stream cancelled by user")
 
     returncode = process.wait()
-    stdout_thread.join(timeout=0.2)
-    stderr_thread.join(timeout=0.2)
+    stdout_thread.join()
+    stderr_thread.join()
     return StreamProcessResult(returncode=returncode, stdout_lines=stdout_lines, stderr_lines=stderr_lines)
 
 

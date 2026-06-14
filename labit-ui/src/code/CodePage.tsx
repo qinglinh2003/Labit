@@ -20,6 +20,7 @@ import {
   FolderOpen,
   Globe,
   Hash,
+  ImagePlus,
   MessageSquare,
   NotebookPen,
   Palette,
@@ -30,6 +31,7 @@ import {
   Square,
   Terminal,
   User,
+  X,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -63,6 +65,8 @@ import {
   applyArtifact,
   artifactDownloadUrl,
   askStream,
+  attachmentUrl,
+  codeFilePreviewPdfUrl,
   createChat,
   deleteChat,
   encodeFileId,
@@ -75,7 +79,9 @@ import {
   saveFileContent,
   stopTask,
   updateChat,
+  uploadAttachment,
   type ChatArtifact,
+  type ChatAttachment,
   type ChatListItem,
   type ChatMessage,
   type ChatMode,
@@ -590,7 +596,8 @@ function CodeEditor({
   language: string;
   onContentSaved: () => void;
 }) {
-  const [mode, setMode] = useState<"view" | "edit">("view");
+  const isMarkdown = /\.(md|mdx|markdown)$/i.test(filePath);
+  const [mode, setMode] = useState<"view" | "edit" | "preview">("view");
   const [content, setContent] = useState("");
   const [savedContent, setSavedContent] = useState("");
   const [loading, setLoading] = useState(true);
@@ -689,6 +696,18 @@ function CodeEditor({
               <Edit3 size={12} />
               Edit
             </button>
+            {isMarkdown && (
+              <button
+                type="button"
+                className={`flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                  mode === "preview" ? "bg-slate-800 text-white" : "bg-white text-slate-500 hover:bg-slate-50"
+                }`}
+                onClick={() => setMode("preview")}
+              >
+                <Eye size={12} />
+                Preview
+              </button>
+            )}
           </div>
           <span className="text-xs text-slate-400 truncate max-w-[300px]">{filePath}</span>
           {language && <span className="text-[10px] text-slate-400 bg-slate-100 px-1.5 py-0.5 rounded">{language}</span>}
@@ -711,14 +730,22 @@ function CodeEditor({
         </div>
       </div>
 
-      {/* Editor */}
+      {/* Editor / Preview */}
       <div className="flex-1 min-h-0 overflow-hidden">
-        <CodeMirrorEditor
-          content={content}
-          language={language}
-          readOnly={mode === "view"}
-          onChange={mode === "edit" ? handleChange : undefined}
-        />
+        {mode === "preview" && isMarkdown ? (
+          <iframe
+            src={codeFilePreviewPdfUrl(project, fileId)}
+            className="h-full w-full border-0"
+            title="Markdown PDF preview"
+          />
+        ) : (
+          <CodeMirrorEditor
+            content={content}
+            language={language}
+            readOnly={mode === "view"}
+            onChange={mode === "edit" ? handleChange : undefined}
+          />
+        )}
       </div>
     </div>
   );
@@ -876,6 +903,30 @@ function ArtifactCard({
 // Message bubble
 // ---------------------------------------------------------------------------
 
+function MessageImages({ message, project, chatId }: { message: ChatMessage; project: string; chatId: string }) {
+  const atts = message.attachments?.filter((a) => a.kind === "image") ?? [];
+  if (atts.length === 0) return null;
+  return (
+    <div className="flex flex-wrap gap-1.5 mt-1">
+      {atts.map((att) => (
+        <a
+          key={att.id}
+          href={attachmentUrl(project, chatId, att.id)}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="block"
+        >
+          <img
+            src={attachmentUrl(project, chatId, att.id)}
+            alt={att.filename}
+            className="rounded-lg max-h-32 max-w-[180px] border border-slate-600 hover:border-slate-400 transition-colors cursor-pointer"
+          />
+        </a>
+      ))}
+    </div>
+  );
+}
+
 function MessageBubble({ message, project, fileId, chatId, onArtifactApplied }: {
   message: ChatMessage;
   project: string;
@@ -887,6 +938,7 @@ function MessageBubble({ message, project, fileId, chatId, onArtifactApplied }: 
     return (
       <div className="flex items-start gap-2.5 justify-end">
         <div className="max-w-[85%] rounded-2xl rounded-tr-md bg-slate-800 px-3.5 py-2.5 text-sm text-white">
+          <MessageImages message={message} project={project} chatId={chatId} />
           <div className="whitespace-pre-wrap leading-relaxed">{message.content}</div>
         </div>
         <div className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full bg-slate-200">
@@ -999,9 +1051,20 @@ function hasAssistantMessage(messages: ChatMessage[], agent: string, content: st
 
 function mergeMissing(server: ChatRecord, local: ChatRecord | null): ChatRecord {
   if (!local) return server;
-  const missing = local.messages.filter(
-    (m) => m.role === "user" && m.id.startsWith("local_") && !server.messages.some((sm) => sm.role === "user" && sm.content === m.content),
+  const lastUserIdx = (() => { for (let i = server.messages.length - 1; i >= 0; i--) { if (server.messages[i].role === "user") return i; } return -1; })();
+  const serverTurnAgents = new Set(
+    server.messages.slice(lastUserIdx + 1).filter((m) => m.role === "assistant").map((m) => m.agent),
   );
+  const missing: ChatMessage[] = [];
+  for (const m of local.messages) {
+    if (m.role === "user" && m.id.startsWith("local_") && !server.messages.some((sm) => sm.role === "user" && sm.content === m.content)) {
+      missing.push(m);
+    } else if (m.role === "assistant" && (m.id.startsWith("done_") || m.id.startsWith("partial_"))) {
+      if (!serverTurnAgents.has(m.agent)) {
+        missing.push(m);
+      }
+    }
+  }
   if (missing.length === 0) return server;
   return { ...server, messages: [...server.messages, ...missing] };
 }
@@ -1025,9 +1088,12 @@ function CodeChatPanel({
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [streamingAgents, setStreamingAgents] = useState<StreamingAgent[]>([]);
+  const [pendingAttachments, setPendingAttachments] = useState<ChatAttachment[]>([]);
+  const [uploading, setUploading] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const composingRef = useRef(false);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const fileId = filePath ? encodeFileId(filePath) : "";
 
@@ -1044,7 +1110,10 @@ function CodeChatPanel({
         setStreamingAgents((prev) => prev.map((a) =>
           a.agent === event.agent ? { ...a, chunks: [...(activeStreams[event.agent] || [])], hasText: true, status: "generating" } : a));
       } else if ((event.type === "done" || event.type === "error") && event.agent) {
-        const finalText = event.full_text ?? (activeStreams[event.agent] || []).join("");
+        let finalText = event.full_text ?? (activeStreams[event.agent] || []).join("");
+        if (!finalText.trim() && event.type === "error" && event.error) {
+          finalText = `${event.agent} error: ${event.error}`;
+        }
         if (finalText.trim()) {
           const msg: ChatMessage = { id: `done_${event.agent}_${Date.now()}`, role: "assistant", content: finalText, agent: event.agent, artifacts: [], created_at: new Date().toISOString() };
           setChat((prev) => {
@@ -1078,7 +1147,22 @@ function CodeChatPanel({
       }
       setStreaming(false);
       setStreamingAgents([]);
-      getChat(project, chatId).then((server) => setChat((local) => mergeMissing(server, local)));
+      // Re-fetch server state. If local assistant messages survive mergeMissing
+      // (i.e. save was in-flight or failed), retry after a delay to pick up
+      // the saved version with artifacts attached.
+      getChat(project, chatId).then((server) => {
+        const merged = mergeMissing(server, null);  // just get server
+        setChat((local) => {
+          const result = mergeMissing(server, local);
+          // If we had to preserve local assistant messages, schedule a retry
+          if (result.messages.length > merged.messages.length) {
+            setTimeout(() => {
+              getChat(project, chatId).then((retry) => setChat((prev) => mergeMissing(retry, prev)));
+            }, 2000);
+          }
+          return result;
+        });
+      });
     };
     return { onEvent, onDone };
   }, [project, chatId]);
@@ -1105,17 +1189,53 @@ function CodeChatPanel({
 
   useEffect(scrollToBottom, [chat?.messages.length, streamingAgents, scrollToBottom]);
 
+  const handleUploadFiles = useCallback(async (files: File[]) => {
+    if (!chat || files.length === 0) return;
+    setUploading(true);
+    try {
+      const newAtts: ChatAttachment[] = [];
+      for (const file of files.slice(0, 4)) {
+        const att = await uploadAttachment(project, chatId, file);
+        newAtts.push(att);
+      }
+      setPendingAttachments((prev) => [...prev, ...newAtts].slice(0, 4));
+    } catch { /* ignore */ } finally {
+      setUploading(false);
+    }
+  }, [chat, project, chatId]);
+
+  const handlePaste = useCallback((e: React.ClipboardEvent) => {
+    const files = Array.from(e.clipboardData.files).filter((f) => f.type.startsWith("image/"));
+    if (files.length > 0) {
+      e.preventDefault();
+      void handleUploadFiles(files);
+    }
+  }, [handleUploadFiles]);
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    const files = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith("image/"));
+    if (files.length > 0) void handleUploadFiles(files);
+  }, [handleUploadFiles]);
+
+  const removePendingAttachment = useCallback((id: string) => {
+    setPendingAttachments((prev) => prev.filter((a) => a.id !== id));
+  }, []);
+
   const handleSend = useCallback(() => {
-    if (!input.trim() || streaming || !chat) return;
+    if ((!input.trim() && pendingAttachments.length === 0) || streaming || !chat) return;
     const content = input.trim();
+    const attIds = pendingAttachments.map((a) => a.id);
+    const attSnapshots = [...pendingAttachments];
     setInput("");
+    setPendingAttachments([]);
     setStreaming(true);
     setStreamingAgents([]);
-    const userMsg: ChatMessage = { id: `local_${Date.now()}`, role: "user", content, agent: null, artifacts: [], created_at: new Date().toISOString() };
+    const userMsg: ChatMessage = { id: `local_${Date.now()}`, role: "user", content, agent: null, attachments: attSnapshots, artifacts: [], created_at: new Date().toISOString() };
     setChat((prev) => prev ? { ...prev, messages: [...prev.messages, userMsg] } : prev);
     const { onEvent, onDone } = buildStreamHandlers();
-    abortRef.current = askStream(project, chatId, content, onEvent, onDone);
-  }, [input, streaming, chat, project, chatId, buildStreamHandlers]);
+    abortRef.current = askStream(project, chatId, content, onEvent, onDone, attIds.length > 0 ? attIds : undefined);
+  }, [input, pendingAttachments, streaming, chat, project, chatId, buildStreamHandlers]);
 
   const handleStop = useCallback(() => {
     void stopTask(project, chatId);
@@ -1154,8 +1274,60 @@ function CodeChatPanel({
         ))}
       </div>
 
-      <div className="border-t border-slate-200 p-3">
+      <div
+        className="border-t border-slate-200 p-3"
+        onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; }}
+        onDrop={handleDrop}
+      >
+        {/* Pending attachment previews */}
+        {pendingAttachments.length > 0 && (
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            {pendingAttachments.map((att) => (
+              <div key={att.id} className="relative group">
+                <img
+                  src={attachmentUrl(project, chatId, att.id)}
+                  alt={att.filename}
+                  className="h-12 w-12 rounded-lg object-cover border border-slate-200"
+                />
+                <button
+                  type="button"
+                  className="absolute -top-1 -right-1 flex h-4 w-4 items-center justify-center rounded-full bg-slate-700 text-white opacity-0 group-hover:opacity-100 transition-opacity"
+                  onClick={() => removePendingAttachment(att.id)}
+                >
+                  <X size={8} />
+                </button>
+              </div>
+            ))}
+            {uploading && (
+              <div className="flex h-12 w-12 items-center justify-center rounded-lg border border-dashed border-slate-300 bg-slate-50">
+                <div className="h-3 w-3 animate-spin rounded-full border-2 border-slate-300 border-t-slate-600" />
+              </div>
+            )}
+          </div>
+        )}
         <div className="flex gap-2">
+          {/* Upload button */}
+          <button
+            type="button"
+            className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg border border-slate-300 bg-white text-slate-500 hover:bg-slate-50 hover:text-slate-700 disabled:opacity-40 transition-colors"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={streaming || uploading}
+            title="Attach image"
+          >
+            <ImagePlus size={14} />
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/png,image/jpeg,image/webp,image/gif"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              const files = Array.from(e.target.files ?? []);
+              if (files.length > 0) void handleUploadFiles(files);
+              e.target.value = "";
+            }}
+          />
           <textarea
             rows={1}
             className="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-slate-400 focus:outline-none focus:ring-1 focus:ring-slate-400/30 resize-none overflow-hidden"
@@ -1168,6 +1340,7 @@ function CodeChatPanel({
             }}
             onCompositionStart={() => { composingRef.current = true; }}
             onCompositionEnd={() => { composingRef.current = false; }}
+            onPaste={handlePaste}
             onKeyDown={(e) => {
               const ne = e.nativeEvent as KeyboardEvent & { isComposing?: boolean; keyCode?: number };
               if (e.key === "Enter" && !e.shiftKey && !(composingRef.current || ne.isComposing || ne.keyCode === 229)) {
@@ -1182,7 +1355,7 @@ function CodeChatPanel({
               <Square size={14} fill="currentColor" />
             </button>
           ) : (
-            <button type="button" className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-800 text-white hover:bg-slate-700 disabled:opacity-40" onClick={handleSend} disabled={!input.trim()}>
+            <button type="button" className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-800 text-white hover:bg-slate-700 disabled:opacity-40" onClick={handleSend} disabled={!input.trim() && pendingAttachments.length === 0}>
               <Send size={15} />
             </button>
           )}

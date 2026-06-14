@@ -122,6 +122,10 @@ export async function createDoc(project: string, filename: string, content: stri
   return res.json();
 }
 
+export function docPreviewPdfUrl(project: string, docId: string): string {
+  return `${docsBase(project)}/${encodeURIComponent(docId)}/preview.pdf`;
+}
+
 export async function deleteDoc(project: string, docId: string): Promise<void> {
   const res = await fetch(`${docsBase(project)}/${encodeURIComponent(docId)}`, {
     method: "DELETE",

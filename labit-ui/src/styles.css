@@ -26,6 +26,11 @@
   --lb-mono: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, monospace;
 }
 
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
 body {
   margin: 0;
   min-width: 320px;

@@ -12,7 +12,7 @@ from pydantic import ValidationError
 
 from labit.api.app import create_app
 from labit.api.chat_models import CreateChatRequest
-from labit.api.chat_routes import BackgroundTask, _stream_from_task
+from labit.api.agent_runtime import BackgroundTask, stream_from_task as _stream_from_task
 from labit.api.chat_service import ChatService
 from labit.papers.models import PaperRecord
 from labit.papers.service import PaperService

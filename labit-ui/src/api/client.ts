@@ -71,6 +71,30 @@ export function listProjects(): Promise<ProjectListResponse> {
   return getJson<ProjectListResponse>("/api/projects");
 }
 
+export interface CreateProjectPayload {
+  name: string;
+  description?: string;
+  repo?: string;
+  keywords?: string[];
+  relevance_criteria?: string;
+}
+
+export async function createProject(payload: CreateProjectPayload): Promise<{ name: string }> {
+  const response = await fetch(`${API_BASE}/api/projects`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: payload.name,
+      description: payload.description ?? "",
+      repo: payload.repo || null,
+      keywords: payload.keywords ?? [],
+      relevance_criteria: payload.relevance_criteria ?? "",
+    }),
+  });
+  if (!response.ok) throw new Error(await response.text());
+  return response.json() as Promise<{ name: string }>;
+}
+
 export function listPapers(project: string): Promise<PaperRecord[]> {
   return getJson<PaperRecord[]>(`/api/projects/${encodeURIComponent(project)}/papers`);
 }

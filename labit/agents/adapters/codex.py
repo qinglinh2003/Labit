@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import threading
 from collections.abc import Callable
@@ -27,10 +28,11 @@ class CodexAdapter(AgentAdapter):
             schema_path = Path(schema_handle.name)
 
             cmd = [
-                "codex",
+                _codex_executable(),
                 "exec",
                 "--dangerously-bypass-approvals-and-sandbox",
                 "--skip-git-repo-check",
+                "--ephemeral",
                 "--color",
                 "never",
                 "--output-last-message",
@@ -62,12 +64,10 @@ class CodexAdapter(AgentAdapter):
                     text=True,
                     cwd=request.cwd,
                     check=True,
-                    timeout=request.timeout_seconds,
+                    timeout=None,
                 )
             except subprocess.TimeoutExpired as exc:
-                raise AgentAdapterError(
-                    f"Codex adapter timed out after {request.timeout_seconds}s."
-                ) from exc
+                raise AgentAdapterError("Codex adapter timed out.") from exc
             except subprocess.CalledProcessError as exc:
                 detail = (exc.stderr or exc.stdout or str(exc)).strip()
                 raise AgentAdapterError(f"Codex adapter failed: {detail}") from exc
@@ -112,10 +112,11 @@ class CodexAdapter(AgentAdapter):
             prompt = f"{request.system_prompt}\n\n{request.prompt}"
 
         cmd = [
-            "codex",
+            _codex_executable(),
             "exec",
             "--dangerously-bypass-approvals-and-sandbox",
             "--skip-git-repo-check",
+            "--ephemeral",
             "--color",
             "never",
             "--json",
@@ -203,15 +204,12 @@ class CodexAdapter(AgentAdapter):
             result = stream_subprocess_lines(
                 cmd,
                 cwd=request.cwd,
-                timeout_seconds=request.timeout_seconds,
                 input_text=prompt,
                 on_stdout_line=_handle_stdout,
                 cancel_event=cancel_event,
             )
         except subprocess.TimeoutExpired as exc:
-            raise AgentAdapterError(
-                f"Codex adapter timed out after {request.timeout_seconds}s."
-            ) from exc
+            raise AgentAdapterError("Codex adapter timed out.") from exc
 
         final_output = out_path.read_text().strip() if out_path.exists() else ""
         out_path.unlink(missing_ok=True)
@@ -229,6 +227,19 @@ class CodexAdapter(AgentAdapter):
             session_id=session_id,
             command=cmd,
         )
+
+
+def _codex_executable() -> str:
+    # Prefer user-installed version (typically newer) over system-wide
+    npm_global = Path.home() / ".npm-global" / "bin" / "codex"
+    if npm_global.exists():
+        return str(npm_global)
+
+    executable = shutil.which("codex")
+    if executable:
+        return executable
+
+    return "codex"
 
 
 def _describe_codex_item(item: object, *, prefix: str) -> str:

@@ -28,7 +28,6 @@ DEFAULT_SYNC_EXCLUDES = [
     "wandb/",
     "outputs/",
     "runs/",
-    ".chats/",
     ".history/",
 ]
 
@@ -125,7 +124,6 @@ class ComputeService:
         profile_name: str,
         *,
         excludes: list[str] | None = None,
-        timeout_seconds: int = 120,
     ) -> SyncResult:
         """Rsync project code/ directory to the remote profile's workdir."""
         profile = self.get_profile(project, profile_name)
@@ -172,7 +170,7 @@ class ComputeService:
 
         result = subprocess.run(
             cmd, text=True, capture_output=True,
-            timeout=timeout_seconds, check=False,
+            timeout=None, check=False,
         )
 
         return SyncResult(
@@ -186,7 +184,7 @@ class ComputeService:
         )
 
     def check_gpu(
-        self, project: str, profile_name: str, *, timeout_seconds: int = 15,
+        self, project: str, profile_name: str,
     ) -> subprocess.CompletedProcess[str]:
         """Run nvidia-smi on the remote machine and return the output."""
         profile = self.get_profile(project, profile_name)
@@ -194,13 +192,12 @@ class ComputeService:
         command = [
             *ssh_cmd[:-1],
             "-o", "BatchMode=yes",
-            "-o", f"ConnectTimeout={timeout_seconds}",
             ssh_cmd[-1],
             "nvidia-smi",
         ]
         return subprocess.run(
             command, text=True, capture_output=True,
-            timeout=timeout_seconds + 2, check=False,
+            timeout=None, check=False,
         )
 
     def _load_project(self, project: str) -> ProjectSpec:

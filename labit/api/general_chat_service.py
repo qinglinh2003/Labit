@@ -1,44 +1,35 @@
 """General (non-paper) chat service: CRUD for project-scoped chats."""
 from __future__ import annotations
 
-import re
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from labit.api.chat_models import AgentName, ChatMode
-from labit.api.general_chat_models import (
+from labit.api.attachment_utils import (
+    get_attachment_path as _get_attachment_path,
+    resolve_attachment_ids as _resolve_attachment_ids,
+    upload_attachment as _upload_attachment,
+)
+from labit.api.chat_models import (
+    AgentName,
     Artifact,
     Attachment,
-    GeneralChatListItem,
-    GeneralChatMessage,
-    GeneralChatRecord,
+    ChatListItem,
+    ChatMessage,
+    ChatMode,
+    ChatRecord,
+)
+from labit.api.chat_storage import (
+    append_message as _append_message,
+    delete_chat_dir,
+    find_artifact,
+    list_chat_records,
+    load_chat,
+    save_chat,
+    update_chat_fields,
 )
 from labit.paths import RepoPaths
 from labit.services.project_service import ProjectService
-
-
-ALLOWED_MIME_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
-MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
-
-
-def _mime_to_ext(mime_type: str) -> str:
-    return {
-        "image/png": ".png",
-        "image/jpeg": ".jpg",
-        "image/webp": ".webp",
-        "image/gif": ".gif",
-    }.get(mime_type, ".bin")
-
-
-def _ext_to_mime(ext: str) -> str:
-    return {
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".webp": "image/webp",
-        ".gif": "image/gif",
-    }.get(ext.lower(), "application/octet-stream")
 
 
 from labit.api.shared_prompts import PROJECT_FILES_CONTEXT
@@ -82,124 +73,6 @@ SYSTEM_PROMPT = (
 )
 
 
-# ---------------------------------------------------------------------------
-# Artifact extraction
-# ---------------------------------------------------------------------------
-
-# Match artifact fences: opening fence has N backticks (N>=3), closing fence
-# must have exactly N backticks on its own line.  This avoids the bug where
-# 3-backtick code blocks inside the artifact content would prematurely close
-# the artifact block.
-_ARTIFACT_OPEN_RE = re.compile(
-    r"(`{3,})\s*artifact:\s*(.+?)\s*\n?"
-    r"title:\s*([^\n]+)\n"
-    r"---\s*\n"
-)
-
-_EXT_TO_LANG: dict[str, str] = {
-    ".md": "markdown", ".markdown": "markdown",
-    ".py": "python", ".js": "javascript", ".ts": "typescript",
-    ".tsx": "typescript", ".jsx": "javascript",
-    ".json": "json", ".yaml": "yaml", ".yml": "yaml",
-    ".toml": "toml", ".sh": "bash", ".bash": "bash",
-    ".tex": "latex", ".css": "css", ".html": "html",
-    ".sql": "sql", ".rs": "rust", ".go": "go",
-    ".java": "java", ".c": "c", ".cpp": "cpp",
-    ".txt": "text", ".csv": "csv", ".xml": "xml",
-}
-
-_EXT_TO_MIME: dict[str, str] = {
-    ".md": "text/markdown", ".markdown": "text/markdown",
-    ".py": "text/x-python", ".js": "text/javascript",
-    ".ts": "text/typescript", ".tsx": "text/typescript",
-    ".json": "application/json", ".yaml": "text/yaml", ".yml": "text/yaml",
-    ".toml": "text/toml", ".sh": "text/x-shellscript",
-    ".tex": "text/x-latex", ".css": "text/css",
-    ".html": "text/plain",  # serve as plain text for safety
-    ".sql": "text/x-sql", ".csv": "text/csv", ".xml": "text/xml",
-    ".txt": "text/plain",
-}
-
-
-def _sanitize_filename(name: str) -> str:
-    """Remove path traversal and special characters from a filename."""
-    name = name.strip().replace("\\", "/")
-    name = name.split("/")[-1]  # take only the basename
-    # Remove characters unsafe for filenames
-    name = re.sub(r'[<>:"|?*\x00-\x1f]', "", name)
-    return name or "artifact.txt"
-
-
-def extract_artifacts(text: str, agent: str = "") -> tuple[str, list[Artifact]]:
-    """Extract artifact blocks from agent output.
-
-    Returns (cleaned_text, artifacts) where cleaned_text has artifact blocks
-    replaced with placeholder references.
-
-    The parser counts the backticks in the opening fence and only closes when
-    it finds a line with *exactly* that many backticks (and nothing else).
-    This correctly handles artifacts that contain nested code blocks with
-    fewer backticks.
-    """
-    artifacts: list[Artifact] = []
-    result_parts: list[str] = []
-    pos = 0
-
-    while pos < len(text):
-        m = _ARTIFACT_OPEN_RE.search(text, pos)
-        if m is None:
-            result_parts.append(text[pos:])
-            break
-
-        # Text before the artifact block
-        result_parts.append(text[pos:m.start()])
-
-        fence = m.group(1)  # the backtick sequence (e.g. ````` or ```)
-        raw_filename = _sanitize_filename(m.group(2).strip())
-        title = m.group(3).strip()
-        content_start = m.end()
-
-        # Find closing fence: the same backtick sequence on its own line
-        # (preceded by newline) or directly after content at the very end
-        # of the text (agents sometimes omit the newline before closing).
-        # We try newline-preceded first, falling back to end-of-text match.
-        closing_nl = re.compile(r"\n" + re.escape(fence) + r"\s*(?:\n|$)")
-        close_m = closing_nl.search(text, content_start)
-        if close_m is None:
-            # Fallback: fence at end of text without preceding newline
-            closing_end = re.compile(re.escape(fence) + r"\s*$")
-            close_m = closing_end.search(text, content_start)
-
-        if close_m is None:
-            # No closing fence found — treat as plain text
-            result_parts.append(text[m.start():m.end()])
-            pos = m.end()
-            continue
-
-        content = text[content_start:close_m.start()]
-        # Strip trailing newline from content if the closing fence was on its own line
-        if close_m.group(0).startswith("\n"):
-            pass  # newline is already excluded from content via close_m.start()
-        # else: content may end with the last text char before the fence
-        ext = Path(raw_filename).suffix.lower()
-        language = _EXT_TO_LANG.get(ext, "text")
-        mime_type = _EXT_TO_MIME.get(ext, "text/plain")
-
-        art = Artifact(
-            id=f"art_{uuid.uuid4().hex[:8]}",
-            title=title,
-            filename=raw_filename,
-            language=language,
-            mime_type=mime_type,
-            content=content,
-        )
-        artifacts.append(art)
-        result_parts.append(f"[Artifact: {title} ({raw_filename})]")
-        pos = close_m.end()
-
-    return "".join(result_parts), artifacts
-
-
 class GeneralChatService:
     def __init__(self, paths: RepoPaths, project_service: ProjectService):
         self.paths = paths
@@ -211,13 +84,13 @@ class GeneralChatService:
         title: str = "",
         mode: ChatMode = ChatMode.SINGLE,
         first_agent: AgentName = "claude",
-    ) -> GeneralChatRecord:
+    ) -> ChatRecord:
         chats_dir = self._chats_dir(project)
         chats_dir.mkdir(parents=True, exist_ok=True)
 
         now = datetime.now(UTC).replace(microsecond=0).isoformat()
         chat_id = uuid.uuid4().hex[:12]
-        record = GeneralChatRecord(
+        record = ChatRecord(
             chat_id=chat_id,
             title=title or f"Chat {chat_id[:6]}",
             project=project,
@@ -226,62 +99,22 @@ class GeneralChatService:
             created_at=now,
             updated_at=now,
         )
-        self._save_chat(chats_dir, record)
+        save_chat(chats_dir, record)
         return record
 
-    def list_chats(self, project: str) -> list[GeneralChatListItem]:
-        chats_dir = self._chats_dir(project)
-        if not chats_dir.exists():
-            return []
-        items: list[GeneralChatListItem] = []
-        seen_ids: set[str] = set()
+    def list_chats(self, project: str) -> list[ChatListItem]:
+        records = list_chat_records(self._chats_dir(project), ChatRecord)
+        return [
+            ChatListItem(
+                chat_id=r.chat_id, title=r.title, mode=r.mode,
+                first_agent=r.first_agent, updated_at=r.updated_at,
+                message_count=len(r.messages),
+            )
+            for r in records
+        ]
 
-        # New format: chats/{chat_id}/chat.json
-        for chat_json in chats_dir.glob("*/chat.json"):
-            try:
-                record = GeneralChatRecord.model_validate_json(chat_json.read_text(encoding="utf-8"))
-                seen_ids.add(record.chat_id)
-                items.append(
-                    GeneralChatListItem(
-                        chat_id=record.chat_id,
-                        title=record.title,
-                        mode=record.mode,
-                        first_agent=record.first_agent,
-                        updated_at=record.updated_at,
-                        message_count=len(record.messages),
-                    )
-                )
-            except Exception:
-                continue
-
-        # Old format: chats/{chat_id}.json (backward compat)
-        for path in chats_dir.glob("*.json"):
-            try:
-                record = GeneralChatRecord.model_validate_json(path.read_text(encoding="utf-8"))
-                if record.chat_id in seen_ids:
-                    continue
-                seen_ids.add(record.chat_id)
-                items.append(
-                    GeneralChatListItem(
-                        chat_id=record.chat_id,
-                        title=record.title,
-                        mode=record.mode,
-                        first_agent=record.first_agent,
-                        updated_at=record.updated_at,
-                        message_count=len(record.messages),
-                    )
-                )
-            except Exception:
-                continue
-
-        items.sort(key=lambda x: x.updated_at, reverse=True)
-        return items
-
-    def get_chat(self, project: str, chat_id: str) -> GeneralChatRecord:
-        path = self._chat_path(project, chat_id)
-        if not path.exists():
-            raise FileNotFoundError(f"Chat '{chat_id}' not found.")
-        return GeneralChatRecord.model_validate_json(path.read_text(encoding="utf-8"))
+    def get_chat(self, project: str, chat_id: str) -> ChatRecord:
+        return load_chat(self._chats_dir(project), chat_id, ChatRecord)
 
     def update_chat(
         self,
@@ -291,40 +124,14 @@ class GeneralChatService:
         mode: ChatMode | None = None,
         first_agent: AgentName | None = None,
         title: str | None = None,
-    ) -> GeneralChatRecord:
-        record = self.get_chat(project, chat_id)
-        if mode is not None:
-            record.mode = mode
-        if first_agent is not None:
-            record.first_agent = first_agent
-        if title is not None:
-            record.title = title
-        record.updated_at = datetime.now(UTC).replace(microsecond=0).isoformat()
-        self._save_chat(self._chats_dir(project), record)
-        return record
+    ) -> ChatRecord:
+        return update_chat_fields(
+            self._chats_dir(project), chat_id, ChatRecord,
+            mode=mode, first_agent=first_agent, title=title,
+        )
 
     def delete_chat(self, project: str, chat_id: str) -> None:
-        import shutil
-
-        removed = False
-        # Remove new directory format.
-        chat_dir = self.chat_dir(project, chat_id)
-        if chat_dir.exists() and chat_dir.is_dir():
-            shutil.rmtree(chat_dir)
-            removed = True
-        # Also remove old single-file format. This matters after an old chat has
-        # been read and re-saved in the new directory format.
-        old_path = self._chats_dir(project) / f"{chat_id}.json"
-        if old_path.exists():
-            old_path.unlink()
-            removed = True
-        # Also clean up old attachments dir
-        old_att = self._chats_dir(project) / f"{chat_id}_attachments"
-        if old_att.exists():
-            shutil.rmtree(old_att)
-            removed = True
-        if not removed:
-            return
+        delete_chat_dir(self._chats_dir(project), chat_id)
 
     def append_message(
         self,
@@ -335,22 +142,17 @@ class GeneralChatService:
         agent: str | None = None,
         attachments: list[Attachment] | None = None,
         artifacts: list[Artifact] | None = None,
-    ) -> GeneralChatMessage:
-        record = self.get_chat(project, chat_id)
-        now = datetime.now(UTC).replace(microsecond=0).isoformat()
-        msg = GeneralChatMessage(
-            id=f"msg_{uuid.uuid4().hex[:8]}",
-            role=role,
-            content=content,
-            agent=agent,
-            attachments=attachments or [],
-            artifacts=artifacts or [],
-            created_at=now,
+    ) -> ChatMessage:
+        extra: dict = {}
+        if attachments:
+            extra["attachments"] = attachments
+        if artifacts:
+            extra["artifacts"] = artifacts
+        return _append_message(
+            self._chats_dir(project), chat_id, ChatRecord,
+            ChatMessage, role=role, content=content, agent=agent,
+            extra_fields=extra or None,
         )
-        record.messages.append(msg)
-        record.updated_at = now
-        self._save_chat(self._chats_dir(project), record)
-        return msg
 
     def upload_attachment(
         self,
@@ -360,32 +162,12 @@ class GeneralChatService:
         mime_type: str,
         data: bytes,
     ) -> Attachment:
-        """Save an uploaded file and return its Attachment metadata."""
-        att_dir = self._attachments_dir(project, chat_id)
-        att_dir.mkdir(parents=True, exist_ok=True)
-
-        att_id = uuid.uuid4().hex[:12]
-        ext = _mime_to_ext(mime_type)
-        dest = att_dir / f"{att_id}{ext}"
-        dest.write_bytes(data)
-
-        return Attachment(
-            id=att_id,
-            kind="image",
-            filename=filename,
-            mime_type=mime_type,
-            path=str(dest),
+        return _upload_attachment(
+            self._attachments_dir(project, chat_id), filename, mime_type, data,
         )
 
     def get_attachment_path(self, project: str, chat_id: str, att_id: str) -> Path | None:
-        """Return the file path of an attachment, or None if not found."""
-        att_dir = self._attachments_dir(project, chat_id)
-        if not att_dir.exists():
-            return None
-        for f in att_dir.iterdir():
-            if f.stem == att_id:
-                return f
-        return None
+        return _get_attachment_path(self._attachments_dir(project, chat_id), att_id)
 
     def resolve_attachment_ids(
         self,
@@ -393,26 +175,10 @@ class GeneralChatService:
         chat_id: str,
         attachment_ids: list[str],
     ) -> list[Attachment]:
-        """Look up stored attachment metadata by IDs from the chat record."""
         record = self.get_chat(project, chat_id)
-        # Build index of all attachments across messages + any pending uploads
-        by_id: dict[str, Attachment] = {}
-        for msg in record.messages:
-            for att in msg.attachments:
-                by_id[att.id] = att
-        # Also check files on disk for recently uploaded but not yet in a message
-        att_dir = self._attachments_dir(project, chat_id)
-        if att_dir.exists():
-            for f in att_dir.iterdir():
-                if f.stem not in by_id:
-                    by_id[f.stem] = Attachment(
-                        id=f.stem,
-                        kind="image",
-                        filename=f.name,
-                        mime_type=_ext_to_mime(f.suffix),
-                        path=str(f),
-                    )
-        return [by_id[aid] for aid in attachment_ids if aid in by_id]
+        return _resolve_attachment_ids(
+            self._attachments_dir(project, chat_id), record.messages, attachment_ids,
+        )
 
     def recent_image_paths(self, project: str, chat_id: str, max_images: int = 4) -> list[str]:
         """Collect image paths from most recent user messages."""
@@ -430,11 +196,22 @@ class GeneralChatService:
                 break  # only grab from the most recent user message with images
         return paths
 
-    def build_prompt(self, project: str, chat_id: str) -> str:
-        """Build prompt from chat history."""
+    def build_prompt(self, project: str, chat_id: str, *, max_history: int | None = None) -> str:
+        """Build prompt from chat history.
+
+        Args:
+            max_history: If set, only include the last N messages from history.
+        """
         record = self.get_chat(project, chat_id)
         parts: list[str] = []
-        for msg in record.messages:
+
+        messages = record.messages
+        if max_history is not None and len(messages) > max_history:
+            omitted = len(messages) - max_history
+            parts.append(f"[{omitted} earlier messages omitted for brevity]")
+            messages = messages[-max_history:]
+
+        for msg in messages:
             if msg.role == "user":
                 text = msg.content
                 if msg.attachments:
@@ -482,11 +259,7 @@ class GeneralChatService:
     ) -> Artifact | None:
         """Find an artifact by ID across all messages in a chat."""
         record = self.get_chat(project, chat_id)
-        for msg in record.messages:
-            for art in msg.artifacts:
-                if art.id == artifact_id:
-                    return art
-        return None
+        return find_artifact(record.messages, artifact_id)
 
     def get_project_dir(self, project: str) -> str:
         """Return the resolved project directory path (for subprocess cwd)."""
@@ -500,18 +273,6 @@ class GeneralChatService:
         project_dir = self.project_service.project_dir(project)
         return project_dir / "chats"
 
-    def _chat_path(self, project: str, chat_id: str) -> Path:
-        # New format: chats/{chat_id}/chat.json
-        new_path = self._chats_dir(project) / chat_id / "chat.json"
-        if new_path.exists():
-            return new_path
-        # Fallback to old format: chats/{chat_id}.json
-        old_path = self._chats_dir(project) / f"{chat_id}.json"
-        if old_path.exists():
-            return old_path
-        # Default to new format for new chats
-        return new_path
-
     def _attachments_dir(self, project: str, chat_id: str) -> Path:
         # New format: chats/{chat_id}/attachments/
         new_dir = self._chats_dir(project) / chat_id / "attachments"
@@ -523,13 +284,3 @@ class GeneralChatService:
             return old_dir
         # Default to new format
         return new_dir
-
-    def _save_chat(self, chats_dir: Path, record: GeneralChatRecord) -> None:
-        # Always save in new directory format: chats/{chat_id}/chat.json
-        chat_dir = chats_dir / record.chat_id
-        chat_dir.mkdir(parents=True, exist_ok=True)
-        path = chat_dir / "chat.json"
-        path.write_text(
-            record.model_dump_json(indent=2),
-            encoding="utf-8",
-        )

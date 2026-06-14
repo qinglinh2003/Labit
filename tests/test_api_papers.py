@@ -324,6 +324,65 @@ def test_api_returns_project_list(tmp_path: Path) -> None:
     assert response.json() == {"projects": ["Labit"], "active_project": "Labit"}
 
 
+def test_api_creates_project_and_sets_active(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    client = TestClient(create_app(paths))
+
+    response = client.post(
+        "/api/projects",
+        json={"name": "InboxPilot", "description": "Email triage experiments"},
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["name"] == "InboxPilot"
+    assert payload["set_active"] is True
+    assert (paths.project_configs_dir / "InboxPilot.yaml").exists()
+    assert (paths.vault_projects_dir / "InboxPilot" / "code").is_dir()
+    assert (paths.vault_projects_dir / "InboxPilot" / "docs").is_dir()
+    assert paths.active_project_path.read_text(encoding="utf-8").strip() == "InboxPilot"
+
+    list_response = client.get("/api/projects")
+    assert list_response.status_code == 200
+    assert list_response.json() == {
+        "projects": ["InboxPilot", "Labit"],
+        "active_project": "InboxPilot",
+    }
+
+
+def test_api_create_project_persists_cli_project_fields(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    client = TestClient(create_app(paths))
+
+    response = client.post(
+        "/api/projects",
+        json={
+            "name": "InboxPilot",
+            "description": "Email triage experiments",
+            "repo": "git@github.com:qinglinh2003/InboxPilot.git",
+            "keywords": ["email", "triage", "automation"],
+            "relevance_criteria": "Inbox automation and prioritization experiments",
+        },
+    )
+
+    assert response.status_code == 201
+    config = yaml.safe_load((paths.project_configs_dir / "InboxPilot.yaml").read_text(encoding="utf-8"))
+    assert config["name"] == "InboxPilot"
+    assert config["description"] == "Email triage experiments"
+    assert config["repo"] == "git@github.com:qinglinh2003/InboxPilot.git"
+    assert config["keywords"] == ["email", "triage", "automation"]
+    assert config["relevance_criteria"] == "Inbox automation and prioritization experiments"
+
+
+def test_api_create_project_rejects_duplicate(tmp_path: Path) -> None:
+    paths = _create_project(tmp_path)
+    client = TestClient(create_app(paths))
+
+    response = client.post("/api/projects", json={"name": "Labit"})
+
+    assert response.status_code == 409
+
+
 def test_api_serves_frontend_dist_from_code_directory(tmp_path: Path, monkeypatch) -> None:
     paths = _create_project(tmp_path)
     frontend_dist = tmp_path / "frontend-dist"

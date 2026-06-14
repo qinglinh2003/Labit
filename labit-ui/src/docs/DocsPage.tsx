@@ -35,6 +35,7 @@ import {
   deleteDoc,
   getActiveTask,
   getChat,
+  docPreviewPdfUrl,
   getDocContent,
   listChats,
   listDocs,
@@ -369,18 +370,17 @@ function DocEditor({
             placeholder="Start writing..."
             spellCheck={false}
           />
+        ) : doc.format === "markdown" && content ? (
+            <iframe
+              key={`${doc.id}-${savedContent.length}`}
+              src={docPreviewPdfUrl(project, doc.id)}
+              className="h-full w-full border-0"
+              title="PDF preview"
+            />
         ) : (
           <div className="h-full overflow-y-auto p-6">
             {content ? (
-              doc.format === "markdown" ? (
-                <div className="prose prose-slate max-w-none">
-                  <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>
-                    {content}
-                  </ReactMarkdown>
-                </div>
-              ) : (
-                <pre className="text-sm text-slate-700 font-mono whitespace-pre-wrap">{content}</pre>
-              )
+              <pre className="text-sm text-slate-700 font-mono whitespace-pre-wrap">{content}</pre>
             ) : (
               <p className="text-sm text-slate-400 italic">Empty document. Switch to Edit mode to start writing.</p>
             )}
@@ -602,9 +602,20 @@ function hasAssistantMessage(messages: ChatMessage[], agent: string, content: st
 
 function mergeMissing(server: ChatRecord, local: ChatRecord | null): ChatRecord {
   if (!local) return server;
-  const missing = local.messages.filter(
-    (m) => m.role === "user" && m.id.startsWith("local_") && !server.messages.some((sm) => sm.role === "user" && sm.content === m.content),
+  const lastUserIdx = (() => { for (let i = server.messages.length - 1; i >= 0; i--) { if (server.messages[i].role === "user") return i; } return -1; })();
+  const serverTurnAgents = new Set(
+    server.messages.slice(lastUserIdx + 1).filter((m) => m.role === "assistant").map((m) => m.agent),
   );
+  const missing: ChatMessage[] = [];
+  for (const m of local.messages) {
+    if (m.role === "user" && m.id.startsWith("local_") && !server.messages.some((sm) => sm.role === "user" && sm.content === m.content)) {
+      missing.push(m);
+    } else if (m.role === "assistant" && (m.id.startsWith("done_") || m.id.startsWith("partial_"))) {
+      if (!serverTurnAgents.has(m.agent)) {
+        missing.push(m);
+      }
+    }
+  }
   if (missing.length === 0) return server;
   return { ...server, messages: [...server.messages, ...missing] };
 }
@@ -645,7 +656,10 @@ function DocChatPanel({
         setStreamingAgents((prev) => prev.map((a) =>
           a.agent === event.agent ? { ...a, chunks: [...(activeStreams[event.agent] || [])], hasText: true, status: "generating" } : a));
       } else if ((event.type === "done" || event.type === "error") && event.agent) {
-        const finalText = event.full_text ?? (activeStreams[event.agent] || []).join("");
+        let finalText = event.full_text ?? (activeStreams[event.agent] || []).join("");
+        if (!finalText.trim() && event.type === "error" && event.error) {
+          finalText = `${event.agent} error: ${event.error}`;
+        }
         if (finalText.trim()) {
           const msg: ChatMessage = { id: `done_${event.agent}_${Date.now()}`, role: "assistant", content: finalText, agent: event.agent, artifacts: [], created_at: new Date().toISOString() };
           setChat((prev) => {
@@ -660,7 +674,18 @@ function DocChatPanel({
     const onDone = () => {
       setStreaming(false);
       setStreamingAgents([]);
-      getChat(project, docId, chatId).then((server) => setChat((local) => mergeMissing(server, local)));
+      getChat(project, docId, chatId).then((server) => {
+        const merged = mergeMissing(server, null);
+        setChat((local) => {
+          const result = mergeMissing(server, local);
+          if (result.messages.length > merged.messages.length) {
+            setTimeout(() => {
+              getChat(project, docId, chatId).then((retry) => setChat((prev) => mergeMissing(retry, prev)));
+            }, 2000);
+          }
+          return result;
+        });
+      });
     };
     return { onEvent, onDone };
   }, [project, docId, chatId]);

@@ -37,11 +37,20 @@ function hasAssistantMessage(messages: ChatMessage[], agent: string, content: st
 
 function mergeMissingLocalMessages(serverChat: ChatRecord, localChat: ChatRecord | null): ChatRecord {
   if (!localChat) return serverChat;
-  const missing = localChat.messages.filter((msg) =>
-    msg.role === "user" &&
-    msg.id.startsWith("local_") &&
-    !serverChat.messages.some((serverMsg) => serverMsg.role === "user" && serverMsg.content === msg.content)
+  const lastUserIdx = (() => { for (let i = serverChat.messages.length - 1; i >= 0; i--) { if (serverChat.messages[i].role === "user") return i; } return -1; })();
+  const serverTurnAgents = new Set(
+    serverChat.messages.slice(lastUserIdx + 1).filter((m) => m.role === "assistant").map((m) => m.agent),
   );
+  const missing: ChatMessage[] = [];
+  for (const msg of localChat.messages) {
+    if (msg.role === "user" && msg.id.startsWith("local_") && !serverChat.messages.some((sm) => sm.role === "user" && sm.content === msg.content)) {
+      missing.push(msg);
+    } else if (msg.role === "assistant" && (msg.id.startsWith("done_") || msg.id.startsWith("partial_"))) {
+      if (!serverTurnAgents.has(msg.agent)) {
+        missing.push(msg);
+      }
+    }
+  }
   if (missing.length === 0) return serverChat;
   return { ...serverChat, messages: [...serverChat.messages, ...missing] };
 }
@@ -124,7 +133,10 @@ export default function ChatPanel({
           )
         );
       } else if ((event.type === "done" || event.type === "error") && event.agent) {
-        const finalText = event.full_text ?? (activeStreams[event.agent] || []).join("");
+        let finalText = event.full_text ?? (activeStreams[event.agent] || []).join("");
+        if (!finalText.trim() && event.type === "error" && event.error) {
+          finalText = `${event.agent} error: ${event.error}`;
+        }
         if (finalText.trim()) {
           const msg: ChatMessage = {
             id: `done_${event.agent}_${Date.now()}`,
@@ -168,7 +180,16 @@ export default function ChatPanel({
       setStreamingAgents([]);
       // Re-fetch to get server-saved messages
       getChat(project, paperId, chatId).then((serverChat) => {
-        setChat((localChat) => mergeMissingLocalMessages(serverChat, localChat));
+        const merged = mergeMissingLocalMessages(serverChat, null);
+        setChat((localChat) => {
+          const result = mergeMissingLocalMessages(serverChat, localChat);
+          if (result.messages.length > merged.messages.length) {
+            setTimeout(() => {
+              getChat(project, paperId, chatId).then((retry) => setChat((prev) => mergeMissingLocalMessages(retry, prev)));
+            }, 2000);
+          }
+          return result;
+        });
       });
     };
 
