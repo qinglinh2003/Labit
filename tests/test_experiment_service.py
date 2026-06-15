@@ -8,7 +8,9 @@ import yaml
 
 import labit.services.experiment_service as experiment_service_module
 from labit.services.compute_service import SyncResult
-from labit.services.experiment_service import ExperimentService, RunRecord, parse_log
+from labit.services.experiment_service import (
+    ExperimentService, RunRecord, SyncManifest, parse_log,
+)
 
 
 @pytest.fixture()
@@ -338,3 +340,236 @@ def test_tail_logs_hides_remote_tail_errors(
     assert svc.tail_logs("TestProj", "exp_01", "run_tail_error") == (
         "[Log unavailable: could not connect to the remote machine or run directory.]"
     )
+
+
+# ── sync tests ──────────────────────────────────────────────────────
+
+
+def _make_run_with_local_logs(svc, experiment_tree, *, status="completed"):
+    """Create a run record and write local cached logs."""
+    record = RunRecord(
+        run_id="run_sync_01",
+        experiment_id="exp_01",
+        name="Test Exp",
+        profile="gpu1",
+        script="experiments/exp_01/run.sh",
+        command="bash experiments/exp_01/run.sh",
+        status=status,
+        remote_workdir="/workspace",
+        remote_run_dir=".labit/runs/run_sync_01",
+    )
+    svc._save_run("TestProj", record)
+
+    # Write local cached log files
+    local_dir = svc._local_run_data_dir("TestProj", "exp_01", "run_sync_01")
+    local_dir.mkdir(parents=True, exist_ok=True)
+    (local_dir / "stdout.log").write_text("line1\nline2\nline3\n")
+    (local_dir / "stderr.log").write_text("warn1\n")
+    (local_dir / "exit_code").write_text("0\n")
+    return record
+
+
+def test_tail_logs_reads_local_for_completed_run(experiment_tree: Path):
+    svc = _make_service(experiment_tree)
+    _make_run_with_local_logs(svc, experiment_tree, status="completed")
+
+    # Should read from local without SSH
+    content = svc.tail_logs("TestProj", "exp_01", "run_sync_01")
+    assert "line1" in content
+    assert "line3" in content
+
+
+def test_tail_logs_reads_local_for_failed_run(experiment_tree: Path):
+    svc = _make_service(experiment_tree)
+    _make_run_with_local_logs(svc, experiment_tree, status="failed")
+
+    content = svc.tail_logs("TestProj", "exp_01", "run_sync_01")
+    assert "line1" in content
+
+
+def test_tail_logs_falls_back_to_local_on_ssh_failure(
+    monkeypatch: pytest.MonkeyPatch, experiment_tree: Path,
+):
+    svc = _make_service(experiment_tree)
+    _make_run_with_local_logs(svc, experiment_tree, status="running")
+
+    def fake_run(cmd, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="Connection refused")
+
+    monkeypatch.setattr(experiment_service_module.subprocess, "run", fake_run)
+
+    content = svc.tail_logs("TestProj", "exp_01", "run_sync_01")
+    assert "line1" in content
+
+
+def test_fetch_events_reads_local_for_completed_run(experiment_tree: Path):
+    svc = _make_service(experiment_tree)
+    record = RunRecord(
+        run_id="run_ev_local",
+        experiment_id="exp_01",
+        name="Test Exp",
+        profile="gpu1",
+        script="experiments/exp_01/run.sh",
+        command="bash experiments/exp_01/run.sh",
+        status="completed",
+        remote_workdir="/workspace",
+        remote_run_dir=".labit/runs/run_ev_local",
+    )
+    svc._save_run("TestProj", record)
+
+    local_dir = svc._local_run_data_dir("TestProj", "exp_01", "run_ev_local")
+    local_dir.mkdir(parents=True, exist_ok=True)
+    (local_dir / "stdout.log").write_text(
+        'Starting...\n'
+        '{"__labit__": true, "type": "metric", "step": 10, "data": {"loss": 2.5}}\n'
+        'Done.\n'
+    )
+
+    result = svc.fetch_events("TestProj", "exp_01", "run_ev_local")
+    assert len(result["events"]) == 1
+    assert result["total_lines"] == 3
+    assert result["plain_lines"] == 2
+
+
+def test_fetch_metrics_reads_local_for_completed_run(experiment_tree: Path):
+    svc = _make_service(experiment_tree)
+    record = RunRecord(
+        run_id="run_m_local",
+        experiment_id="exp_01",
+        name="Test Exp",
+        profile="gpu1",
+        script="experiments/exp_01/run.sh",
+        command="bash experiments/exp_01/run.sh",
+        status="completed",
+        remote_workdir="/workspace",
+        remote_run_dir=".labit/runs/run_m_local",
+    )
+    svc._save_run("TestProj", record)
+
+    local_dir = svc._local_run_data_dir("TestProj", "exp_01", "run_m_local")
+    local_dir.mkdir(parents=True, exist_ok=True)
+    (local_dir / "stdout.log").write_text(
+        '{"__labit__": true, "type": "metric", "step": 10, "data": {"loss": 2.5}}\n'
+        '{"__labit__": true, "type": "metric", "step": 20, "data": {"loss": 1.8}}\n'
+    )
+
+    result = svc.fetch_metrics("TestProj", "exp_01", "run_m_local")
+    assert "loss" in result["metrics"]
+    assert len(result["metrics"]["loss"]) == 2
+    assert result["steps"] == [10, 20]
+
+
+def test_sync_logs_no_remote_run_dir(experiment_tree: Path):
+    svc = _make_service(experiment_tree)
+    record = RunRecord(
+        run_id="run_no_remote",
+        experiment_id="exp_01",
+        name="Test Exp",
+        profile="gpu1",
+        script="experiments/exp_01/run.sh",
+        command="bash experiments/exp_01/run.sh",
+        status="completed",
+        remote_workdir="/workspace",
+        remote_run_dir="",
+    )
+    svc._save_run("TestProj", record)
+
+    manifest = svc.sync_logs("TestProj", "exp_01", "run_no_remote")
+    assert manifest.last_sync_status == "failed"
+    assert "No remote run directory" in manifest.last_sync_error
+
+    loaded = svc._load_run("TestProj", "exp_01", "run_no_remote")
+    assert loaded.sync is not None
+    assert loaded.sync["last_sync_status"] == "failed"
+    assert "No remote run directory" in loaded.sync["last_sync_error"]
+
+
+def test_stop_run_returns_record_with_sync_state(
+    monkeypatch: pytest.MonkeyPatch, experiment_tree: Path,
+):
+    svc = _make_service(experiment_tree)
+    record = RunRecord(
+        run_id="run_stop_sync",
+        experiment_id="exp_01",
+        name="Test Exp",
+        profile="gpu1",
+        script="experiments/exp_01/run.sh",
+        command="bash experiments/exp_01/run.sh",
+        status="running",
+        pid=4242,
+        remote_workdir="/workspace",
+        remote_run_dir=".labit/runs/run_stop_sync",
+    )
+    svc._save_run("TestProj", record)
+
+    def fake_run(cmd, **kwargs):
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(experiment_service_module.subprocess, "run", fake_run)
+
+    stopped = svc.stop_run("TestProj", "exp_01", "run_stop_sync")
+    assert stopped.status == "stopped"
+    assert stopped.sync is not None
+    assert stopped.sync["last_sync_status"] == "ok"
+
+
+def test_sync_manifest_roundtrip():
+    m = SyncManifest(
+        logs_synced_at="2026-06-15T10:00:00+00:00",
+        last_sync_status="ok",
+        files_synced=3,
+        bytes_synced=12345,
+    )
+    d = m.to_dict()
+    m2 = SyncManifest.from_dict(d)
+    assert m2.logs_synced_at == m.logs_synced_at
+    assert m2.files_synced == 3
+
+
+def test_sync_field_persisted_on_run_record(experiment_tree: Path):
+    svc = _make_service(experiment_tree)
+    record = RunRecord(
+        run_id="run_sync_field",
+        experiment_id="exp_01",
+        name="Test Exp",
+        profile="gpu1",
+        script="experiments/exp_01/run.sh",
+        command="bash experiments/exp_01/run.sh",
+        status="completed",
+        remote_workdir="/workspace",
+        remote_run_dir="",
+        sync={"logs_synced_at": "2026-06-15T10:00:00+00:00", "last_sync_status": "ok"},
+    )
+    svc._save_run("TestProj", record)
+    loaded = svc._load_run("TestProj", "exp_01", "run_sync_field")
+    assert loaded.sync is not None
+    assert loaded.sync["last_sync_status"] == "ok"
+
+
+def test_launch_injects_labit_env_vars(
+    monkeypatch: pytest.MonkeyPatch, experiment_tree: Path,
+):
+    svc = _make_service(experiment_tree)
+    captured: dict[str, object] = {}
+
+    def fake_sync_code(project, profile_name):
+        return SyncResult(
+            success=True, profile_name=profile_name,
+            local_path="/local/code", remote_path="/workspace",
+        )
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return SimpleNamespace(returncode=0, stdout="4242\n", stderr="")
+
+    monkeypatch.setattr(svc.compute_service, "sync_code", fake_sync_code)
+    monkeypatch.setattr(ExperimentService, "_git_head", staticmethod(lambda code_dir: "abc123"))
+    monkeypatch.setattr(ExperimentService, "_git_dirty", staticmethod(lambda code_dir: False))
+    monkeypatch.setattr(experiment_service_module.subprocess, "run", fake_run)
+
+    svc.launch("TestProj", "exp_01")
+
+    remote_cmd = captured["cmd"][-1]
+    assert "LABIT_RUN_DIR=" in remote_cmd
+    assert "LABIT_RESULTS_DIR=" in remote_cmd
+    assert "/results" in remote_cmd

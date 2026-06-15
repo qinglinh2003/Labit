@@ -42,6 +42,25 @@ class ExperimentManifest:
 
 
 @dataclass
+class SyncManifest:
+    """Tracks the state of log/result sync from remote to local."""
+
+    logs_synced_at: str = ""
+    last_sync_status: str = ""  # ok | failed
+    last_sync_error: str = ""
+    files_synced: int = 0
+    bytes_synced: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {k: v for k, v in self.__dict__.items()}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SyncManifest:
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+
+@dataclass
 class RunRecord:
     """Persisted state of a single experiment run."""
 
@@ -63,6 +82,7 @@ class RunRecord:
     finished_at: str = ""
     notes: str = ""
     error: str = ""
+    sync: dict | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in self.__dict__.items()}
@@ -253,6 +273,9 @@ class ExperimentService:
         remote_run_dir_q = shlex.quote(remote_run_dir)
         script_rel_q = shlex.quote(script_rel)
         inner_cmd = (
+            f"export LABIT_RUN_DIR={shlex.quote(remote_run_dir)}; "
+            f"export LABIT_RESULTS_DIR={shlex.quote(remote_run_dir + '/results')}; "
+            f"mkdir -p -- $LABIT_RESULTS_DIR; "
             f"(bash {script_rel_q}; echo $? > {shlex.quote(remote_run_dir + '/exit_code')}) "
             f"> {shlex.quote(remote_run_dir + '/stdout.log')} "
             f"2> {shlex.quote(remote_run_dir + '/stderr.log')}"
@@ -345,6 +368,13 @@ class ExperimentService:
                     record.error = ""
                     record.finished_at = _now_iso()
                     self._save_run(project, record)
+
+                    # Auto-sync logs after recovery
+                    try:
+                        self.sync_logs(project, experiment_id, run_id)
+                        record = self._load_run(project, experiment_id, run_id)
+                    except Exception:
+                        pass
                 elif exit_text != "unknown":
                     # exit_code file exists but content is unexpected
                     pass
@@ -392,6 +422,13 @@ class ExperimentService:
             record.finished_at = _now_iso()
             self._save_run(project, record)
 
+            # Auto-sync logs on completion
+            try:
+                self.sync_logs(project, experiment_id, run_id)
+                record = self._load_run(project, experiment_id, run_id)
+            except Exception:
+                pass  # Best-effort; don't fail refresh because of sync
+
         return record
 
     def tail_logs(
@@ -409,13 +446,22 @@ class ExperimentService:
         record = self._load_run(project, experiment_id, run_id)
         if not record.remote_run_dir:
             return _empty_log_message(stream)
+
+        # For terminal runs (completed/failed/stopped), prefer local cache
+        local_log = self._local_run_data_dir(
+            project, experiment_id, run_id
+        ) / f"{stream}.log"
+
+        if record.status in ("completed", "failed", "stopped") and local_log.exists():
+            return _tail_local(local_log, tail)
+
+        # Try remote SSH
         profile = self.compute_service.get_profile(project, record.profile)
         ssh_cmd = profile.ssh_command()
         workdir = record.remote_workdir.replace("\uff5e", "~")
         log_file = f"{record.remote_run_dir}/{stream}.log"
 
         try:
-            # Check if file exists first, return friendly message if not
             result = subprocess.run(
                 [
                     *ssh_cmd,
@@ -427,11 +473,18 @@ class ExperimentService:
                 text=True, capture_output=True, timeout=None, check=False,
             )
             if result.returncode != 0:
+                # Remote failed — fall back to local cache
+                if local_log.exists():
+                    return _tail_local(local_log, tail)
                 return "[Log unavailable: could not connect to the remote machine or run directory.]"
             return result.stdout
         except subprocess.TimeoutExpired:
+            if local_log.exists():
+                return _tail_local(local_log, tail)
             return "[Log unavailable: SSH connection timed out. The remote machine may be unreachable.]"
         except Exception:
+            if local_log.exists():
+                return _tail_local(local_log, tail)
             return "[Log unavailable: could not connect to remote machine.]"
 
     def fetch_events(
@@ -493,11 +546,20 @@ class ExperimentService:
     ) -> tuple[str, int]:
         """Return all Labit event lines from stdout.log plus the full line count.
 
-        This avoids parsing only a tail window, which can drop startup config or
-        early metrics in long experiments, while still avoiding a full raw-log
-        transfer for large logs.
+        For terminal runs with synced logs, reads from local cache.
+        Otherwise reads from remote via SSH.
         """
         record = self._load_run(project, experiment_id, run_id)
+
+        # For terminal runs, prefer local cache
+        local_log = self._local_run_data_dir(
+            project, experiment_id, run_id
+        ) / "stdout.log"
+
+        if record.status in ("completed", "failed", "stopped") and local_log.exists():
+            return _parse_structured_from_local(local_log)
+
+        # Remote path
         profile = self.compute_service.get_profile(project, record.profile)
         ssh_cmd = profile.ssh_command()
         workdir = record.remote_workdir.replace("\uff5e", "~")
@@ -515,8 +577,14 @@ class ExperimentService:
                 [*ssh_cmd, remote_cmd],
                 text=True, capture_output=True, timeout=None, check=False,
             )
-        except Exception as exc:
-            return f"Error reading structured logs: {exc}", 1
+        except Exception:
+            # Fall back to local cache
+            if local_log.exists():
+                return _parse_structured_from_local(local_log)
+            return "", 0
+
+        if result.returncode != 0 and local_log.exists():
+            return _parse_structured_from_local(local_log)
 
         lines = result.stdout.splitlines()
         total_lines = 0
@@ -552,10 +620,111 @@ class ExperimentService:
             record.status = "stopped"
             record.finished_at = _now_iso()
             self._save_run(project, record)
+
+            # Best-effort sync logs after stop
+            try:
+                self.sync_logs(project, experiment_id, run_id)
+                record = self._load_run(project, experiment_id, run_id)
+            except Exception:
+                pass
         except Exception:
             pass
 
         return record
+
+    # ── log sync ─────────────────────────────────────────────────────
+
+    def _local_run_data_dir(self, project: str, experiment_id: str, run_id: str) -> Path:
+        """Local directory for synced run data (logs, results)."""
+        return self._experiment_runs_dir(project, experiment_id) / run_id
+
+    def sync_logs(
+        self,
+        project: str,
+        experiment_id: str,
+        run_id: str,
+    ) -> SyncManifest:
+        """Pull stdout.log, stderr.log, and exit_code from remote to local."""
+        record = self._load_run(project, experiment_id, run_id)
+        if not record.remote_run_dir:
+            manifest = SyncManifest(
+                last_sync_status="failed",
+                last_sync_error="No remote run directory recorded.",
+            )
+            record.sync = manifest.to_dict()
+            self._save_run(project, record)
+            return manifest
+
+        profile = self.compute_service.get_profile(project, record.profile)
+        ssh_cmd = profile.ssh_command()
+        workdir = record.remote_workdir.replace("\uff5e", "~")
+
+        local_dir = self._local_run_data_dir(project, experiment_id, run_id)
+        local_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build rsync command to pull only log files
+        remote_source = f"{profile.connection.target}:{workdir}/{record.remote_run_dir}/"
+
+        cmd = ["rsync", "-az"]
+        # Only include log-related files
+        cmd.extend(["--include", "stdout.log"])
+        cmd.extend(["--include", "stderr.log"])
+        cmd.extend(["--include", "exit_code"])
+        cmd.extend(["--exclude", "*"])
+
+        # SSH options
+        ssh_parts = ["ssh"]
+        if profile.connection.identity_file:
+            ssh_parts.extend(["-i", str(Path(profile.connection.identity_file).expanduser())])
+        if profile.connection.port != 22:
+            ssh_parts.extend(["-p", str(profile.connection.port)])
+        cmd.extend(["-e", shlex.join(ssh_parts)])
+
+        cmd.append(remote_source)
+        cmd.append(str(local_dir) + "/")
+
+        try:
+            result = subprocess.run(
+                cmd, text=True, capture_output=True, timeout=60, check=False,
+            )
+            if result.returncode == 0:
+                # Count synced files and bytes
+                files_synced = sum(
+                    1 for f in ["stdout.log", "stderr.log", "exit_code"]
+                    if (local_dir / f).exists()
+                )
+                bytes_synced = sum(
+                    (local_dir / f).stat().st_size
+                    for f in ["stdout.log", "stderr.log", "exit_code"]
+                    if (local_dir / f).exists()
+                )
+                manifest = SyncManifest(
+                    logs_synced_at=_now_iso(),
+                    last_sync_status="ok",
+                    files_synced=files_synced,
+                    bytes_synced=bytes_synced,
+                )
+            else:
+                manifest = SyncManifest(
+                    last_sync_status="failed",
+                    last_sync_error=result.stderr.strip()[:500],
+                )
+        except subprocess.TimeoutExpired:
+            manifest = SyncManifest(
+                last_sync_status="failed",
+                last_sync_error="Rsync timed out after 60 seconds.",
+            )
+        except Exception as exc:
+            manifest = SyncManifest(
+                last_sync_status="failed",
+                last_sync_error=str(exc)[:500],
+            )
+
+        # Persist sync state on the run record
+        record.sync = manifest.to_dict()
+        self._save_run(project, record)
+
+        return manifest
 
     # ── helpers ──────────────────────────────────────────────────────
 
@@ -622,6 +791,30 @@ def parse_log(raw: str) -> tuple[list[dict], int]:
             pass
         plain_count += 1
     return events, plain_count
+
+
+def _tail_local(path: Path, tail: int) -> str:
+    """Read the last *tail* lines from a local file."""
+    try:
+        lines = path.read_text().splitlines()
+        return "\n".join(lines[-tail:]) + ("\n" if lines else "")
+    except Exception:
+        return ""
+
+
+def _parse_structured_from_local(path: Path) -> tuple[str, int]:
+    """Extract __labit__ event lines and total line count from a local log file."""
+    try:
+        text = path.read_text()
+    except Exception:
+        return "", 0
+    all_lines = text.splitlines()
+    total_lines = len(all_lines)
+    event_lines = [
+        line for line in all_lines
+        if '"__labit__"' in line
+    ]
+    return "\n".join(event_lines), total_lines
 
 
 def _quote_remote_path(path: str) -> str:

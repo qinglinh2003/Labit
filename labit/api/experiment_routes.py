@@ -38,6 +38,7 @@ class RunResponse(BaseModel):
     finished_at: str
     notes: str
     error: str
+    sync: dict | None = None
 
 
 class ExperimentWithLatestRun(BaseModel):
@@ -70,6 +71,14 @@ class EventsResponse(BaseModel):
 class MetricsResponse(BaseModel):
     metrics: dict[str, list[dict]]
     steps: list[int]
+
+
+class SyncResponse(BaseModel):
+    logs_synced_at: str
+    last_sync_status: str
+    last_sync_error: str
+    files_synced: int
+    bytes_synced: int
 
 
 # ── router factory ───────────────────────────────────────────────────
@@ -210,6 +219,23 @@ def mount_experiment_routes(svc: ExperimentService) -> APIRouter:
         try:
             data = svc.fetch_metrics(project, experiment_id, run_id)
             return MetricsResponse(**data)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @router.post(
+        "/{experiment_id}/runs/{run_id}/sync",
+        response_model=SyncResponse,
+    )
+    def sync_run_logs(project: str, experiment_id: str, run_id: str) -> SyncResponse:
+        try:
+            manifest = svc.sync_logs(project, experiment_id, run_id)
+            return SyncResponse(
+                logs_synced_at=manifest.logs_synced_at,
+                last_sync_status=manifest.last_sync_status,
+                last_sync_error=manifest.last_sync_error,
+                files_synced=manifest.files_synced,
+                bytes_synced=manifest.bytes_synced,
+            )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
