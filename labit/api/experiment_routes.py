@@ -73,12 +73,25 @@ class MetricsResponse(BaseModel):
     steps: list[int]
 
 
+class SyncRequest(BaseModel):
+    mode: str = "logs"  # logs | results | all
+    exclude_patterns: list[str] = []
+
+
 class SyncResponse(BaseModel):
     logs_synced_at: str
+    results_synced_at: str = ""
     last_sync_status: str
     last_sync_error: str
     files_synced: int
     bytes_synced: int
+    excluded_patterns: list[str] = []
+
+
+class ResultEntry(BaseModel):
+    path: str
+    size: int
+    modified: str
 
 
 # ── router factory ───────────────────────────────────────────────────
@@ -226,16 +239,75 @@ def mount_experiment_routes(svc: ExperimentService) -> APIRouter:
         "/{experiment_id}/runs/{run_id}/sync",
         response_model=SyncResponse,
     )
-    def sync_run_logs(project: str, experiment_id: str, run_id: str) -> SyncResponse:
+    def sync_run(
+        project: str, experiment_id: str, run_id: str, body: SyncRequest | None = None,
+    ) -> SyncResponse:
+        if body is None:
+            body = SyncRequest()
+        allowed_modes = {"logs", "results", "all"}
+        if body.mode not in allowed_modes:
+            raise HTTPException(
+                status_code=422,
+                detail=f"mode must be one of {allowed_modes}",
+            )
         try:
-            manifest = svc.sync_logs(project, experiment_id, run_id)
+            if body.mode == "logs":
+                manifest = svc.sync_logs(project, experiment_id, run_id)
+            elif body.mode == "results":
+                manifest = svc.sync_results(
+                    project, experiment_id, run_id,
+                    exclude_patterns=body.exclude_patterns or None,
+                )
+            else:  # all
+                manifest = svc.sync_all(
+                    project, experiment_id, run_id,
+                    exclude_patterns=body.exclude_patterns or None,
+                )
             return SyncResponse(
                 logs_synced_at=manifest.logs_synced_at,
+                results_synced_at=manifest.results_synced_at,
                 last_sync_status=manifest.last_sync_status,
                 last_sync_error=manifest.last_sync_error,
                 files_synced=manifest.files_synced,
                 bytes_synced=manifest.bytes_synced,
+                excluded_patterns=manifest.excluded_patterns,
             )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @router.get(
+        "/{experiment_id}/runs/{run_id}/results",
+        response_model=list[ResultEntry],
+    )
+    def list_results(
+        project: str, experiment_id: str, run_id: str,
+    ) -> list[ResultEntry]:
+        try:
+            entries = svc.list_results(project, experiment_id, run_id)
+            return [ResultEntry(**e) for e in entries]
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @router.get("/{experiment_id}/runs/{run_id}/results/{file_path:path}/preview")
+    def preview_result_file(
+        project: str, experiment_id: str, run_id: str, file_path: str,
+    ):
+        try:
+            return svc.preview_result_file(
+                project, experiment_id, run_id, file_path,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @router.get("/{experiment_id}/runs/{run_id}/results/{file_path:path}")
+    def get_result_file(project: str, experiment_id: str, run_id: str, file_path: str):
+        from fastapi.responses import FileResponse
+
+        try:
+            resolved = svc.read_result_file(
+                project, experiment_id, run_id, file_path,
+            )
+            return FileResponse(resolved)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 

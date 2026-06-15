@@ -166,3 +166,82 @@ export async function getRunMetrics(
   if (!res.ok) throw new Error(`Failed to get metrics: ${res.status}`);
   return res.json();
 }
+
+// ── Sync & Results ─────────────────────────────────────────────────
+
+export interface SyncResult {
+  logs_synced_at: string;
+  results_synced_at: string;
+  last_sync_status: string;
+  last_sync_error: string;
+  files_synced: number;
+  bytes_synced: number;
+  excluded_patterns: string[];
+}
+
+export async function syncRun(
+  project: string,
+  experimentId: string,
+  runId: string,
+  mode: "logs" | "results" | "all" = "logs",
+): Promise<SyncResult> {
+  const res = await fetch(
+    `${API}/api/projects/${project}/experiments/${encodeURIComponent(experimentId)}/runs/${encodeURIComponent(runId)}/sync`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    },
+  );
+  if (!res.ok) throw new Error(`Sync failed: ${res.status}`);
+  return res.json();
+}
+
+export interface ResultEntry {
+  path: string;
+  size: number;
+  modified: string;
+}
+
+export async function listResults(
+  project: string,
+  experimentId: string,
+  runId: string,
+): Promise<ResultEntry[]> {
+  const res = await fetch(
+    `${API}/api/projects/${project}/experiments/${encodeURIComponent(experimentId)}/runs/${encodeURIComponent(runId)}/results`,
+  );
+  if (!res.ok) throw new Error(`Failed to list results: ${res.status}`);
+  return res.json();
+}
+
+export interface ResultPreview {
+  kind: "text" | "json" | "csv" | "image" | "download";
+  path: string;
+  size: number;
+  content: string | null;
+  truncated: boolean;
+  download_url: string;
+}
+
+export async function getResultPreview(
+  project: string,
+  experimentId: string,
+  runId: string,
+  filePath: string,
+): Promise<ResultPreview> {
+  const res = await fetch(
+    `${API}/api/projects/${project}/experiments/${encodeURIComponent(experimentId)}/runs/${encodeURIComponent(runId)}/results/${encodeURIComponent(filePath)}/preview`,
+  );
+  if (!res.ok) throw new Error(`Failed to preview: ${res.status}`);
+  return res.json();
+}
+
+export function getResultDownloadUrl(
+  project: string,
+  experimentId: string,
+  runId: string,
+  filePath: string,
+): string {
+  return `${API}/api/projects/${project}/experiments/${encodeURIComponent(experimentId)}/runs/${encodeURIComponent(runId)}/results/${encodeURIComponent(filePath)}`;
+}

@@ -573,3 +573,311 @@ def test_launch_injects_labit_env_vars(
     assert "LABIT_RUN_DIR=" in remote_cmd
     assert "LABIT_RESULTS_DIR=" in remote_cmd
     assert "/results" in remote_cmd
+
+
+# ── V2: results sync + browsing ────────────────────────────────────
+
+
+def test_sync_results_no_remote_run_dir(experiment_tree: Path):
+    svc = _make_service(experiment_tree)
+    record = RunRecord(
+        run_id="run_no_remote_r",
+        experiment_id="exp_01",
+        name="Test Exp",
+        profile="gpu1",
+        script="experiments/exp_01/run.sh",
+        command="bash experiments/exp_01/run.sh",
+        status="completed",
+        remote_workdir="/workspace",
+        remote_run_dir="",
+    )
+    svc._save_run("TestProj", record)
+
+    manifest = svc.sync_results("TestProj", "exp_01", "run_no_remote_r")
+    assert manifest.last_sync_status == "failed"
+    assert "No remote run directory" in manifest.last_sync_error
+
+
+def test_sync_results_preserves_logs_synced_at(
+    monkeypatch: pytest.MonkeyPatch, experiment_tree: Path,
+):
+    svc = _make_service(experiment_tree)
+    record = RunRecord(
+        run_id="run_preserve",
+        experiment_id="exp_01",
+        name="Test Exp",
+        profile="gpu1",
+        script="experiments/exp_01/run.sh",
+        command="bash experiments/exp_01/run.sh",
+        status="completed",
+        remote_workdir="/workspace",
+        remote_run_dir=".labit/runs/run_preserve",
+        sync={"logs_synced_at": "2026-06-15T10:00:00+00:00", "last_sync_status": "ok"},
+    )
+    svc._save_run("TestProj", record)
+
+    # Mock rsync to fail (simulates remote unavailable)
+    def fake_run(cmd, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="Connection refused")
+
+    monkeypatch.setattr(experiment_service_module.subprocess, "run", fake_run)
+
+    manifest = svc.sync_results("TestProj", "exp_01", "run_preserve")
+    # Even though results sync failed, logs_synced_at should be preserved
+    assert manifest.logs_synced_at == "2026-06-15T10:00:00+00:00"
+    assert manifest.last_sync_status == "failed"
+
+
+def test_sync_manifest_v2_fields():
+    m = SyncManifest(
+        logs_synced_at="2026-06-15T10:00:00+00:00",
+        results_synced_at="2026-06-15T11:00:00+00:00",
+        last_sync_status="ok",
+        files_synced=42,
+        bytes_synced=123456,
+        excluded_patterns=["checkpoints/", "*.pt"],
+    )
+    d = m.to_dict()
+    m2 = SyncManifest.from_dict(d)
+    assert m2.results_synced_at == "2026-06-15T11:00:00+00:00"
+    assert m2.excluded_patterns == ["checkpoints/", "*.pt"]
+
+
+def test_list_results_empty(experiment_tree: Path):
+    svc = _make_service(experiment_tree)
+    record = RunRecord(
+        run_id="run_no_results",
+        experiment_id="exp_01",
+        name="Test Exp",
+        profile="gpu1",
+        script="experiments/exp_01/run.sh",
+        command="bash experiments/exp_01/run.sh",
+        status="completed",
+        remote_workdir="/workspace",
+        remote_run_dir=".labit/runs/run_no_results",
+    )
+    svc._save_run("TestProj", record)
+    assert svc.list_results("TestProj", "exp_01", "run_no_results") == []
+
+
+def test_list_results_with_files(experiment_tree: Path):
+    svc = _make_service(experiment_tree)
+    record = RunRecord(
+        run_id="run_with_results",
+        experiment_id="exp_01",
+        name="Test Exp",
+        profile="gpu1",
+        script="experiments/exp_01/run.sh",
+        command="bash experiments/exp_01/run.sh",
+        status="completed",
+        remote_workdir="/workspace",
+        remote_run_dir=".labit/runs/run_with_results",
+    )
+    svc._save_run("TestProj", record)
+
+    results_dir = svc._local_run_data_dir("TestProj", "exp_01", "run_with_results") / "results"
+    results_dir.mkdir(parents=True)
+    (results_dir / "metrics.json").write_text('{"loss": 0.5}')
+    sub = results_dir / "figures"
+    sub.mkdir()
+    (sub / "train_loss.png").write_bytes(b"\x89PNG")
+
+    entries = svc.list_results("TestProj", "exp_01", "run_with_results")
+    assert len(entries) == 2
+    paths = {e["path"] for e in entries}
+    assert "metrics.json" in paths
+    assert "figures/train_loss.png" in paths
+    # Each entry has size and modified
+    for e in entries:
+        assert e["size"] > 0
+        assert e["modified"]
+
+
+def test_read_result_file(experiment_tree: Path):
+    svc = _make_service(experiment_tree)
+    record = RunRecord(
+        run_id="run_read_file",
+        experiment_id="exp_01",
+        name="Test Exp",
+        profile="gpu1",
+        script="experiments/exp_01/run.sh",
+        command="bash experiments/exp_01/run.sh",
+        status="completed",
+        remote_workdir="/workspace",
+        remote_run_dir=".labit/runs/run_read_file",
+    )
+    svc._save_run("TestProj", record)
+
+    results_dir = svc._local_run_data_dir("TestProj", "exp_01", "run_read_file") / "results"
+    results_dir.mkdir(parents=True)
+    (results_dir / "metrics.json").write_text('{"loss": 0.5}')
+
+    path = svc.read_result_file("TestProj", "exp_01", "run_read_file", "metrics.json")
+    assert path.read_text() == '{"loss": 0.5}'
+
+
+def test_read_result_file_path_traversal(experiment_tree: Path):
+    svc = _make_service(experiment_tree)
+    record = RunRecord(
+        run_id="run_traversal",
+        experiment_id="exp_01",
+        name="Test Exp",
+        profile="gpu1",
+        script="experiments/exp_01/run.sh",
+        command="bash experiments/exp_01/run.sh",
+        status="completed",
+        remote_workdir="/workspace",
+        remote_run_dir=".labit/runs/run_traversal",
+    )
+    svc._save_run("TestProj", record)
+
+    results_dir = svc._local_run_data_dir("TestProj", "exp_01", "run_traversal") / "results"
+    results_dir.mkdir(parents=True)
+
+    with pytest.raises(FileNotFoundError):
+        svc.read_result_file("TestProj", "exp_01", "run_traversal", "../../run_traversal.json")
+
+
+def test_read_result_file_not_found(experiment_tree: Path):
+    svc = _make_service(experiment_tree)
+    record = RunRecord(
+        run_id="run_no_file",
+        experiment_id="exp_01",
+        name="Test Exp",
+        profile="gpu1",
+        script="experiments/exp_01/run.sh",
+        command="bash experiments/exp_01/run.sh",
+        status="completed",
+        remote_workdir="/workspace",
+        remote_run_dir=".labit/runs/run_no_file",
+    )
+    svc._save_run("TestProj", record)
+
+    results_dir = svc._local_run_data_dir("TestProj", "exp_01", "run_no_file") / "results"
+    results_dir.mkdir(parents=True)
+
+    with pytest.raises(FileNotFoundError):
+        svc.read_result_file("TestProj", "exp_01", "run_no_file", "nonexistent.json")
+
+
+def test_parse_rsync_stats():
+    from labit.services.experiment_service import _parse_rsync_stats
+
+    output = """
+Number of files: 15 (reg: 10, dir: 5)
+Number of created files: 8
+Number of regular files transferred: 7
+Total file size: 2,345,678 bytes
+Total transferred file size: 1,234,567 bytes
+"""
+    files, total_bytes = _parse_rsync_stats(output)
+    assert files == 7
+    assert total_bytes == 1234567
+
+
+def test_default_results_exclude():
+    from labit.services.experiment_service import _DEFAULT_RESULTS_EXCLUDE
+
+    assert "checkpoints/" in _DEFAULT_RESULTS_EXCLUDE
+    assert "*.pt" in _DEFAULT_RESULTS_EXCLUDE
+    assert "wandb/" in _DEFAULT_RESULTS_EXCLUDE
+    assert "__pycache__/" in _DEFAULT_RESULTS_EXCLUDE
+
+
+# ── preview tests ───────────────────────────────────────────────────
+
+def _make_preview_run(svc, run_id="run_preview"):
+    record = RunRecord(
+        run_id=run_id,
+        experiment_id="exp_01",
+        name="Test Exp",
+        profile="gpu1",
+        script="experiments/exp_01/run.sh",
+        command="bash experiments/exp_01/run.sh",
+        status="completed",
+        remote_workdir="/workspace",
+        remote_run_dir=f".labit/runs/{run_id}",
+    )
+    svc._save_run("TestProj", record)
+    results_dir = svc._local_run_data_dir("TestProj", "exp_01", run_id) / "results"
+    results_dir.mkdir(parents=True)
+    return results_dir
+
+
+def test_preview_json(experiment_tree: Path):
+    svc = _make_service(experiment_tree)
+    results_dir = _make_preview_run(svc)
+    (results_dir / "metrics.json").write_text('{"loss": 0.5}')
+
+    p = svc.preview_result_file("TestProj", "exp_01", "run_preview", "metrics.json")
+    assert p["kind"] == "json"
+    assert '"loss"' in p["content"]
+    assert not p["truncated"]
+
+
+def test_preview_csv(experiment_tree: Path):
+    svc = _make_service(experiment_tree)
+    results_dir = _make_preview_run(svc, "run_csv")
+    (results_dir / "data.csv").write_text("a,b\n1,2\n3,4\n")
+
+    p = svc.preview_result_file("TestProj", "exp_01", "run_csv", "data.csv")
+    assert p["kind"] == "csv"
+    assert "a,b" in p["content"]
+
+
+def test_preview_image(experiment_tree: Path):
+    svc = _make_service(experiment_tree)
+    results_dir = _make_preview_run(svc, "run_img")
+    (results_dir / "plot.png").write_bytes(b"\x89PNG\r\n")
+
+    p = svc.preview_result_file("TestProj", "exp_01", "run_img", "plot.png")
+    assert p["kind"] == "image"
+    assert p["content"] is None
+    assert "plot.png" in p["download_url"]
+
+
+def test_preview_download_fallback(experiment_tree: Path):
+    svc = _make_service(experiment_tree)
+    results_dir = _make_preview_run(svc, "run_dl")
+    (results_dir / "model.pt").write_bytes(b"\x00" * 100)
+
+    p = svc.preview_result_file("TestProj", "exp_01", "run_dl", "model.pt")
+    assert p["kind"] == "download"
+    assert p["content"] is None
+
+
+def test_preview_text(experiment_tree: Path):
+    svc = _make_service(experiment_tree)
+    results_dir = _make_preview_run(svc, "run_txt")
+    (results_dir / "notes.txt").write_text("hello world")
+
+    p = svc.preview_result_file("TestProj", "exp_01", "run_txt", "notes.txt")
+    assert p["kind"] == "text"
+    assert p["content"] == "hello world"
+
+
+def test_preview_truncation(experiment_tree: Path):
+    svc = _make_service(experiment_tree)
+    results_dir = _make_preview_run(svc, "run_big")
+    (results_dir / "big.log").write_text("x" * (600 * 1024))
+
+    p = svc.preview_result_file("TestProj", "exp_01", "run_big", "big.log")
+    assert p["kind"] == "text"
+    assert p["truncated"] is True
+    assert len(p["content"]) == 512 * 1024
+
+
+def test_preview_url_encoding(experiment_tree: Path):
+    """download_url must encode special chars (#, ?, space) in file paths."""
+    svc = _make_service(experiment_tree)
+    results_dir = _make_preview_run(svc, "run_enc")
+    figures_dir = results_dir / "figures"
+    figures_dir.mkdir()
+    (figures_dir / "loss #1.png").write_bytes(b"\x89PNG\r\n")
+
+    p = svc.preview_result_file("TestProj", "exp_01", "run_enc", "figures/loss #1.png")
+    assert p["kind"] == "image"
+    # The URL must not contain a raw space or #
+    assert " " not in p["download_url"]
+    assert "#" not in p["download_url"]
+    assert "loss%20%231.png" in p["download_url"]

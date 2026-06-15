@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import urllib.parse
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -41,15 +42,28 @@ class ExperimentManifest:
     tags: list[str] = field(default_factory=list)
 
 
+_DEFAULT_RESULTS_EXCLUDE = [
+    "checkpoints/",
+    "*.pt",
+    "*.pth",
+    "*.ckpt",
+    "*.safetensors",
+    "wandb/",
+    "__pycache__/",
+]
+
+
 @dataclass
 class SyncManifest:
     """Tracks the state of log/result sync from remote to local."""
 
     logs_synced_at: str = ""
+    results_synced_at: str = ""
     last_sync_status: str = ""  # ok | failed
     last_sync_error: str = ""
     files_synced: int = 0
     bytes_synced: int = 0
+    excluded_patterns: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in self.__dict__.items()}
@@ -647,9 +661,13 @@ class ExperimentService:
         """Pull stdout.log, stderr.log, and exit_code from remote to local."""
         record = self._load_run(project, experiment_id, run_id)
         if not record.remote_run_dir:
+            prev = SyncManifest.from_dict(record.sync) if record.sync else SyncManifest()
             manifest = SyncManifest(
+                logs_synced_at=prev.logs_synced_at,
+                results_synced_at=prev.results_synced_at,
                 last_sync_status="failed",
                 last_sync_error="No remote run directory recorded.",
+                excluded_patterns=prev.excluded_patterns,
             )
             record.sync = manifest.to_dict()
             self._save_run(project, record)
@@ -687,6 +705,8 @@ class ExperimentService:
             result = subprocess.run(
                 cmd, text=True, capture_output=True, timeout=60, check=False,
             )
+            # Preserve prior results sync state
+            prev = SyncManifest.from_dict(record.sync) if record.sync else SyncManifest()
             if result.returncode == 0:
                 # Count synced files and bytes
                 files_synced = sum(
@@ -700,24 +720,37 @@ class ExperimentService:
                 )
                 manifest = SyncManifest(
                     logs_synced_at=_now_iso(),
+                    results_synced_at=prev.results_synced_at,
                     last_sync_status="ok",
                     files_synced=files_synced,
                     bytes_synced=bytes_synced,
+                    excluded_patterns=prev.excluded_patterns,
                 )
             else:
                 manifest = SyncManifest(
+                    logs_synced_at=prev.logs_synced_at,
+                    results_synced_at=prev.results_synced_at,
                     last_sync_status="failed",
                     last_sync_error=result.stderr.strip()[:500],
+                    excluded_patterns=prev.excluded_patterns,
                 )
         except subprocess.TimeoutExpired:
+            prev = SyncManifest.from_dict(record.sync) if record.sync else SyncManifest()
             manifest = SyncManifest(
+                logs_synced_at=prev.logs_synced_at,
+                results_synced_at=prev.results_synced_at,
                 last_sync_status="failed",
                 last_sync_error="Rsync timed out after 60 seconds.",
+                excluded_patterns=prev.excluded_patterns,
             )
         except Exception as exc:
+            prev = SyncManifest.from_dict(record.sync) if record.sync else SyncManifest()
             manifest = SyncManifest(
+                logs_synced_at=prev.logs_synced_at,
+                results_synced_at=prev.results_synced_at,
                 last_sync_status="failed",
                 last_sync_error=str(exc)[:500],
+                excluded_patterns=prev.excluded_patterns,
             )
 
         # Persist sync state on the run record
@@ -725,6 +758,264 @@ class ExperimentService:
         self._save_run(project, record)
 
         return manifest
+
+    def sync_results(
+        self,
+        project: str,
+        experiment_id: str,
+        run_id: str,
+        *,
+        exclude_patterns: list[str] | None = None,
+    ) -> SyncManifest:
+        """Pull results/ directory from remote to local.
+
+        Default excludes large files (checkpoints, .pt, wandb, etc.).
+        ``exclude_patterns`` are *appended* to defaults, not replacing them.
+        """
+        record = self._load_run(project, experiment_id, run_id)
+        if not record.remote_run_dir:
+            prev = SyncManifest.from_dict(record.sync) if record.sync else SyncManifest()
+            manifest = SyncManifest(
+                logs_synced_at=prev.logs_synced_at,
+                results_synced_at=prev.results_synced_at,
+                last_sync_status="failed",
+                last_sync_error="No remote run directory recorded.",
+                excluded_patterns=prev.excluded_patterns,
+            )
+            record.sync = manifest.to_dict()
+            self._save_run(project, record)
+            return manifest
+
+        profile = self.compute_service.get_profile(project, record.profile)
+        workdir = record.remote_workdir.replace("\uff5e", "~")
+
+        local_results = self._local_run_data_dir(project, experiment_id, run_id) / "results"
+        local_results.mkdir(parents=True, exist_ok=True)
+
+        # Merge exclude patterns: defaults + user-supplied
+        excludes = list(_DEFAULT_RESULTS_EXCLUDE)
+        if exclude_patterns:
+            excludes.extend(exclude_patterns)
+
+        remote_source = f"{profile.connection.target}:{workdir}/{record.remote_run_dir}/results/"
+
+        cmd = ["rsync", "-az", "--stats"]
+        for pat in excludes:
+            cmd.extend(["--exclude", pat])
+
+        # SSH options
+        ssh_parts = ["ssh"]
+        if profile.connection.identity_file:
+            ssh_parts.extend(["-i", str(Path(profile.connection.identity_file).expanduser())])
+        if profile.connection.port != 22:
+            ssh_parts.extend(["-p", str(profile.connection.port)])
+        cmd.extend(["-e", shlex.join(ssh_parts)])
+
+        cmd.append(remote_source)
+        cmd.append(str(local_results) + "/")
+
+        try:
+            result = subprocess.run(
+                cmd, text=True, capture_output=True, timeout=300, check=False,
+            )
+            if result.returncode == 0:
+                files_synced, bytes_synced = _parse_rsync_stats(result.stdout)
+                # Preserve existing logs_synced_at if present
+                prev = SyncManifest.from_dict(record.sync) if record.sync else SyncManifest()
+                manifest = SyncManifest(
+                    logs_synced_at=prev.logs_synced_at,
+                    results_synced_at=_now_iso(),
+                    last_sync_status="ok",
+                    files_synced=files_synced,
+                    bytes_synced=bytes_synced,
+                    excluded_patterns=excludes,
+                )
+            else:
+                prev = SyncManifest.from_dict(record.sync) if record.sync else SyncManifest()
+                manifest = SyncManifest(
+                    logs_synced_at=prev.logs_synced_at,
+                    results_synced_at=prev.results_synced_at,
+                    last_sync_status="failed",
+                    last_sync_error=result.stderr.strip()[:500],
+                    excluded_patterns=excludes,
+                )
+        except subprocess.TimeoutExpired:
+            prev = SyncManifest.from_dict(record.sync) if record.sync else SyncManifest()
+            manifest = SyncManifest(
+                logs_synced_at=prev.logs_synced_at,
+                results_synced_at=prev.results_synced_at,
+                last_sync_status="failed",
+                last_sync_error="Rsync timed out after 300 seconds.",
+                excluded_patterns=excludes,
+            )
+        except Exception as exc:
+            prev = SyncManifest.from_dict(record.sync) if record.sync else SyncManifest()
+            manifest = SyncManifest(
+                logs_synced_at=prev.logs_synced_at,
+                results_synced_at=prev.results_synced_at,
+                last_sync_status="failed",
+                last_sync_error=str(exc)[:500],
+                excluded_patterns=excludes,
+            )
+
+        record = self._load_run(project, experiment_id, run_id)
+        record.sync = manifest.to_dict()
+        self._save_run(project, record)
+        return manifest
+
+    def sync_all(
+        self,
+        project: str,
+        experiment_id: str,
+        run_id: str,
+        *,
+        exclude_patterns: list[str] | None = None,
+    ) -> SyncManifest:
+        """Sync both logs and results from remote."""
+        self.sync_logs(project, experiment_id, run_id)
+        return self.sync_results(
+            project, experiment_id, run_id,
+            exclude_patterns=exclude_patterns,
+        )
+
+    # ── result browsing ─────────────────────────────────────────────
+
+    def list_results(
+        self, project: str, experiment_id: str, run_id: str,
+    ) -> list[dict[str, Any]]:
+        """List synced result files as a flat list with relative paths."""
+        self._load_run(project, experiment_id, run_id)  # validate run exists
+        results_dir = self._local_run_data_dir(project, experiment_id, run_id) / "results"
+        if not results_dir.exists():
+            return []
+        entries: list[dict[str, Any]] = []
+        for path in sorted(results_dir.rglob("*")):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(results_dir)
+            entries.append({
+                "path": str(rel),
+                "size": path.stat().st_size,
+                "modified": datetime.fromtimestamp(
+                    path.stat().st_mtime, tz=timezone.utc
+                ).isoformat(timespec="seconds"),
+            })
+        return entries
+
+    def read_result_file(
+        self,
+        project: str,
+        experiment_id: str,
+        run_id: str,
+        file_path: str,
+    ) -> Path:
+        """Return the local Path to a synced result file.
+
+        Raises FileNotFoundError if the file doesn't exist or the path
+        escapes the results directory.
+        """
+        self._load_run(project, experiment_id, run_id)  # validate run exists
+        results_dir = self._local_run_data_dir(project, experiment_id, run_id) / "results"
+        resolved = (results_dir / file_path).resolve()
+        # Prevent path traversal
+        if not resolved.is_relative_to(results_dir.resolve()):
+            raise FileNotFoundError(f"Invalid path: {file_path}")
+        if not resolved.is_file():
+            raise FileNotFoundError(f"Result file not found: {file_path}")
+        return resolved
+
+    # ── result preview ─────────────────────────────────────────────
+
+    _TEXT_EXTENSIONS = frozenset({
+        ".txt", ".log", ".md", ".yaml", ".yml", ".toml", ".ini",
+        ".cfg", ".conf", ".sh", ".bash", ".py", ".csv", ".tsv",
+    })
+    _JSON_EXTENSIONS = frozenset({".json", ".jsonl"})
+    _IMAGE_EXTENSIONS = frozenset({
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+    })
+    _PREVIEW_MAX_BYTES = 512 * 1024  # 512 KB text preview cap
+
+    def preview_result_file(
+        self,
+        project: str,
+        experiment_id: str,
+        run_id: str,
+        file_path: str,
+    ) -> dict[str, Any]:
+        """Return preview data for a synced result file.
+
+        Returns a dict with keys: kind, path, size, content (str | None),
+        truncated, download_url.
+        """
+        resolved = self.read_result_file(project, experiment_id, run_id, file_path)
+        size = resolved.stat().st_size
+        suffix = resolved.suffix.lower()
+
+        encoded_path = "/".join(
+            urllib.parse.quote(seg, safe="") for seg in file_path.split("/")
+        )
+        base_url = (
+            f"/api/projects/{urllib.parse.quote(project, safe='')}"
+            f"/experiments/{urllib.parse.quote(experiment_id, safe='')}"
+            f"/runs/{urllib.parse.quote(run_id, safe='')}"
+            f"/results/{encoded_path}"
+        )
+
+        if suffix in self._IMAGE_EXTENSIONS:
+            return {
+                "kind": "image",
+                "path": file_path,
+                "size": size,
+                "content": None,
+                "truncated": False,
+                "download_url": base_url,
+            }
+
+        if suffix in self._JSON_EXTENSIONS:
+            truncated = size > self._PREVIEW_MAX_BYTES
+            raw = resolved.read_bytes()[:self._PREVIEW_MAX_BYTES]
+            text = raw.decode("utf-8", errors="replace")
+            # Try to pretty-print JSON (only full file, not truncated)
+            if not truncated and suffix == ".json":
+                import json as _json
+                try:
+                    obj = _json.loads(text)
+                    text = _json.dumps(obj, indent=2, ensure_ascii=False)
+                except _json.JSONDecodeError:
+                    pass
+            return {
+                "kind": "json",
+                "path": file_path,
+                "size": size,
+                "content": text,
+                "truncated": truncated,
+                "download_url": base_url,
+            }
+
+        if suffix in self._TEXT_EXTENSIONS:
+            truncated = size > self._PREVIEW_MAX_BYTES
+            raw = resolved.read_bytes()[:self._PREVIEW_MAX_BYTES]
+            text = raw.decode("utf-8", errors="replace")
+            kind = "csv" if suffix in (".csv", ".tsv") else "text"
+            return {
+                "kind": kind,
+                "path": file_path,
+                "size": size,
+                "content": text,
+                "truncated": truncated,
+                "download_url": base_url,
+            }
+
+        # Not previewable — download only
+        return {
+            "kind": "download",
+            "path": file_path,
+            "size": size,
+            "content": None,
+            "truncated": False,
+            "download_url": base_url,
+        }
 
     # ── helpers ──────────────────────────────────────────────────────
 
@@ -815,6 +1106,27 @@ def _parse_structured_from_local(path: Path) -> tuple[str, int]:
         if '"__labit__"' in line
     ]
     return "\n".join(event_lines), total_lines
+
+
+def _parse_rsync_stats(stdout: str) -> tuple[int, int]:
+    """Extract file count and byte count from rsync --stats output."""
+    files = 0
+    total_bytes = 0
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("Number of regular files transferred:"):
+            try:
+                files = int(line.split(":")[-1].strip().replace(",", ""))
+            except ValueError:
+                pass
+        elif line.startswith("Total transferred file size:"):
+            try:
+                raw = line.split(":")[-1].strip().replace(",", "")
+                # Format: "12345 bytes" or just "12345"
+                total_bytes = int(raw.split()[0])
+            except (ValueError, IndexError):
+                pass
+    return files, total_bytes
 
 
 def _quote_remote_path(path: str) -> str:
