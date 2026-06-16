@@ -1398,6 +1398,7 @@ function RightSidebar({
   const noteSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const refreshChats = useCallback(() => {
+    if (!project) return;
     listChats(project).then(setChats).catch(() => {});
   }, [project]);
 
