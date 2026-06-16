@@ -10,6 +10,7 @@ import labit.services.experiment_service as experiment_service_module
 from labit.services.compute_service import SyncResult
 from labit.services.experiment_service import (
     ExperimentService, RunRecord, SyncManifest, parse_log,
+    _extract_artifact_dirs,
 )
 
 
@@ -628,6 +629,110 @@ def test_sync_results_preserves_logs_synced_at(
     assert manifest.last_sync_status == "failed"
 
 
+def test_sync_results_falls_back_to_artifact_dirs(
+    monkeypatch: pytest.MonkeyPatch, experiment_tree: Path,
+):
+    svc = _make_service(experiment_tree)
+    record = RunRecord(
+        run_id="run_artifacts",
+        experiment_id="exp_01",
+        name="Test Exp",
+        profile="gpu1",
+        script="experiments/exp_01/run.sh",
+        command="bash experiments/exp_01/run.sh",
+        status="completed",
+        remote_workdir="/workspace",
+        remote_run_dir=".labit/runs/run_artifacts",
+    )
+    svc._save_run("TestProj", record)
+    local_log_dir = svc._local_run_data_dir("TestProj", "exp_01", "run_artifacts")
+    local_log_dir.mkdir(parents=True, exist_ok=True)
+    (local_log_dir / "stdout.log").write_text(
+        '{"__labit__": true, "type": "artifact", "name": "summary", '
+        '"path": "/workspace/outputs/phase0/summary.csv"}\n'
+    )
+
+    def fake_run(cmd, **kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "Number of regular files transferred: 0\n"
+                "Total transferred file size: 0 bytes\n"
+            ),
+            stderr="",
+        )
+
+    captured: dict[str, object] = {}
+
+    def fake_sync_artifact_dirs(profile, workdir, artifact_dirs, local_results, excludes):
+        captured["workdir"] = workdir
+        captured["artifact_dirs"] = artifact_dirs
+        captured["local_results"] = local_results
+        return 2, 1234
+
+    monkeypatch.setattr(experiment_service_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(svc, "_sync_artifact_dirs", fake_sync_artifact_dirs)
+
+    manifest = svc.sync_results("TestProj", "exp_01", "run_artifacts")
+
+    assert manifest.last_sync_status == "ok"
+    assert manifest.files_synced == 2
+    assert manifest.bytes_synced == 1234
+    assert manifest.artifact_sources == ["/workspace/outputs/phase0"]
+    assert captured["workdir"] == "/workspace"
+    assert captured["artifact_dirs"] == ["/workspace/outputs/phase0"]
+
+
+def test_sync_results_ignores_artifact_dirs_outside_workdir(
+    monkeypatch: pytest.MonkeyPatch, experiment_tree: Path,
+):
+    svc = _make_service(experiment_tree)
+    record = RunRecord(
+        run_id="run_artifacts_outside",
+        experiment_id="exp_01",
+        name="Test Exp",
+        profile="gpu1",
+        script="experiments/exp_01/run.sh",
+        command="bash experiments/exp_01/run.sh",
+        status="completed",
+        remote_workdir="/workspace",
+        remote_run_dir=".labit/runs/run_artifacts_outside",
+    )
+    svc._save_run("TestProj", record)
+    local_log_dir = svc._local_run_data_dir("TestProj", "exp_01", "run_artifacts_outside")
+    local_log_dir.mkdir(parents=True, exist_ok=True)
+    (local_log_dir / "stdout.log").write_text(
+        '{"__labit__": true, "type": "artifact", "name": "safe", '
+        '"path": "/workspace/outputs/phase0/summary.csv"}\n'
+        '{"__labit__": true, "type": "artifact", "name": "unsafe", '
+        '"path": "/etc/passwd"}\n'
+    )
+
+    def fake_run(cmd, **kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "Number of regular files transferred: 0\n"
+                "Total transferred file size: 0 bytes\n"
+            ),
+            stderr="",
+        )
+
+    captured: dict[str, object] = {}
+
+    def fake_sync_artifact_dirs(profile, workdir, artifact_dirs, local_results, excludes):
+        captured["artifact_dirs"] = artifact_dirs
+        return 1, 100
+
+    monkeypatch.setattr(experiment_service_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(svc, "_sync_artifact_dirs", fake_sync_artifact_dirs)
+
+    manifest = svc.sync_results("TestProj", "exp_01", "run_artifacts_outside")
+
+    assert manifest.artifact_sources == ["/workspace/outputs/phase0"]
+    assert captured["artifact_dirs"] == ["/workspace/outputs/phase0"]
+
+
 def test_sync_manifest_v2_fields():
     m = SyncManifest(
         logs_synced_at="2026-06-15T10:00:00+00:00",
@@ -867,6 +972,46 @@ def test_preview_truncation(experiment_tree: Path):
     assert len(p["content"]) == 512 * 1024
 
 
+def test_extract_artifact_dirs(tmp_path: Path):
+    """_extract_artifact_dirs parses artifact events from stdout.log."""
+    log = tmp_path / "stdout.log"
+    log.write_text(
+        'some plain log line\n'
+        '{"__labit__": true, "type": "artifact", "name": "results", "path": "/workspace/outputs/foo/bar.json"}\n'
+        '{"__labit__": true, "type": "artifact", "name": "chart", "path": "/workspace/outputs/foo/baz.png"}\n'
+        '{"__labit__": true, "type": "artifact", "name": "other", "path": "/workspace/outputs/qux/data.csv"}\n'
+        '{"__labit__": true, "type": "metric", "name": "loss", "value": 0.5}\n'
+    )
+    dirs = _extract_artifact_dirs(log)
+    assert dirs == ["/workspace/outputs/foo", "/workspace/outputs/qux"]
+
+
+def test_extract_artifact_dirs_no_artifacts(tmp_path: Path):
+    """Returns empty list when no artifact events in stdout."""
+    log = tmp_path / "stdout.log"
+    log.write_text("just plain output\n")
+    assert _extract_artifact_dirs(log) == []
+
+
+def test_extract_artifact_dirs_missing_file(tmp_path: Path):
+    """Returns empty list when stdout.log doesn't exist."""
+    assert _extract_artifact_dirs(tmp_path / "nonexistent.log") == []
+
+
+def test_sync_manifest_artifact_sources():
+    """SyncManifest roundtrips artifact_sources field."""
+    m = SyncManifest(
+        logs_synced_at="2026-01-01T00:00:00+00:00",
+        results_synced_at="2026-01-01T00:00:00+00:00",
+        last_sync_status="ok",
+        artifact_sources=["/workspace/outputs/foo"],
+    )
+    d = m.to_dict()
+    assert d["artifact_sources"] == ["/workspace/outputs/foo"]
+    m2 = SyncManifest.from_dict(d)
+    assert m2.artifact_sources == ["/workspace/outputs/foo"]
+
+
 def test_preview_url_encoding(experiment_tree: Path):
     """download_url must encode special chars (#, ?, space) in file paths."""
     svc = _make_service(experiment_tree)
@@ -881,3 +1026,221 @@ def test_preview_url_encoding(experiment_tree: Path):
     assert " " not in p["download_url"]
     assert "#" not in p["download_url"]
     assert "loss%20%231.png" in p["download_url"]
+
+
+# ── auto-refresh & graceful profile handling ───────────────────────
+
+
+def test_refresh_status_missing_profile(experiment_tree: Path):
+    """refresh_status should return cached record if profile is deleted."""
+    svc = _make_service(experiment_tree)
+    # Create a run with a non-existent profile
+    import json
+    run_dir = experiment_tree / "vault" / "projects" / "TestProj" / "runs" / "exp_01"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    record_data = {
+        "run_id": "run_missing_profile",
+        "experiment_id": "exp_01",
+        "name": "Test",
+        "profile": "deleted_gpu",
+        "script": "experiments/exp_01/run.sh",
+        "command": "bash run.sh",
+        "status": "running",
+        "pid": 99999,
+        "exit_code": None,
+        "remote_workdir": "/workspace",
+        "remote_run_dir": ".labit/runs/run_missing_profile",
+        "local_commit": "",
+        "dirty": False,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "started_at": "2026-01-01T00:00:01+00:00",
+        "finished_at": "",
+        "notes": "",
+        "error": "",
+    }
+    (run_dir / "run_missing_profile.json").write_text(json.dumps(record_data))
+
+    # Should not raise, should return cached record
+    result = svc.refresh_status("TestProj", "exp_01", "run_missing_profile")
+    assert result.status == "running"  # unchanged, since profile is gone
+
+
+def test_refresh_all_running_throttle(experiment_tree: Path):
+    """refresh_all_running should be throttled to avoid redundant SSH calls."""
+    import json, time
+    svc = _make_service(experiment_tree)
+    run_dir = experiment_tree / "vault" / "projects" / "TestProj" / "runs" / "exp_01"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    record_data = {
+        "run_id": "run_throttle",
+        "experiment_id": "exp_01",
+        "name": "Test",
+        "profile": "deleted_gpu",
+        "script": "experiments/exp_01/run.sh",
+        "command": "bash run.sh",
+        "status": "running",
+        "pid": 99999,
+        "exit_code": None,
+        "remote_workdir": "/workspace",
+        "remote_run_dir": ".labit/runs/run_throttle",
+        "local_commit": "",
+        "dirty": False,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "started_at": "2026-01-01T00:00:01+00:00",
+        "finished_at": "",
+        "notes": "",
+        "error": "",
+    }
+    (run_dir / "run_throttle.json").write_text(json.dumps(record_data))
+
+    # First call should proceed (sets timestamp)
+    svc.refresh_all_running("TestProj")
+    # Second call within 15s should be throttled (no-op)
+    svc.refresh_all_running("TestProj")
+    # Record should still be running (profile doesn't exist, so no SSH)
+    record = svc._load_run("TestProj", "exp_01", "run_throttle")
+    assert record.status == "running"
+
+
+def test_refresh_all_running_limits_runs_per_sweep(experiment_tree: Path, monkeypatch: pytest.MonkeyPatch):
+    """A list poll should not attempt unbounded SSH refreshes."""
+    svc = _make_service(experiment_tree)
+    for idx in range(6):
+        svc._save_run(
+            "TestProj",
+            RunRecord(
+                run_id=f"run_many_{idx}",
+                experiment_id="exp_01",
+                name="Test",
+                profile="gpu1",
+                script="experiments/exp_01/run.sh",
+                command="bash run.sh",
+                status="running",
+                pid=1000 + idx,
+                remote_workdir="/workspace",
+                remote_run_dir=f".labit/runs/run_many_{idx}",
+            ),
+        )
+
+    refreshed: list[str] = []
+
+    def fake_refresh(
+        project: str,
+        experiment_id: str,
+        run_id: str,
+        *,
+        ssh_timeout: int = 10,
+        sync_logs_on_finish: bool = True,
+    ):
+        refreshed.append(run_id)
+        return svc._load_run(project, experiment_id, run_id)
+
+    monkeypatch.setattr(svc, "refresh_status", fake_refresh)
+
+    svc.refresh_all_running("TestProj")
+
+    assert len(refreshed) == 4
+
+
+def test_refresh_all_running_does_not_sync_logs(experiment_tree: Path, monkeypatch: pytest.MonkeyPatch):
+    """Automatic list polling should update status without running rsync."""
+    svc = _make_service(experiment_tree)
+    svc._save_run(
+        "TestProj",
+        RunRecord(
+            run_id="run_no_log_sync",
+            experiment_id="exp_01",
+            name="Test",
+            profile="gpu1",
+            script="experiments/exp_01/run.sh",
+            command="bash run.sh",
+            status="running",
+            pid=1000,
+            remote_workdir="/workspace",
+            remote_run_dir=".labit/runs/run_no_log_sync",
+        ),
+    )
+
+    called_with: list[bool] = []
+
+    def fake_refresh(
+        project: str,
+        experiment_id: str,
+        run_id: str,
+        *,
+        ssh_timeout: int = 10,
+        sync_logs_on_finish: bool = True,
+    ):
+        called_with.append(sync_logs_on_finish)
+        return svc._load_run(project, experiment_id, run_id)
+
+    monkeypatch.setattr(svc, "refresh_status", fake_refresh)
+
+    svc.refresh_all_running("TestProj")
+
+    assert called_with == [False]
+
+
+def test_tail_logs_missing_profile(experiment_tree: Path):
+    """tail_logs should return empty message if profile is deleted."""
+    import json
+    svc = _make_service(experiment_tree)
+    run_dir = experiment_tree / "vault" / "projects" / "TestProj" / "runs" / "exp_01"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    record_data = {
+        "run_id": "run_no_profile",
+        "experiment_id": "exp_01",
+        "name": "Test",
+        "profile": "gone_gpu",
+        "script": "experiments/exp_01/run.sh",
+        "command": "bash run.sh",
+        "status": "running",
+        "pid": 99999,
+        "exit_code": None,
+        "remote_workdir": "/workspace",
+        "remote_run_dir": ".labit/runs/run_no_profile",
+        "local_commit": "",
+        "dirty": False,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "started_at": "2026-01-01T00:00:01+00:00",
+        "finished_at": "",
+        "notes": "",
+        "error": "",
+    }
+    (run_dir / "run_no_profile.json").write_text(json.dumps(record_data))
+
+    # Should not raise
+    result = svc.tail_logs("TestProj", "exp_01", "run_no_profile")
+    assert "No stdout" in result or result == ""
+
+
+def test_fetch_events_no_remote_run_dir(experiment_tree: Path):
+    """fetch_events should return empty when remote_run_dir is empty."""
+    import json
+    svc = _make_service(experiment_tree)
+    run_dir = experiment_tree / "vault" / "projects" / "TestProj" / "runs" / "exp_01"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    record_data = {
+        "run_id": "run_no_dir",
+        "experiment_id": "exp_01",
+        "name": "Test",
+        "profile": "gpu1",
+        "script": "experiments/exp_01/run.sh",
+        "command": "bash run.sh",
+        "status": "failed",
+        "pid": None,
+        "exit_code": None,
+        "remote_workdir": "/workspace",
+        "remote_run_dir": "",
+        "local_commit": "",
+        "dirty": False,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "started_at": "",
+        "finished_at": "2026-01-01T00:00:01+00:00",
+        "notes": "",
+        "error": "Sync failed",
+    }
+    (run_dir / "run_no_dir.json").write_text(json.dumps(record_data))
+
+    result = svc.fetch_events("TestProj", "exp_01", "run_no_dir")
+    assert result["events"] == []
