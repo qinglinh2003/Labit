@@ -4,7 +4,7 @@ import subprocess
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from queue import Queue
+from queue import Empty, Queue
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -75,7 +75,10 @@ def stream_subprocess_lines(
                 stderr_thread.join()
                 raise StreamCancelled("Stream cancelled by user")
 
-            stream_name, payload = queue.get()
+            try:
+                stream_name, payload = queue.get(timeout=0.5)
+            except Empty:
+                continue
 
             if payload is None:
                 finished_streams.add(stream_name)

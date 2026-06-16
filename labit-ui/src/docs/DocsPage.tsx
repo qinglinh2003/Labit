@@ -726,6 +726,8 @@ function DocChatPanel({
 
   const handleStop = useCallback(() => {
     void stopTask(project, docId, chatId);
+    abortRef.current?.abort();
+    abortRef.current = null;
   }, [project, docId, chatId]);
 
   const handleModeChange = useCallback((mode: ChatMode) => {

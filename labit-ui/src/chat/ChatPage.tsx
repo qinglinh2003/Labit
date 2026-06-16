@@ -789,6 +789,8 @@ export default function ChatPage({ project, activeChatId, onActiveChatIdChange }
   // Stop
   const handleStop = useCallback(() => {
     if (project && activeChatId) void stopTask(project, activeChatId);
+    abortRef.current?.abort();
+    abortRef.current = null;
   }, [project, activeChatId]);
 
   // Mode / swap

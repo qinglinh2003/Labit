@@ -1239,6 +1239,8 @@ function CodeChatPanel({
 
   const handleStop = useCallback(() => {
     void stopTask(project, chatId);
+    abortRef.current?.abort();
+    abortRef.current = null;
   }, [project, chatId]);
 
   const handleModeChange = useCallback((mode: ChatMode) => {

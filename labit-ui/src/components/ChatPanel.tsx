@@ -256,6 +256,11 @@ export default function ChatPanel({
   const handleStop = useCallback(() => {
     // Tell the backend to cancel the agent subprocess
     void stopTask(project, paperId, chatId);
+    // Abort the SSE reader immediately so the UI unblocks.
+    // The AbortError triggers onDone() in consumeSSE, which
+    // sets streaming=false and re-fetches the chat from server.
+    abortRef.current?.abort();
+    abortRef.current = null;
   }, [project, paperId, chatId]);
 
   const handleModeChange = useCallback((mode: ChatMode) => {

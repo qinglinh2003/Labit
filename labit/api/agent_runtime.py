@@ -42,6 +42,7 @@ class BackgroundTask:
     events: list[dict] = field(default_factory=list)
     cancel_events: list[threading.Event] = field(default_factory=list)
     done: bool = False
+    cancelled: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def push_event(self, event: dict) -> None:
@@ -57,6 +58,7 @@ class BackgroundTask:
             return list(self.events), self.done
 
     def cancel(self) -> None:
+        self.cancelled = True
         for ce in self.cancel_events:
             ce.set()
 
@@ -351,7 +353,7 @@ def _orchestrate_round_robin(
     save_result(first)
 
     first_text = get_agent_text(task, first)
-    if len(agents) > 1 and first_text:
+    if len(agents) > 1 and first_text and not task.cancelled:
         second = agents[1]
         # After save_result(first), the first agent's reply is in chat history.
         # build_prompt(second) will include it, so no need for extra peer context.
