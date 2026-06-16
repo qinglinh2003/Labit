@@ -84,6 +84,7 @@ class ComputeService:
         port: int = 22,
         identity_file: str | None = None,
         workdir: str = "",
+        cache_dir: str = ".cache",
         notes: str = "",
     ) -> ComputeProfile:
         return ComputeProfile(
@@ -95,6 +96,7 @@ class ComputeService:
                 identity_file=identity_file,
             ),
             workdir=workdir,
+            cache_dir=cache_dir,
             notes=notes,
         )
 
@@ -153,7 +155,13 @@ class ComputeService:
 
         # Build rsync command
         cmd = ["rsync", "-azP", "--delete"]
-        for pattern in (excludes or DEFAULT_SYNC_EXCLUDES):
+        all_excludes = list(excludes or DEFAULT_SYNC_EXCLUDES)
+        # Always exclude the profile's cache directory from code sync
+        if profile.cache_dir:
+            cache_pattern = profile.cache_dir.strip("/") + "/"
+            if cache_pattern not in all_excludes:
+                all_excludes.append(cache_pattern)
+        for pattern in all_excludes:
             cmd.extend(["--exclude", pattern])
 
         # SSH options

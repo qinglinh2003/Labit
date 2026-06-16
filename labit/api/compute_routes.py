@@ -13,6 +13,7 @@ class ComputeProfileResponse(BaseModel):
     port: int
     identity_file: str | None
     workdir: str
+    cache_dir: str
     notes: str
     ssh_display: str
 
@@ -23,6 +24,7 @@ class SaveProfileRequest(BaseModel):
     port: int = 22
     identity_file: str | None = None
     workdir: str = ""
+    cache_dir: str = ".cache"
     notes: str = ""
 
 
@@ -53,6 +55,7 @@ def _to_response(profile) -> ComputeProfileResponse:
         port=profile.connection.port,
         identity_file=profile.connection.identity_file,
         workdir=profile.workdir,
+        cache_dir=profile.cache_dir,
         notes=profile.notes,
         ssh_display=profile.ssh_display(),
     )
@@ -85,6 +88,7 @@ def mount_compute_routes(svc: ComputeService) -> APIRouter:
                 port=body.port,
                 identity_file=body.identity_file,
                 workdir=body.workdir,
+                cache_dir=body.cache_dir,
                 notes=body.notes,
             )
             svc.save_profile(project, profile)

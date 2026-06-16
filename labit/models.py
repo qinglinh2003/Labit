@@ -103,6 +103,7 @@ class ComputeProfile(BaseModel):
     name: str
     connection: SSHConnection
     workdir: str = ""
+    cache_dir: str = ".cache"
     notes: str = ""
 
     @field_validator("name")
@@ -110,7 +111,7 @@ class ComputeProfile(BaseModel):
     def validate_name_field(cls, value: str) -> str:
         return _validate_name(value)
 
-    @field_validator("workdir", "notes")
+    @field_validator("workdir", "cache_dir", "notes")
     @classmethod
     def strip_optional_text(cls, value: str | None) -> str:
         return _strip_optional_text(value)
