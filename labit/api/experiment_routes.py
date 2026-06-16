@@ -86,6 +86,7 @@ class SyncResponse(BaseModel):
     files_synced: int
     bytes_synced: int
     excluded_patterns: list[str] = []
+    artifact_sources: list[str] = []
 
 
 class ResultEntry(BaseModel):
@@ -277,6 +278,7 @@ def mount_experiment_routes(svc: ExperimentService) -> APIRouter:
                 files_synced=manifest.files_synced,
                 bytes_synced=manifest.bytes_synced,
                 excluded_patterns=manifest.excluded_patterns,
+                artifact_sources=manifest.artifact_sources,
             )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

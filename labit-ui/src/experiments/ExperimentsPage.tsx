@@ -52,6 +52,7 @@ import {
   type MetricPoint,
   type ResultEntry,
   type ResultPreview,
+  type SyncResult,
 } from "../api/experiments";
 
 type Category = "ready" | "running" | "recent";
@@ -134,6 +135,7 @@ export default function ExperimentsPage({ project }: { project: string }) {
   const [resultPreview, setResultPreview] = useState<ResultPreview | null>(null);
   const [resultsLoading, setResultsLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [lastSyncResult, setLastSyncResult] = useState<SyncResult | null>(null);
 
   const expQuery = useQuery({
     queryKey: ["experiments", project],
@@ -451,6 +453,7 @@ export default function ExperimentsPage({ project }: { project: string }) {
                   preview={resultPreview}
                   loading={resultsLoading}
                   syncing={syncing}
+                  lastSyncResult={lastSyncResult}
                   onLoadFiles={async () => {
                     setResultsLoading(true);
                     try {
@@ -478,7 +481,8 @@ export default function ExperimentsPage({ project }: { project: string }) {
                   onSync={async () => {
                     setSyncing(true);
                     try {
-                      await syncRun(project, logModal.experimentId, logModal.runId, "results");
+                      const sr = await syncRun(project, logModal.experimentId, logModal.runId, "results");
+                      setLastSyncResult(sr);
                       const files = await listResults(project, logModal.experimentId, logModal.runId);
                       setResultFiles(files);
                     } catch (err: any) {
@@ -900,6 +904,7 @@ function ResultsPanel({
   preview,
   loading,
   syncing,
+  lastSyncResult,
   onLoadFiles,
   onPreview,
   onClosePreview,
@@ -912,6 +917,7 @@ function ResultsPanel({
   preview: ResultPreview | null;
   loading: boolean;
   syncing: boolean;
+  lastSyncResult: SyncResult | null;
   onLoadFiles: () => Promise<void>;
   onPreview: (path: string) => Promise<void>;
   onClosePreview: () => void;
@@ -1021,6 +1027,18 @@ function ResultsPanel({
           </button>
         </div>
       </div>
+
+      {/* Artifact fallback banner */}
+      {lastSyncResult?.artifact_sources && lastSyncResult.artifact_sources.length > 0 && (
+        <div className="mb-3 rounded-md border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-400">
+          <p className="font-medium">Results synced from artifact paths (not $LABIT_RESULTS_DIR):</p>
+          <ul className="mt-1 space-y-0.5 text-amber-400/80 font-mono">
+            {lastSyncResult.artifact_sources.map((s) => (
+              <li key={s}>{s}</li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {loading ? (
         <div className="flex items-center justify-center py-12 text-sm text-slate-400">

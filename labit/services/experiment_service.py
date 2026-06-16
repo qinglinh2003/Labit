@@ -11,13 +11,14 @@ Run records are persisted under ``vault/projects/<project>/runs/<experiment_id>/
 from __future__ import annotations
 
 import json
+import posixpath
 import re
 import shlex
 import urllib.parse
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
@@ -64,6 +65,7 @@ class SyncManifest:
     files_synced: int = 0
     bytes_synced: int = 0
     excluded_patterns: list[str] = field(default_factory=list)
+    artifact_sources: list[str] = field(default_factory=list)  # non-empty if fallback to artifact dirs
 
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in self.__dict__.items()}
@@ -922,7 +924,26 @@ class ExperimentService:
             )
             if result.returncode == 0:
                 files_synced, bytes_synced = _parse_rsync_stats(result.stdout)
-                # Preserve existing logs_synced_at if present
+                artifact_sources: list[str] = []
+
+                # Fallback: if standard results/ was empty, try artifact dirs
+                if files_synced == 0:
+                    local_log = self._local_run_data_dir(
+                        project, experiment_id, run_id,
+                    ) / "stdout.log"
+                    artifact_dirs = _filter_artifact_dirs_for_workdir(
+                        _extract_artifact_dirs(local_log),
+                        workdir,
+                    )
+                    if artifact_dirs:
+                        fb_files, fb_bytes = self._sync_artifact_dirs(
+                            profile, workdir, artifact_dirs,
+                            local_results, excludes,
+                        )
+                        files_synced += fb_files
+                        bytes_synced += fb_bytes
+                        artifact_sources = artifact_dirs
+
                 prev = SyncManifest.from_dict(record.sync) if record.sync else SyncManifest()
                 manifest = SyncManifest(
                     logs_synced_at=prev.logs_synced_at,
@@ -931,6 +952,7 @@ class ExperimentService:
                     files_synced=files_synced,
                     bytes_synced=bytes_synced,
                     excluded_patterns=excludes,
+                    artifact_sources=artifact_sources,
                 )
             else:
                 prev = SyncManifest.from_dict(record.sync) if record.sync else SyncManifest()
@@ -964,6 +986,56 @@ class ExperimentService:
         record.sync = manifest.to_dict()
         self._save_run(project, record)
         return manifest
+
+    def _sync_artifact_dirs(
+        self,
+        profile: Any,
+        workdir: str,
+        artifact_dirs: list[str],
+        local_results: Path,
+        excludes: list[str],
+    ) -> tuple[int, int]:
+        """Rsync artifact directories from remote into local results/.
+
+        Each artifact dir (e.g. /workspace/outputs/phase0_foo) is synced into
+        local_results/<dirname>/.  Returns (total_files, total_bytes).
+        """
+        total_files = 0
+        total_bytes = 0
+
+        for remote_dir in artifact_dirs:
+            dirname = Path(remote_dir).name
+            local_sub = local_results / dirname
+            local_sub.mkdir(parents=True, exist_ok=True)
+
+            remote_source = f"{profile.connection.target}:{remote_dir}/"
+
+            cmd = ["rsync", "-az", "--stats"]
+            for pat in excludes:
+                cmd.extend(["--exclude", pat])
+
+            ssh_parts = ["ssh"]
+            if profile.connection.identity_file:
+                ssh_parts.extend(["-i", str(Path(profile.connection.identity_file).expanduser())])
+            if profile.connection.port != 22:
+                ssh_parts.extend(["-p", str(profile.connection.port)])
+            cmd.extend(["-e", shlex.join(ssh_parts)])
+
+            cmd.append(remote_source)
+            cmd.append(str(local_sub) + "/")
+
+            try:
+                result = subprocess.run(
+                    cmd, text=True, capture_output=True, timeout=300, check=False,
+                )
+                if result.returncode == 0:
+                    f, b = _parse_rsync_stats(result.stdout)
+                    total_files += f
+                    total_bytes += b
+            except Exception:
+                pass  # best-effort per directory
+
+        return total_files, total_bytes
 
     def sync_all(
         self,
@@ -1208,6 +1280,55 @@ def _parse_structured_from_local(path: Path) -> tuple[str, int]:
         if '"__labit__"' in line
     ]
     return "\n".join(event_lines), total_lines
+
+
+def _extract_artifact_dirs(stdout_path: Path) -> list[str]:
+    """Parse artifact events from stdout.log and return unique parent directories.
+
+    Artifact events look like:
+        {"__labit__": true, "type": "artifact", "path": "/workspace/outputs/foo/bar.json"}
+
+    Returns sorted list of unique parent directories (e.g. ["/workspace/outputs/foo"]).
+    """
+    dirs: set[str] = set()
+    try:
+        for line in stdout_path.read_text().splitlines():
+            if '"artifact"' not in line:
+                continue
+            try:
+                obj = json.loads(line)
+                if (
+                    isinstance(obj, dict)
+                    and obj.get("__labit__")
+                    and obj.get("type") == "artifact"
+                    and obj.get("path")
+                ):
+                    parent = str(Path(obj["path"]).parent)
+                    dirs.add(parent)
+            except (json.JSONDecodeError, ValueError):
+                continue
+    except Exception:
+        pass
+    return sorted(dirs)
+
+
+def _filter_artifact_dirs_for_workdir(artifact_dirs: list[str], workdir: str) -> list[str]:
+    """Keep only absolute artifact dirs under the remote workdir."""
+    normalized_workdir = PurePosixPath(posixpath.normpath(workdir))
+    if not normalized_workdir.is_absolute():
+        return []
+
+    filtered: list[str] = []
+    for artifact_dir in artifact_dirs:
+        normalized_dir = PurePosixPath(posixpath.normpath(artifact_dir))
+        if not normalized_dir.is_absolute():
+            continue
+        try:
+            normalized_dir.relative_to(normalized_workdir)
+        except ValueError:
+            continue
+        filtered.append(str(normalized_dir))
+    return filtered
 
 
 def _parse_rsync_stats(stdout: str) -> tuple[int, int]:

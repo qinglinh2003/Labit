@@ -177,6 +177,7 @@ export interface SyncResult {
   files_synced: number;
   bytes_synced: number;
   excluded_patterns: string[];
+  artifact_sources: string[];
 }
 
 export async function syncRun(
