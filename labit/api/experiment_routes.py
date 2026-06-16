@@ -106,6 +106,12 @@ def mount_experiment_routes(svc: ExperimentService) -> APIRouter:
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+        # Auto-refresh running runs so status stays current
+        try:
+            svc.refresh_all_running(project)
+        except Exception:
+            pass  # Best-effort; don't fail the list because of refresh
+
         result: list[ExperimentWithLatestRun] = []
         for exp in experiments:
             latest = svc.latest_run(project, exp.experiment_id)

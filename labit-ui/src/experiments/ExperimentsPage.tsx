@@ -176,8 +176,11 @@ export default function ExperimentsPage({ project }: { project: string }) {
     async (experimentId: string, runId: string) => {
       try {
         await stopRun(project, experimentId, runId);
+      } catch (err: any) {
+        console.error("Stop failed:", err);
+      } finally {
         void queryClient.invalidateQueries({ queryKey: ["experiments", project] });
-      } catch {}
+      }
     },
     [project, queryClient],
   );

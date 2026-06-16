@@ -124,6 +124,7 @@ class ExperimentService:
         self.compute_service = compute_service or ComputeService(
             paths, project_service=self.project_service
         )
+        self._last_refresh_all: dict[str, float] = {}  # project -> timestamp
 
     # ── discovery ────────────────────────────────────────────────────
 
@@ -286,10 +287,23 @@ class ExperimentService:
         workdir_q = _quote_remote_path(workdir)
         remote_run_dir_q = shlex.quote(remote_run_dir)
         script_rel_q = shlex.quote(script_rel)
+        # Resolve cache directory (absolute or relative to workdir)
+        cache_dir = profile.cache_dir or ".cache"
+        if not cache_dir.startswith("/"):
+            cache_abs = f"{workdir}/{cache_dir}"
+        else:
+            cache_abs = cache_dir
+        cache_abs_q = shlex.quote(cache_abs)
+
         inner_cmd = (
             f"export LABIT_RUN_DIR={shlex.quote(remote_run_dir)}; "
             f"export LABIT_RESULTS_DIR={shlex.quote(remote_run_dir + '/results')}; "
-            f"mkdir -p -- $LABIT_RESULTS_DIR; "
+            f"export LABIT_CACHE_DIR={cache_abs_q}; "
+            f"export HF_HOME={cache_abs_q}/huggingface; "
+            f"export HF_HUB_CACHE={cache_abs_q}/huggingface/hub; "
+            f"export TRANSFORMERS_CACHE={cache_abs_q}/huggingface/transformers; "
+            f"export TORCH_HOME={cache_abs_q}/torch; "
+            f"mkdir -p -- $LABIT_RESULTS_DIR $HF_HOME $TORCH_HOME; "
             f"(bash {script_rel_q}; echo $? > {shlex.quote(remote_run_dir + '/exit_code')}) "
             f"> {shlex.quote(remote_run_dir + '/stdout.log')} "
             f"2> {shlex.quote(remote_run_dir + '/stderr.log')}"
@@ -308,7 +322,7 @@ class ExperimentService:
                 [*ssh_cmd, remote_cmd],
                 text=True,
                 capture_output=True,
-                timeout=None,
+                timeout=30,
                 check=False,
             )
             if result.returncode != 0:
@@ -354,10 +368,22 @@ class ExperimentService:
 
     # ── monitoring ───────────────────────────────────────────────────
 
-    def refresh_status(self, project: str, experiment_id: str, run_id: str) -> RunRecord:
+    def refresh_status(
+        self,
+        project: str,
+        experiment_id: str,
+        run_id: str,
+        *,
+        ssh_timeout: int = 10,
+        sync_logs_on_finish: bool = True,
+    ) -> RunRecord:
         record = self._load_run(project, experiment_id, run_id)
 
-        profile = self.compute_service.get_profile(project, record.profile)
+        try:
+            profile = self.compute_service.get_profile(project, record.profile)
+        except FileNotFoundError:
+            # Profile was deleted — can't check remote, return cached status
+            return record
         ssh_cmd = profile.ssh_command()
 
         # If launch failed with no PID (e.g. SSH timeout), try to recover
@@ -373,7 +399,7 @@ class ExperimentService:
             try:
                 r = subprocess.run(
                     [*ssh_cmd, recover_cmd],
-                    text=True, capture_output=True, timeout=None, check=False,
+                    text=True, capture_output=True, timeout=ssh_timeout, check=False,
                 )
                 exit_text = r.stdout.strip()
                 if exit_text.isdigit():
@@ -384,11 +410,12 @@ class ExperimentService:
                     self._save_run(project, record)
 
                     # Auto-sync logs after recovery
-                    try:
-                        self.sync_logs(project, experiment_id, run_id)
-                        record = self._load_run(project, experiment_id, run_id)
-                    except Exception:
-                        pass
+                    if sync_logs_on_finish:
+                        try:
+                            self.sync_logs(project, experiment_id, run_id)
+                            record = self._load_run(project, experiment_id, run_id)
+                        except Exception:
+                            pass
                 elif exit_text != "unknown":
                     # exit_code file exists but content is unexpected
                     pass
@@ -400,50 +427,102 @@ class ExperimentService:
         if record.status not in ("running",):
             return record
 
-        # Check if PID is alive
-        check_cmd = f"kill -0 {record.pid} 2>/dev/null && echo alive || echo dead"
+        # Check if PID is alive and read exit_code in a single SSH call
+        workdir = record.remote_workdir.replace("\uff5e", "~")
+        combined_cmd = (
+            f"kill -0 {record.pid} 2>/dev/null && echo alive || "
+            f"(echo dead && cd -- {_quote_remote_path(workdir)} && "
+            f"cat -- {shlex.quote(record.remote_run_dir + '/exit_code')} "
+            "2>/dev/null || echo unknown)"
+        )
         try:
             result = subprocess.run(
-                [*ssh_cmd, check_cmd],
-                text=True, capture_output=True, timeout=None, check=False,
+                [*ssh_cmd, combined_cmd],
+                text=True, capture_output=True, timeout=ssh_timeout, check=False,
             )
-            status_text = result.stdout.strip().split("\n")[-1]
+            lines = result.stdout.strip().split("\n")
+            status_text = lines[0].strip() if lines else "alive"
         except Exception:
             return record
 
         if status_text == "dead":
-            # Process finished — check exit code
-            workdir = record.remote_workdir.replace("\uff5e", "~")
-            exit_cmd = (
-                f"cd -- {_quote_remote_path(workdir)} && "
-                f"cat -- {shlex.quote(record.remote_run_dir + '/exit_code')} "
-                "2>/dev/null || echo unknown"
-            )
-            try:
-                exit_result = subprocess.run(
-                    [*ssh_cmd, exit_cmd],
-                    text=True, capture_output=True, timeout=None, check=False,
-                )
-                exit_text = exit_result.stdout.strip()
-                if exit_text.isdigit():
-                    record.exit_code = int(exit_text)
-                    record.status = "completed" if record.exit_code == 0 else "failed"
-                else:
-                    record.status = "failed"
-                    record.exit_code = -1
-            except Exception:
+            exit_text = lines[1].strip() if len(lines) > 1 else "unknown"
+            if exit_text.isdigit():
+                record.exit_code = int(exit_text)
+                record.status = "completed" if record.exit_code == 0 else "failed"
+            else:
                 record.status = "failed"
+                record.exit_code = -1
             record.finished_at = _now_iso()
             self._save_run(project, record)
 
             # Auto-sync logs on completion
-            try:
-                self.sync_logs(project, experiment_id, run_id)
-                record = self._load_run(project, experiment_id, run_id)
-            except Exception:
-                pass  # Best-effort; don't fail refresh because of sync
+            if sync_logs_on_finish:
+                try:
+                    self.sync_logs(project, experiment_id, run_id)
+                    record = self._load_run(project, experiment_id, run_id)
+                except Exception:
+                    pass  # Best-effort; don't fail refresh because of sync
 
         return record
+
+    def refresh_all_running(self, project: str) -> None:
+        """Refresh status of all running runs in the project, concurrently.
+
+        Throttled to run at most once every 15 seconds per project.
+        """
+        import time
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        now = time.monotonic()
+        last = self._last_refresh_all.get(project, 0.0)
+        if now - last < 15:
+            return
+
+        # Collect all running runs across all experiments
+        running_runs: list[tuple[str, str]] = []  # (experiment_id, run_id)
+        runs_dir = self._runs_dir(project)
+        if not runs_dir.exists():
+            return
+        for exp_dir in runs_dir.iterdir():
+            if not exp_dir.is_dir():
+                continue
+            for run_file in exp_dir.glob("*.json"):
+                try:
+                    data = json.loads(run_file.read_text())
+                    if data.get("status") == "running":
+                        running_runs.append((data["experiment_id"], data["run_id"]))
+                except Exception:
+                    continue
+
+        if not running_runs:
+            return
+
+        self._last_refresh_all[project] = now
+        running_runs = running_runs[:4]
+
+        def _refresh_one(exp_id: str, run_id: str) -> None:
+            try:
+                self.refresh_status(
+                    project,
+                    exp_id,
+                    run_id,
+                    ssh_timeout=8,
+                    sync_logs_on_finish=False,
+                )
+            except Exception:
+                pass
+
+        with ThreadPoolExecutor(max_workers=min(len(running_runs), 4)) as pool:
+            futures = {
+                pool.submit(_refresh_one, eid, rid): (eid, rid)
+                for eid, rid in running_runs
+            }
+            for future in as_completed(futures, timeout=12):
+                try:
+                    future.result()
+                except Exception:
+                    pass
 
     def tail_logs(
         self,
@@ -469,8 +548,13 @@ class ExperimentService:
         if record.status in ("completed", "failed", "stopped") and local_log.exists():
             return _tail_local(local_log, tail)
 
-        # Try remote SSH
-        profile = self.compute_service.get_profile(project, record.profile)
+        # Try remote SSH — profile may have been deleted
+        try:
+            profile = self.compute_service.get_profile(project, record.profile)
+        except FileNotFoundError:
+            if local_log.exists():
+                return _tail_local(local_log, tail)
+            return _empty_log_message(stream)
         ssh_cmd = profile.ssh_command()
         workdir = record.remote_workdir.replace("\uff5e", "~")
         log_file = f"{record.remote_run_dir}/{stream}.log"
@@ -484,7 +568,7 @@ class ExperimentService:
                     f"tail -n {tail} -- {shlex.quote(log_file)}; "
                     f"else echo {shlex.quote(_empty_log_message(stream))}; fi",
                 ],
-                text=True, capture_output=True, timeout=None, check=False,
+                text=True, capture_output=True, timeout=15, check=False,
             )
             if result.returncode != 0:
                 # Remote failed — fall back to local cache
@@ -573,8 +657,20 @@ class ExperimentService:
         if record.status in ("completed", "failed", "stopped") and local_log.exists():
             return _parse_structured_from_local(local_log)
 
+        # Can't reach remote if run never started or profile is gone
+        if not record.remote_run_dir:
+            if local_log.exists():
+                return _parse_structured_from_local(local_log)
+            return "", 0
+
+        try:
+            profile = self.compute_service.get_profile(project, record.profile)
+        except FileNotFoundError:
+            if local_log.exists():
+                return _parse_structured_from_local(local_log)
+            return "", 0
+
         # Remote path
-        profile = self.compute_service.get_profile(project, record.profile)
         ssh_cmd = profile.ssh_command()
         workdir = record.remote_workdir.replace("\uff5e", "~")
         log_file = f"{record.remote_run_dir}/stdout.log"
@@ -589,7 +685,7 @@ class ExperimentService:
         try:
             result = subprocess.run(
                 [*ssh_cmd, remote_cmd],
-                text=True, capture_output=True, timeout=None, check=False,
+                text=True, capture_output=True, timeout=15, check=False,
             )
         except Exception:
             # Fall back to local cache
@@ -615,32 +711,38 @@ class ExperimentService:
         if record.status != "running" or record.pid is None:
             return record
 
-        profile = self.compute_service.get_profile(project, record.profile)
-        ssh_cmd = profile.ssh_command()
+        # Mark stopped immediately so the UI reflects the intent even if
+        # the remote kill is slow, the SSH connection hangs, or the
+        # compute profile has been deleted.
+        record.status = "stopped"
+        record.finished_at = _now_iso()
+        self._save_run(project, record)
 
+        # Best-effort remote kill — profile may have been deleted/renamed.
         try:
+            profile = self.compute_service.get_profile(project, record.profile)
+            ssh_cmd = profile.ssh_command()
             subprocess.run(
                 [
                     *ssh_cmd,
                     f"kill -TERM -- -{record.pid} 2>/dev/null || "
                     f"kill -TERM -- {record.pid} 2>/dev/null; "
-                    "sleep 2; "
+                    "sleep 1; "
                     f"kill -KILL -- -{record.pid} 2>/dev/null || "
                     f"kill -KILL -- {record.pid} 2>/dev/null; "
                     "true",
                 ],
-                text=True, capture_output=True, timeout=None, check=False,
+                text=True, capture_output=True, timeout=15, check=False,
             )
-            record.status = "stopped"
-            record.finished_at = _now_iso()
-            self._save_run(project, record)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass  # Profile missing or remote kill timed out
+        except Exception:
+            pass
 
-            # Best-effort sync logs after stop
-            try:
-                self.sync_logs(project, experiment_id, run_id)
-                record = self._load_run(project, experiment_id, run_id)
-            except Exception:
-                pass
+        # Best-effort sync logs after stop
+        try:
+            self.sync_logs(project, experiment_id, run_id)
+            record = self._load_run(project, experiment_id, run_id)
         except Exception:
             pass
 
