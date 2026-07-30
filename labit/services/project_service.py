@@ -152,25 +152,33 @@ class ProjectService:
         )
 
     def archive_project(self, name: str) -> dict:
-        spec = self.load_project(name)
-        resolved = self.resolve_project_name(name) or spec.name
-        if spec.archived:
+        resolved = self.resolve_project_name(name)
+        if resolved is None:
+            raise FileNotFoundError(
+                f"Project '{name}' not found. Available projects: {', '.join(self.list_project_names()) or '(none)'}"
+            )
+        config = self._read_project_config(resolved)
+        if bool(config.get("archived")):
             return {"name": resolved, "archived": True, "changed": False}
         was_active = self.active_project_name() == resolved
-        spec.archived = True
-        self.save_project(spec, force=True)
+        config["archived"] = True
+        self._write_project_config(resolved, config)
         if was_active:
             if self.paths.active_project_path.exists():
                 self.paths.active_project_path.unlink()
         return {"name": resolved, "archived": True, "changed": True}
 
     def unarchive_project(self, name: str) -> dict:
-        spec = self.load_project(name)
-        resolved = self.resolve_project_name(name) or spec.name
-        if not spec.archived:
+        resolved = self.resolve_project_name(name)
+        if resolved is None:
+            raise FileNotFoundError(
+                f"Project '{name}' not found. Available projects: {', '.join(self.list_project_names(include_archived=True)) or '(none)'}"
+            )
+        config = self._read_project_config(resolved)
+        if not bool(config.get("archived")):
             return {"name": resolved, "archived": False, "changed": False}
-        spec.archived = False
-        self.save_project(spec, force=True)
+        config.pop("archived", None)
+        self._write_project_config(resolved, config)
         return {"name": resolved, "archived": False, "changed": True}
 
     def list_project_summaries(self, *, include_archived: bool = False) -> list[ProjectSummary]:
@@ -188,6 +196,18 @@ class ProjectService:
             handle.write(content)
             temp_path = Path(handle.name)
         temp_path.replace(path)
+
+    def _read_project_config(self, name: str) -> dict:
+        config_path = self.paths.project_configs_dir / f"{name}.yaml"
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        if not isinstance(raw, dict):
+            raise ValueError(f"Project '{name}' config must be a YAML mapping.")
+        return raw
+
+    def _write_project_config(self, name: str, config: dict) -> None:
+        config_path = self.paths.project_configs_dir / f"{name}.yaml"
+        yaml_text = yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
+        self._atomic_write(config_path, yaml_text)
 
     def _with_legacy_compute_profiles(self, raw: dict) -> dict:
         """Hydrate old project configs that referenced configs/compute/<name>.yaml."""

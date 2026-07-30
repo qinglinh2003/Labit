@@ -29,6 +29,8 @@ DEFAULT_SYNC_EXCLUDES = [
     "outputs/",
     "runs/",
     ".history/",
+    ".hf_home/",
+    ".cache/",
 ]
 
 

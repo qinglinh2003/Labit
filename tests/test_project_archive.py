@@ -77,6 +77,35 @@ def test_api_archive_hides_project_and_clears_active(tmp_path: Path) -> None:
     }
 
 
+def test_api_archive_preserves_legacy_project_config_fields(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    _write_project(paths, "Legacy")
+    config_path = paths.project_configs_dir / "Legacy.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "name": "Legacy",
+                "description": "legacy config",
+                "arxiv_categories": ["cs.AI"],
+                "storage_profile": "research-r2",
+                "sync_dirs": ["outputs"],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(paths))
+
+    archive_response = client.put("/api/projects/Legacy/archive")
+
+    assert archive_response.status_code == 200
+    saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert saved["archived"] is True
+    assert saved["arxiv_categories"] == ["cs.AI"]
+    assert saved["storage_profile"] == "research-r2"
+    assert saved["sync_dirs"] == ["outputs"]
+
+
 def test_api_unarchive_restores_project_to_default_list(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     _write_project(paths, "Hidden", archived=True)

@@ -231,9 +231,13 @@ class CodexAdapter(AgentAdapter):
 
 def _codex_executable() -> str:
     # Prefer user-installed version (typically newer) over system-wide
-    npm_global = Path.home() / ".npm-global" / "bin" / "codex"
-    if npm_global.exists():
-        return str(npm_global)
+    home = Path.home()
+    for candidate in (
+        home / ".npm-global" / "bin" / "codex",
+        home / ".local" / "bin" / "codex",
+    ):
+        if candidate.exists():
+            return str(candidate)
 
     executable = shutil.which("codex")
     if executable:
