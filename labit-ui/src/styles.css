@@ -41,6 +41,21 @@ select {
   font: inherit;
 }
 
+.labit-markdown .katex-display {
+  margin: 0.75rem 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.35rem 0;
+}
+
+.labit-markdown .katex {
+  font-size: 1.02em;
+}
+
+.labit-markdown .katex-display > .katex {
+  white-space: nowrap;
+}
+
 /* ── LABIT sidebar components ── */
 
 /* panel shell */

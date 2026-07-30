@@ -3,10 +3,6 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { Archive, ArchiveRestore, Ban, BookOpen, Check, ChevronDown, ChevronLeft, ChevronRight, Edit3, Eye, FileText, FolderOpen, FolderPlus, MessageSquare, NotebookPen, Plus, RefreshCw, Search, Settings, Star, Tag, Undo2, X } from "lucide-react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
-import rehypeKatex from "rehype-katex";
 import {
   archiveProject,
   createProject,
@@ -26,6 +22,7 @@ import { createChat, deleteChat, listChats, type ChatListItem } from "./api/chat
 import PaperImageReader from "./components/PaperImageReader";
 import ChatList from "./components/ChatList";
 import ChatPanel from "./components/ChatPanel";
+import Markdown from "./components/Markdown";
 import TodoPage from "./todo/TodoPage";
 import ChatPage from "./chat/ChatPage";
 import DocsPage from "./docs/DocsPage";
@@ -1491,11 +1488,7 @@ function NoteEditor({ project, paperId }: { project: string; paperId: string }) 
         ) : (
           <div className="h-full overflow-y-auto p-4">
             {content ? (
-              <div className="prose prose-sm prose-slate max-w-none">
-                <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>
-                  {content}
-                </ReactMarkdown>
-              </div>
+              <Markdown>{content}</Markdown>
             ) : (
               <p className="text-sm text-slate-400 italic">No notes yet.</p>
             )}

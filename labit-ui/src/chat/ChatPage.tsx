@@ -1,10 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, ChevronDown, ChevronRight, ClipboardCopy, Download, FilePlus2, FileText, ImagePlus, MessageSquarePlus, Plus, Send, Square, Trash2, User, X } from "lucide-react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
-import rehypeKatex from "rehype-katex";
-import "katex/dist/katex.min.css";
 import {
   artifactDownloadUrl,
   askStream,
@@ -28,6 +23,7 @@ import {
 } from "./api";
 import { createDoc } from "../docs/api";
 import { ClaudeIcon, CodexIcon } from "../components/AgentIcons";
+import Markdown from "../components/Markdown";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -122,28 +118,6 @@ function AgentAvatar({ agent, pulse }: { agent: string; pulse?: boolean }) {
   if (agent === "claude") return <div className={cls}><ClaudeIcon size={15} className={style.icon} /></div>;
   if (agent === "codex") return <div className={cls}><CodexIcon size={15} className={style.icon} /></div>;
   return <div className={cls}><span className={`text-xs font-bold ${style.icon}`}>{agent[0]?.toUpperCase()}</span></div>;
-}
-
-// ---------------------------------------------------------------------------
-// Markdown renderer
-// ---------------------------------------------------------------------------
-
-function Markdown({ children }: { children: string }) {
-  return (
-    <div className="prose prose-sm prose-slate max-w-none break-words
-      prose-p:my-1.5 prose-p:leading-relaxed
-      prose-headings:mt-3 prose-headings:mb-1.5 prose-headings:font-semibold
-      prose-ul:my-1.5 prose-ol:my-1.5 prose-li:my-0.5
-      prose-pre:my-2 prose-pre:rounded-lg prose-pre:bg-slate-800 prose-pre:text-slate-100
-      prose-code:rounded prose-code:bg-slate-100 prose-code:px-1 prose-code:py-0.5 prose-code:text-slate-800 prose-code:before:content-none prose-code:after:content-none
-      prose-table:text-sm prose-th:px-2 prose-th:py-1 prose-td:px-2 prose-td:py-1
-      prose-blockquote:border-slate-300 prose-blockquote:text-slate-600
-      prose-a:text-blue-600 prose-a:no-underline hover:prose-a:underline
-      prose-img:rounded-lg"
-    >
-      <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>{children}</ReactMarkdown>
-    </div>
-  );
 }
 
 // ---------------------------------------------------------------------------

@@ -33,11 +33,6 @@ import {
   User,
   X,
 } from "lucide-react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
-import rehypeKatex from "rehype-katex";
-import "katex/dist/katex.min.css";
 
 // CodeMirror
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter } from "@codemirror/view";
@@ -91,6 +86,7 @@ import {
 } from "./api";
 import { ClaudeIcon, CodexIcon } from "../components/AgentIcons";
 import ChatList from "../components/ChatList";
+import Markdown from "../components/Markdown";
 import ModeSwapBar from "../components/ModeSwapBar";
 import { createDoc } from "../docs/api";
 
@@ -136,28 +132,6 @@ const AGENT_COLORS: Record<string, { accent: string; icon: string }> = {
 
 function agentStyle(agent: string) {
   return AGENT_COLORS[agent] ?? { accent: "border-slate-200", icon: "text-slate-500" };
-}
-
-// ---------------------------------------------------------------------------
-// Markdown renderer
-// ---------------------------------------------------------------------------
-
-function Markdown({ children }: { children: string }) {
-  return (
-    <div className="prose prose-sm prose-slate max-w-none break-words
-      prose-p:my-1.5 prose-p:leading-relaxed
-      prose-headings:mt-3 prose-headings:mb-1.5 prose-headings:font-semibold
-      prose-ul:my-1.5 prose-ol:my-1.5 prose-li:my-0.5
-      prose-pre:my-2 prose-pre:rounded-lg prose-pre:bg-slate-800 prose-pre:text-slate-100
-      prose-code:rounded prose-code:bg-slate-100 prose-code:px-1 prose-code:py-0.5 prose-code:text-slate-800 prose-code:before:content-none prose-code:after:content-none
-      prose-table:text-sm prose-th:px-2 prose-th:py-1 prose-td:px-2 prose-td:py-1
-      prose-blockquote:border-slate-300 prose-blockquote:text-slate-600
-      prose-a:text-blue-600 prose-a:no-underline hover:prose-a:underline
-      prose-img:rounded-lg"
-    >
-      <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>{children}</ReactMarkdown>
-    </div>
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1537,11 +1511,7 @@ function RightSidebar({
               ) : (
                 <div className="h-full overflow-y-auto p-4">
                   {noteContent ? (
-                    <div className="prose prose-sm prose-slate max-w-none">
-                      <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>
-                        {noteContent}
-                      </ReactMarkdown>
-                    </div>
+                    <Markdown>{noteContent}</Markdown>
                   ) : (
                     <p className="text-sm text-slate-400 italic">No notes yet.</p>
                   )}
